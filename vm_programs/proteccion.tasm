@@ -1,0 +1,8 @@
+.code
+.entry _start
+
+_start:
+        MOVI R1, 123
+        STORE R1, [R0]     ; debe fallar: intenta sobrescribir el opcode inicial
+        HALT
+

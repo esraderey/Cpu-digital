@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#071011">
+  <meta name="description" content="Consola local para programar, ejecutar y observar Tramoya VM32.">
+  <meta property="og:title" content="Tramoya VM32 Console">
+  <meta property="og:description" content="Controla, observa y restaura una VM RISC de 32 bits.">
+  <meta property="og:image" content="/og.png">
+  <title>Tramoya VM32 Console</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">32</span>
+        <div>
+          <p>TRAMOYA</p>
+          <h1>VM Console</h1>
+        </div>
+      </div>
+
+      <div class="machine-summary" aria-live="polite">
+        <span id="statePill" class="state-pill" data-state="CREATED"><i></i> CREATED</span>
+        <span class="summary-item"><b>PC</b><code id="pcValue">0x00000000</code></span>
+        <span class="summary-item"><b>INS</b><code id="instructionValue">0</code></span>
+        <span class="summary-item"><b>CYC</b><code id="cycleValue">0</code></span>
+      </div>
+
+      <nav class="top-actions" aria-label="Acciones de archivo">
+        <button id="downloadBytecode" class="ghost-button" title="Descargar bytecode .tvm">Bytecode</button>
+        <button id="saveSnapshot" class="ghost-button" title="Guardar el estado completo">Snapshot</button>
+        <button id="openSnapshot" class="icon-button" title="Restaurar snapshot" aria-label="Restaurar snapshot">↥</button>
+        <input id="snapshotFile" type="file" accept=".tvms,application/octet-stream" hidden>
+        <button id="openSettings" class="icon-button" title="Límites de la VM" aria-label="Abrir configuración">⚙</button>
+        <button id="openHelp" class="icon-button" title="Ayuda y atajos" aria-label="Abrir ayuda">?</button>
+      </nav>
+    </header>
+
+    <main class="console-grid">
+      <section class="panel editor-panel" aria-labelledby="editorTitle">
+        <header class="panel-header">
+          <div>
+            <span class="eyebrow">PROGRAMA</span>
+            <h2 id="editorTitle">Fuente VM32</h2>
+          </div>
+          <div class="header-controls">
+            <label class="select-wrap">
+              <span class="sr-only">Ejemplo</span>
+              <select id="demoSelect" aria-label="Elegir ejemplo"></select>
+            </label>
+            <button id="loadProgram" class="primary-button">Ensamblar</button>
+          </div>
+        </header>
+
+        <div class="editor-wrap">
+          <div id="editorGutter" class="editor-gutter" aria-hidden="true"></div>
+          <textarea id="sourceEditor" spellcheck="false" aria-label="Código ensamblador VM32"></textarea>
+        </div>
+
+        <div class="editor-footer">
+          <div id="compileStatus" class="compile-status"><i></i><span>Preparando ensamblador…</span></div>
+          <div class="editor-stats"><span id="lineCount">0 líneas</span><span id="wordCount">0 palabras</span></div>
+        </div>
+      </section>
+
+      <section class="panel execution-panel" aria-labelledby="executionTitle">
+        <header class="panel-header execution-header">
+          <div>
+            <span class="eyebrow">CONTROL</span>
+            <h2 id="executionTitle">Ejecución</h2>
+          </div>
+          <div class="transport" role="group" aria-label="Controles de ejecución">
+            <button id="stepButton" class="transport-button" title="Paso · F10"><span>│▶</span> Paso</button>
+            <button id="runButton" class="transport-button run" title="Ejecutar · F5"><span>▶</span> Ejecutar</button>
+            <button id="stopButton" class="transport-button" title="Detener · Escape" disabled><span>■</span></button>
+            <button id="resetButton" class="transport-button" title="Restablecer"><span>↻</span></button>
+          </div>
+        </header>
+
+        <ol id="lifecycleRail" class="lifecycle-rail" aria-label="Ciclo de vida Tramoya">
+          <li data-state="CREATED">Creada</li>
+          <li data-state="READY">Lista</li>
+          <li data-state="RUNNING">Activa</li>
+          <li data-state="PAUSED">Pausa</li>
+          <li data-state="WAITING">Espera</li>
+          <li data-state="HALTED">Final</li>
+          <li data-state="FAULTED">Fallo</li>
+        </ol>
+
+        <div id="registerGrid" class="register-grid" aria-label="Registros"></div>
+
+        <div class="execution-footer">
+          <div id="flagGrid" class="flag-grid" aria-label="Banderas"></div>
+          <div class="number-mode" role="group" aria-label="Formato numérico">
+            <button data-number-mode="hex" class="active">HEX</button>
+            <button data-number-mode="dec">DEC</button>
+            <button data-number-mode="signed">±</button>
+          </div>
+        </div>
+
+        <div id="reasonBar" class="reason-bar" hidden></div>
+      </section>
+
+      <section class="panel output-panel" aria-labelledby="outputTitle">
+        <header class="panel-header compact">
+          <div>
+            <span class="eyebrow">HOST I/O</span>
+            <h2 id="outputTitle">Salida</h2>
+          </div>
+          <span id="outputUnits" class="panel-count">0 unidades</span>
+        </header>
+        <pre id="outputTerminal" class="output-terminal" aria-live="polite"><span class="muted">Sin salida</span></pre>
+        <form id="inputForm" class="inline-form">
+          <label>
+            <span class="sr-only">Entrada numérica</span>
+            <input id="inputValues" placeholder="Entrada: 7, 8, 0x2A" autocomplete="off">
+          </label>
+          <button class="small-button" type="submit">Entregar</button>
+        </form>
+      </section>
+
+      <section class="panel resources-panel" aria-labelledby="resourcesTitle">
+        <header class="panel-header compact">
+          <div>
+            <span class="eyebrow">LÍMITES</span>
+            <h2 id="resourcesTitle">Recursos</h2>
+          </div>
+          <span id="protectionBadge" class="protection-badge">Código protegido</span>
+        </header>
+        <div class="resource-list">
+          <div class="resource-row">
+            <div><span>Gas</span><code id="gasLabel">—</code></div>
+            <progress id="gasProgress" max="100" value="0"></progress>
+          </div>
+          <div class="resource-row">
+            <div><span>Pila</span><code id="stackLabel">—</code></div>
+            <progress id="stackProgress" max="100" value="0"></progress>
+          </div>
+          <div class="resource-row">
+            <div><span>Memoria</span><code id="memoryLabel">—</code></div>
+            <progress id="memoryProgress" max="100" value="0"></progress>
+          </div>
+          <div class="resource-row">
+            <div><span>Salida</span><code id="outputLabel">—</code></div>
+            <progress id="outputProgress" max="100" value="0"></progress>
+          </div>
+        </div>
+        <dl class="micro-stats">
+          <div><dt>Heap</dt><dd id="heapValue">—</dd></div>
+          <div><dt>Entrada</dt><dd id="inputDepth">—</dd></div>
+          <div><dt>IRQ</dt><dd id="irqDepth">—</dd></div>
+          <div><dt>Traza</dt><dd id="traceDepth">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel stack-panel" aria-labelledby="stackTitle">
+        <header class="panel-header compact">
+          <div>
+            <span class="eyebrow">LIFO</span>
+            <h2 id="stackTitle">Pila</h2>
+          </div>
+          <span id="stackDepth" class="panel-count">0 valores</span>
+        </header>
+        <div id="stackView" class="stack-view"><p class="empty-state">Pila vacía</p></div>
+      </section>
+
+      <section class="panel memory-panel" aria-labelledby="memoryTitle">
+        <header class="panel-header compact">
+          <div>
+            <span class="eyebrow">PALABRAS DE 32 BITS</span>
+            <h2 id="memoryTitle">Memoria</h2>
+          </div>
+          <form id="memoryForm" class="memory-controls">
+            <label>Desde <input id="memoryStart" value="0x0" aria-label="Dirección inicial"></label>
+            <label>Cantidad <select id="memoryCount"><option>32</option><option selected>64</option><option>128</option><option>256</option></select></label>
+            <button class="small-button" type="submit">Leer</button>
+          </form>
+        </header>
+        <div class="memory-table-wrap">
+          <table class="data-table memory-table">
+            <thead><tr><th>Dirección</th><th colspan="4">Valores</th></tr></thead>
+            <tbody id="memoryBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel trace-panel" aria-labelledby="traceTitle">
+        <header class="panel-header compact">
+          <div>
+            <span class="eyebrow">ÚLTIMAS TRANSACCIONES</span>
+            <h2 id="traceTitle">Traza</h2>
+          </div>
+          <div class="trace-meta"><span id="lastTransition">—</span><span id="traceCount" class="panel-count">0 eventos</span></div>
+        </header>
+        <div class="trace-table-wrap">
+          <table class="data-table trace-table">
+            <thead><tr><th>#</th><th>PC</th><th>Opcode</th><th>Operandos</th><th>Detalle</th><th>Ciclos</th></tr></thead>
+            <tbody id="traceBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel inspect-panel" aria-labelledby="inspectTitle">
+        <header class="panel-header compact">
+          <div>
+            <span class="eyebrow">ENLACE Y EVENTOS</span>
+            <h2 id="inspectTitle">Programa</h2>
+          </div>
+          <span id="programSize" class="panel-count">—</span>
+        </header>
+
+        <div class="inspect-tabs" role="tablist">
+          <button class="active" data-tab="symbols" role="tab">Símbolos</button>
+          <button data-tab="interrupts" role="tab">Interrupciones</button>
+          <button data-tab="breakpoints" role="tab">Breakpoints</button>
+        </div>
+
+        <div id="symbolsTab" class="inspect-tab active">
+          <div id="symbolList" class="symbol-list"></div>
+        </div>
+
+        <div id="interruptsTab" class="inspect-tab">
+          <form id="vectorForm" class="vertical-form">
+            <div><label>Vector <input id="vectorNumber" value="1"></label><label>Destino <input id="vectorTarget" placeholder="ISR_1"></label></div>
+            <button class="small-button" type="submit">Configurar vector</button>
+          </form>
+          <form id="interruptForm" class="inline-form">
+            <label><span class="sr-only">Interrupción</span><input id="interruptNumber" value="1" placeholder="Vector"></label>
+            <button class="small-button" type="submit">Solicitar IRQ</button>
+          </form>
+          <div id="interruptStatus" class="interrupt-status"></div>
+        </div>
+
+        <div id="breakpointsTab" class="inspect-tab">
+          <label class="field-label">Etiquetas o direcciones
+            <input id="breakpointValues" placeholder="BUCLE, 0x10">
+          </label>
+          <p class="field-hint">Se aplican al ejecutar. Sepáralos con espacios o comas.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="statusbar">
+      <span><i id="connectionDot"></i><span id="connectionText">Conectando con VM32…</span></span>
+      <span id="lastInstruction">Sin instrucción</span>
+      <span>F5 ejecutar · F10 paso · Ctrl+Enter ensamblar</span>
+    </footer>
+  </div>
+
+  <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" class="dialog-card">
+      <header><div><span class="eyebrow">NUEVA INSTANCIA</span><h2>Límites de ejecución</h2></div><button value="cancel" class="icon-button" aria-label="Cerrar">×</button></header>
+      <p>Se aplican la próxima vez que ensambles. Los límites protegen al host de programas defectuosos.</p>
+      <div class="settings-grid">
+        <label>Memoria (palabras)<input id="settingMemory" type="number" min="256" max="16777216" value="1048576"></label>
+        <label>Gas total<input id="settingGas" type="number" min="1" value="1000000"></label>
+        <label>Pila máxima<input id="settingStack" type="number" min="1" value="8192"></label>
+        <label>Buffer de traza<input id="settingTrace" type="number" min="0" max="100000" value="4096"></label>
+        <label>Salida máxima<input id="settingOutput" type="number" min="1" value="1000000"></label>
+        <label class="check-field"><input id="settingProtect" type="checkbox" checked> Proteger segmento de código</label>
+      </div>
+      <footer><button value="cancel" class="ghost-button">Cerrar</button><button id="applySettings" value="default" class="primary-button">Aplicar y ensamblar</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="helpDialog">
+    <form method="dialog" class="dialog-card help-card">
+      <header><div><span class="eyebrow">REFERENCIA RÁPIDA</span><h2>Cómo usar la consola</h2></div><button value="cancel" class="icon-button" aria-label="Cerrar">×</button></header>
+      <div class="help-columns">
+        <section><h3>Flujo</h3><ol><li>Elige un ejemplo o edita el fuente.</li><li>Ensamblar crea bytecode y reinicia la VM.</li><li>Usa Paso o Ejecutar; PC marca la instrucción actual.</li><li>Inspecciona registros, memoria, pila y traza.</li></ol></section>
+        <section><h3>Atajos</h3><dl><div><dt>F5</dt><dd>Ejecutar / detener</dd></div><div><dt>F10</dt><dd>Una instrucción</dd></div><div><dt>Ctrl + Enter</dt><dd>Ensamblar</dd></div><div><dt>Escape</dt><dd>Detener bloques</dd></div></dl></section>
+      </div>
+      <details><summary>Syscalls incluidas</summary><p><code>0 exit</code> · <code>1 print_int</code> · <code>2 print_char</code> · <code>3 read_int</code> · <code>4 memory_size</code> · <code>5 cycles</code> · <code>6 random</code> · <code>7 print_string</code> · <code>8 alloc</code></p></details>
+      <footer><button value="cancel" class="primary-button">Entendido</button></footer>
+    </form>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

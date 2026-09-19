@@ -1,0 +1,21 @@
+; Calcula 5! = 120.
+        LOADI 1
+        SAVE RESULTADO
+        LOADI 5
+        SAVE CONTADOR
+
+BUCLE:  LOAD RESULTADO
+        MUL CONTADOR
+        SAVE RESULTADO
+        LOAD CONTADOR
+        SUBI 1
+        SAVE CONTADOR
+        JNZ BUCLE
+
+        LOAD RESULTADO
+        OUT
+        HALT
+
+RESULTADO: .WORD 0
+CONTADOR:  .WORD 0
+

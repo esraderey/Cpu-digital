@@ -1,0 +1,24 @@
+.code
+.entry _start
+
+_start:
+        LEA R4, NUMEROS
+        MOVI R2, 0
+        MOVI R3, 8
+
+BUCLE:
+        LOAD R5, [R4]
+        ADD R2, R2, R5
+        ADDI R4, R4, 1
+        SUBI R3, R3, 1
+        CMPI R3, 0
+        JPOS BUCLE
+
+        MOV R1, R2
+        SYSCALL 1
+        MOVI R1, 0
+        HALT
+
+.data
+NUMEROS: .WORD 4, 8, 15, 16, 23, 42, 100, 200
+

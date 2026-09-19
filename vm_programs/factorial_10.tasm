@@ -1,0 +1,18 @@
+.code
+.entry _start
+
+_start:
+        MOVI R1, 10
+        MOVI R2, 1
+
+BUCLE:
+        MUL R2, R2, R1
+        SUBI R1, R1, 1
+        CMPI R1, 0
+        JPOS BUCLE
+
+        MOV R1, R2
+        SYSCALL 1          ; print_int(R1)
+        MOVI R1, 0
+        HALT
+

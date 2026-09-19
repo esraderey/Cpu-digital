@@ -1,0 +1,20 @@
+.code
+.entry _start
+
+_start:
+        MOVI R1, 0         ; a
+        MOVI R2, 1         ; b
+        MOVI R3, 20        ; cantidad
+
+BUCLE:
+        SYSCALL 1
+        ADD R4, R1, R2
+        MOV R1, R2
+        MOV R2, R4
+        SUBI R3, R3, 1
+        CMPI R3, 0
+        JPOS BUCLE
+
+        MOVI R1, 0
+        HALT
+

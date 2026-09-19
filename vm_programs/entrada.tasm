@@ -1,0 +1,12 @@
+.code
+.entry _start
+
+_start:
+        SYSCALL 3          ; read_int -> R1, espera si no hay entrada
+        MOV R2, R1
+        SYSCALL 3
+        ADD R1, R1, R2
+        SYSCALL 1
+        MOVI R1, 0
+        HALT
+

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpu-digital-tramoya"
+version = "2.0.0"
+description = "Runtime VM32 seguro y CPU de 16 bits construidos sobre Tramoya"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "tramoya==1.5.3",
+]
+
+[project.scripts]
+cpu-digital = "cpu_simulator:main"
+tramoya-vm = "tramoya_vm:main"
+tramoya-ui = "cpu_digital.ui_server:main"
+
+[tool.setuptools]
+py-modules = ["cpu_simulator", "tramoya_vm"]
+
+[tool.setuptools.packages.find]
+include = ["cpu_digital*", "programs*", "vm_programs*"]
+
+[tool.setuptools.package-data]
+cpu_digital = ["ui/*"]
+programs = ["*.asm"]
+vm_programs = ["*.tasm"]

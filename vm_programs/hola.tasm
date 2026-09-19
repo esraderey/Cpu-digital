@@ -1,0 +1,13 @@
+.code
+.entry _start
+
+_start:
+        LEA R1, MENSAJE
+        MOVI R2, 256
+        SYSCALL 7          ; print_string(R1, R2)
+        MOVI R1, 0
+        HALT
+
+.data
+MENSAJE: .STRING "Hola desde Tramoya VM32\n"
+

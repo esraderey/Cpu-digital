@@ -7,7 +7,8 @@ un pequeño lenguaje ensamblador y permite observar cada microestado del procesa
 El repositorio ahora contiene dos arquitecturas:
 
 - **Tramoya VM32:** runtime RISC de 32 bits para scripts seguros, automatización,
-  videojuegos, reglas de negocio y extensiones embebidas. Es la opción recomendada
+  videojuegos, reglas de negocio y extensiones embebidas. Incluye FPU IEEE 754,
+  aritmética de 64 bits y fibras cooperativas. Es la opción recomendada
   para aplicaciones reales. Consulta [VM32.md](VM32.md) y la especificación técnica
   [RFC EXP 00015](RFC-EXP-00015.md).
 - **CPU Digital 16:** arquitectura pequeña para inspección ciclo a ciclo y
@@ -44,6 +45,10 @@ puedes iniciarla con el comando `tramoya-ui` después de instalar el proyecto. U
 - Ejecución continua optimizada; `step()` conserva instrumentación completa.
 - Snapshots v2 dispersos y compatibles con snapshots densos v1.
 - Ensamblador limitado antes de reservar `.space` para evitar agotamiento accidental.
+- **51 instrucciones** en formato fijo de 4 palabras.
+- **FPU softcore** IEEE 754 single-precision (9 instrucciones).
+- **Aritmética extendida** de 64 bits con cadena de carry (3 instrucciones).
+- **Fibras cooperativas** con context switch completo (3 instrucciones).
 
 Benchmark reproducible:
 
@@ -233,13 +238,21 @@ undo, snapshots y diagramas.
 ## Estructura
 
 ```text
-cpu_simulator.py          CLI y depurador
+cpu_simulator.py          CLI y depurador (CPU 16)
+tramoya_vm.py             CLI y depurador (VM32)
 cpu_digital/
-  cpu.py                  CPU y unidad de control Tramoya
+  cpu.py                  CPU de 16 bits y unidad de control Tramoya
   isa.py                  ISA de 16 bits
-  assembler.py            ensamblador/desensamblador
-programs/                 ejemplos .asm
+  assembler.py            ensamblador/desensamblador (16 bits)
+  vm32.py                 VM de 32 bits con FPU, aritmética 64-bit y fibras
+  vm32_isa.py             ISA de 32 bits (51 instrucciones)
+  vm32_assembler.py       ensamblador/desensamblador (VM32)
+  memory.py               memoria paginada de palabras int32
+  ui_server.py            consola web de instrumentación
+programs/                 ejemplos .asm (CPU 16)
+vm_programs/              ejemplos .tasm (VM32)
 tests/                    pruebas automáticas
+benchmarks/               benchmarks de rendimiento
 ```
 
 Es un simulador educativo: modela flujo de control, registros y memoria, no

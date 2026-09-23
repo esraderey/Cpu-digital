@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import struct
 import zlib
 from collections import deque
 from dataclasses import dataclass
@@ -46,6 +48,18 @@ class _PauseSignal(Exception):
     pass
 
 
+@dataclass(slots=True)
+class _FiberContext:
+    """Contexto de una fibra cooperativa."""
+    fiber_id: int
+    pc: int
+    registers: list[int]
+    flags: dict[str, bool]
+    stack: list[int]
+    state: str  # "READY", "RUNNING", "FINISHED"
+    parent_id: int
+
+
 @dataclass(frozen=True, slots=True)
 class VMConfig:
     memory_words: int = DEFAULT_MEMORY_WORDS
@@ -54,6 +68,7 @@ class VMConfig:
     interrupt_depth: int = 32
     trace_size: int = 4_096
     output_limit: int = 1_000_000
+    fiber_limit: int = 64
     protect_code: bool = True
     capabilities: frozenset[str] = frozenset({"io", "introspection", "random", "memory"})
 
@@ -66,6 +81,7 @@ class VMConfig:
             or self.interrupt_depth < 1
             or self.trace_size < 0
             or self.output_limit < 1
+            or self.fiber_limit < 1
         ):
             raise ValueError("Los límites de recursos no son válidos")
 
@@ -205,6 +221,9 @@ class TramoyaVM32:
         self._trace_sequence = 0
         self._pending_event = None
         self._decode_cache: list[tuple[VMInstruction | None, int, int, int] | None] = []
+        self._fibers: dict[int, _FiberContext] = {}
+        self._current_fiber: int = 0
+        self._next_fiber_id: int = 1
         self._sync_special_registers()
 
     def _fresh_lifecycle_context(self) -> dict[str, Any]:
@@ -445,6 +464,11 @@ class TramoyaVM32:
             self._instructions,
             self._cycles,
             self._gas_remaining,
+            self._current_fiber,
+            self._next_fiber_id,
+            {fid: _FiberContext(f.fiber_id, f.pc, f.registers.copy(), dict(f.flags),
+                                f.stack.copy(), f.state, f.parent_id)
+             for fid, f in self._fibers.items()} if self._fibers else None,
         )
 
     def _rollback_core(self, snapshot: tuple[Any, ...]) -> None:
@@ -468,6 +492,9 @@ class TramoyaVM32:
             self._instructions,
             self._cycles,
             self._gas_remaining,
+            current_fiber,
+            next_fiber_id,
+            fibers_snapshot,
         ) = snapshot
         self._flags = dict(zip(("Z", "N", "C", "O"), flags, strict=True))
         self._stack = [] if stack is None else stack
@@ -476,6 +503,9 @@ class TramoyaVM32:
         self._pending_interrupts = deque(() if pending_interrupts is None else pending_interrupts)
         self._interrupt_vectors = {} if interrupt_vectors is None else interrupt_vectors
         self._interrupt_stack = [] if interrupt_stack is None else interrupt_stack
+        self._current_fiber = current_fiber
+        self._next_fiber_id = next_fiber_id
+        self._fibers = {} if fibers_snapshot is None else fibers_snapshot
         self._sync_special_registers()
 
     def _build_decode_cache(self) -> None:
@@ -607,6 +637,71 @@ class TramoyaVM32:
             # HALT indica terminación correcta. Para devolver otro código se
             # usa la syscall 0, que toma el valor explícito de R1.
             raise _HaltSignal(0)
+        # ── FPU: punto flotante IEEE 754 single-precision ────────────
+        elif opcode == VMOpcode.FADD:
+            self._float_to_reg(a, self._float_from_reg(b) + self._float_from_reg(c))
+        elif opcode == VMOpcode.FSUB:
+            self._float_to_reg(a, self._float_from_reg(b) - self._float_from_reg(c))
+        elif opcode == VMOpcode.FMUL:
+            self._float_to_reg(a, self._float_from_reg(b) * self._float_from_reg(c))
+        elif opcode == VMOpcode.FDIV:
+            divisor = self._float_from_reg(c)
+            if divisor == 0.0:
+                raise _ExecutionFault("División flotante entre cero")
+            self._float_to_reg(a, self._float_from_reg(b) / divisor)
+        elif opcode == VMOpcode.FCMP:
+            left, right = self._float_from_reg(a), self._float_from_reg(b)
+            if math.isnan(left) or math.isnan(right):
+                self._flags.update(Z=False, N=False, C=True, O=False)
+            else:
+                self._set_float_flags(left - right)
+        elif opcode == VMOpcode.FTOI:
+            fval = self._float_from_reg(b)
+            if math.isnan(fval) or math.isinf(fval):
+                raise _ExecutionFault("Conversión float→int de NaN o infinito")
+            ival = int(fval)
+            if not -(1 << 31) <= ival < (1 << 31):
+                raise _ExecutionFault("Desbordamiento en conversión float→int")
+            self._write_result(a, ival)
+        elif opcode == VMOpcode.ITOF:
+            self._float_to_reg(a, float(self._read_register(b)))
+        elif opcode == VMOpcode.FABS:
+            self._float_to_reg(a, abs(self._float_from_reg(b)))
+        elif opcode == VMOpcode.FSQRT:
+            fval = self._float_from_reg(b)
+            if fval < 0.0:
+                raise _ExecutionFault("Raíz cuadrada de número negativo")
+            self._float_to_reg(a, math.sqrt(fval))
+        # ── Aritmética extendida 64 bits ───────────────────────
+        elif opcode == VMOpcode.MULH:
+            full = self._read_register(b) * self._read_register(c)
+            high = signed32((full >> 32) & 0xFFFFFFFF)
+            self._write_result(a, high)
+        elif opcode == VMOpcode.ADDX:
+            left, right = self._read_register(b), self._read_register(c)
+            carry_in = 1 if self._flags["C"] else 0
+            raw = left + right + carry_in
+            unsigned = (left & 0xFFFFFFFF) + (right & 0xFFFFFFFF) + carry_in
+            result = signed32(raw)
+            overflow = (left >= 0) == (right >= 0) and (result >= 0) != (left >= 0)
+            self._write_register(a, result)
+            self._set_flags(result, carry=unsigned > 0xFFFFFFFF, overflow=overflow)
+        elif opcode == VMOpcode.SUBX:
+            left, right = self._read_register(b), self._read_register(c)
+            borrow_in = 0 if self._flags["C"] else 1
+            raw = left - right - borrow_in
+            result = signed32(raw)
+            overflow = (left >= 0) != (right >= 0) and (result >= 0) != (left >= 0)
+            borrow_unsigned = (left & 0xFFFFFFFF) >= ((right & 0xFFFFFFFF) + borrow_in)
+            self._write_register(a, result)
+            self._set_flags(result, carry=borrow_unsigned, overflow=overflow)
+        # ── Fibras cooperativas ────────────────────────────────
+        elif opcode == VMOpcode.SPAWN:
+            self._spawn_fiber(a)
+        elif opcode == VMOpcode.SWITCH:
+            self._switch_fiber(self._read_register(a))
+        elif opcode == VMOpcode.FRET:
+            self._finish_fiber()
 
     def _effective_address(self, base_register: int, offset: int) -> int:
         return self._read_register(base_register) + offset
@@ -670,6 +765,29 @@ class TramoyaVM32:
     def _quotient(dividend: int, divisor: int) -> int:
         quotient = abs(dividend) // abs(divisor)
         return -quotient if (dividend < 0) != (divisor < 0) else quotient
+
+    # ── FPU: IEEE 754 single-precision ─────────────────────────────
+
+    def _float_from_reg(self, index: int) -> float:
+        """Interpreta un registro como float IEEE 754 single-precision."""
+        bits = self._read_register(index) & 0xFFFFFFFF
+        return struct.unpack('f', struct.pack('I', bits))[0]
+
+    def _float_to_reg(self, dest: int, value: float) -> None:
+        """Empaqueta un float en un registro y actualiza banderas flotantes."""
+        bits = struct.unpack('I', struct.pack('f', value))[0]
+        self._write_register(dest, signed32(bits))
+        self._set_float_flags(value)
+
+    def _set_float_flags(self, value: float) -> None:
+        """Z=cero, N=negativo, C=NaN, O=infinito."""
+        is_nan = math.isnan(value)
+        self._flags.update(
+            Z=value == 0.0 and not is_nan,
+            N=value < 0.0 and not is_nan,
+            C=is_nan,
+            O=math.isinf(value),
+        )
 
     def _push(self, value: int) -> None:
         if len(self._stack) >= self.config.stack_limit:
@@ -874,6 +992,87 @@ class TramoyaVM32:
         self._flags = flags
         self._interrupts_enabled = enabled
 
+    # ── Fibras cooperativas ────────────────────────────────────────
+
+    def _spawn_fiber(self, address: int) -> None:
+        """Crea una nueva fibra en la dirección dada. Devuelve su ID en R1."""
+        if len(self._fibers) >= self.config.fiber_limit:
+            raise _ExecutionFault(f"Límite de fibras alcanzado ({self.config.fiber_limit})")
+        self._validate_executable(address)
+        fiber_id = self._next_fiber_id
+        self._next_fiber_id += 1
+        fiber = _FiberContext(
+            fiber_id=fiber_id,
+            pc=address,
+            registers=[0] * 16,
+            flags={"Z": True, "N": False, "C": False, "O": False},
+            stack=[],
+            state="READY",
+            parent_id=self._current_fiber,
+        )
+        self._fibers[fiber_id] = fiber
+        self._write_result(1, fiber_id)
+
+    def _switch_fiber(self, fiber_id: int) -> None:
+        """Cambia el contexto de ejecución a la fibra indicada."""
+        if fiber_id == self._current_fiber:
+            return
+        target = self._fibers.get(fiber_id)
+        if target is None:
+            raise _ExecutionFault(f"Fibra {fiber_id} no encontrada")
+        if target.state == "FINISHED":
+            raise _ExecutionFault(f"Fibra {fiber_id} ya terminó")
+        self._save_fiber_context()
+        self._load_fiber_context(fiber_id)
+
+    def _finish_fiber(self) -> None:
+        """Termina la fibra actual y regresa a la fibra padre."""
+        if self._current_fiber == 0:
+            raise _ExecutionFault("La fibra principal no puede terminar con FRET")
+        fiber = self._fibers.get(self._current_fiber)
+        parent_id = fiber.parent_id if fiber is not None else 0
+        if fiber is not None:
+            fiber.state = "FINISHED"
+        parent = self._fibers.get(parent_id)
+        if parent is None or parent.state == "FINISHED":
+            parent_id = 0
+            parent = self._fibers.get(parent_id)
+        if parent is None:
+            raise _ExecutionFault("No hay fibra padre a la cual regresar")
+        self._load_fiber_context(parent_id)
+
+    def _save_fiber_context(self) -> None:
+        """Guarda el estado actual de ejecución en la fibra activa."""
+        fiber = self._fibers.get(self._current_fiber)
+        if fiber is None:
+            fiber = _FiberContext(
+                fiber_id=self._current_fiber,
+                pc=self._pc,
+                registers=self._registers.copy(),
+                flags=dict(self._flags),
+                stack=self._stack.copy(),
+                state="READY",
+                parent_id=0,
+            )
+            self._fibers[self._current_fiber] = fiber
+        else:
+            fiber.pc = self._pc
+            fiber.registers = self._registers.copy()
+            fiber.flags = dict(self._flags)
+            fiber.stack = self._stack.copy()
+            fiber.state = "READY"
+
+    def _load_fiber_context(self, fiber_id: int) -> None:
+        """Carga el estado de una fibra en el contexto de ejecución."""
+        fiber = self._fibers[fiber_id]
+        self._pc = fiber.pc
+        self._registers = fiber.registers.copy()
+        self._flags = dict(fiber.flags)
+        self._stack = fiber.stack.copy()
+        fiber.state = "RUNNING"
+        self._current_fiber = fiber_id
+        self._sync_special_registers()
+
     def step(self) -> str:
         if self.state == "READY":
             self.machine.trigger("start")
@@ -998,6 +1197,7 @@ class TramoyaVM32:
                 "trace_size": self.config.trace_size,
                 "protect_code": self.config.protect_code,
                 "output_limit": self.config.output_limit,
+                "fiber_limit": self.config.fiber_limit,
                 "capabilities": sorted(self.config.capabilities),
             },
             "program": {
@@ -1027,6 +1227,20 @@ class TramoyaVM32:
                 "instructions": self._instructions,
                 "cycles": self._cycles,
                 "gas_remaining": self._gas_remaining,
+                "fibers": [
+                    {
+                        "fiber_id": f.fiber_id,
+                        "pc": f.pc,
+                        "registers": f.registers,
+                        "flags": f.flags,
+                        "stack": f.stack,
+                        "state": f.state,
+                        "parent_id": f.parent_id,
+                    }
+                    for f in self._fibers.values()
+                ],
+                "current_fiber": self._current_fiber,
+                "next_fiber_id": self._next_fiber_id,
             },
         }
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -1096,6 +1310,7 @@ class TramoyaVM32:
                     else config_integer("trace_size", defaults.trace_size)
                 ),
                 output_limit=config_integer("output_limit", defaults.output_limit),
+                fiber_limit=config_integer("fiber_limit", defaults.fiber_limit),
                 protect_code=protect_code,
                 capabilities=capabilities,
             )
@@ -1250,6 +1465,23 @@ class TramoyaVM32:
         self._instructions = int(core["instructions"])
         self._cycles = int(core["cycles"])
         self._gas_remaining = int(core["gas_remaining"])
+        self._current_fiber = int(core.get("current_fiber", 0))
+        self._next_fiber_id = int(core.get("next_fiber_id", 1))
+        fibers_raw = core.get("fibers", [])
+        self._fibers = {}
+        if isinstance(fibers_raw, list):
+            for fdata in fibers_raw:
+                if isinstance(fdata, dict):
+                    fid = int(fdata.get("fiber_id", 0))
+                    self._fibers[fid] = _FiberContext(
+                        fiber_id=fid,
+                        pc=int(fdata.get("pc", 0)),
+                        registers=list(fdata.get("registers", [0] * 16)),
+                        flags=dict(fdata.get("flags", {"Z": True, "N": False, "C": False, "O": False})),
+                        stack=list(fdata.get("stack", [])),
+                        state=str(fdata.get("state", "READY")),
+                        parent_id=int(fdata.get("parent_id", 0)),
+                    )
         self._validate_restored_state()
         self._build_decode_cache()
         self._sync_special_registers()
@@ -1282,6 +1514,15 @@ class TramoyaVM32:
                 raise ValueError(str(exc)) from exc
         if len(self._interrupt_stack) > self.config.interrupt_depth:
             raise ValueError("Pila de interrupciones excede el límite")
+        if len(self._fibers) > self.config.fiber_limit:
+            raise ValueError("Número de fibras excede el límite")
+        for fiber in self._fibers.values():
+            if fiber.state not in {"READY", "RUNNING", "FINISHED"}:
+                raise ValueError(f"Estado de fibra inválido: {fiber.state}")
+            if len(fiber.registers) != 16:
+                raise ValueError("Registros de fibra inválidos")
+            if len(fiber.stack) > self.config.stack_limit:
+                raise ValueError("Pila de fibra excede el límite")
 
     def save_snapshot(self, path: str | Path) -> Path:
         destination = Path(path)

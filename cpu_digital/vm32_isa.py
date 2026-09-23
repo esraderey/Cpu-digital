@@ -76,6 +76,27 @@ class VMOpcode(IntEnum):
 
     HALT = 99
 
+    # FPU — punto flotante IEEE 754 single-precision
+    FADD = 100
+    FSUB = 101
+    FMUL = 102
+    FDIV = 103
+    FCMP = 104
+    FTOI = 105
+    ITOF = 106
+    FABS = 107
+    FSQRT = 108
+
+    # Aritmética extendida 64 bits
+    MULH = 110
+    ADDX = 111
+    SUBX = 112
+
+    # Fibras cooperativas
+    SPAWN = 120
+    SWITCH = 121
+    FRET = 122
+
 
 @dataclass(frozen=True, slots=True)
 class VMInstruction:
@@ -131,6 +152,24 @@ _SPECS = (
     VMInstruction(VMOpcode.YIELD, "YIELD", "none"),
     VMInstruction(VMOpcode.BREAK, "BREAK", "none"),
     VMInstruction(VMOpcode.HALT, "HALT", "none"),
+    # FPU
+    VMInstruction(VMOpcode.FADD, "FADD", "reg_reg_reg", 3),
+    VMInstruction(VMOpcode.FSUB, "FSUB", "reg_reg_reg", 3),
+    VMInstruction(VMOpcode.FMUL, "FMUL", "reg_reg_reg", 3),
+    VMInstruction(VMOpcode.FDIV, "FDIV", "reg_reg_reg", 5),
+    VMInstruction(VMOpcode.FCMP, "FCMP", "reg_reg", 2),
+    VMInstruction(VMOpcode.FTOI, "FTOI", "reg_reg", 2),
+    VMInstruction(VMOpcode.ITOF, "ITOF", "reg_reg", 2),
+    VMInstruction(VMOpcode.FABS, "FABS", "reg_reg", 2),
+    VMInstruction(VMOpcode.FSQRT, "FSQRT", "reg_reg", 5),
+    # Aritmética extendida
+    VMInstruction(VMOpcode.MULH, "MULH", "reg_reg_reg", 2),
+    VMInstruction(VMOpcode.ADDX, "ADDX", "reg_reg_reg", 1),
+    VMInstruction(VMOpcode.SUBX, "SUBX", "reg_reg_reg", 1),
+    # Fibras
+    VMInstruction(VMOpcode.SPAWN, "SPAWN", "target", 5),
+    VMInstruction(VMOpcode.SWITCH, "SWITCH", "reg", 5),
+    VMInstruction(VMOpcode.FRET, "FRET", "none", 3),
 )
 
 VM32_ISA: Mapping[int, VMInstruction] = MappingProxyType(

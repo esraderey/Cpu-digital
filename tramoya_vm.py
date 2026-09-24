@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from pathlib import Path
 
 from tramoya import MachineError
 
 from cpu_digital.vm32 import VMConfig, VMRuntimeError, TramoyaVM32
+from cpu_digital.memory_chip import NonVolatileMemoryChip
 from cpu_digital.vm32_assembler import (
     Program32,
     VM32Assembler,
@@ -48,12 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-run", action="store_true", help="Solo compila/inspecciona")
     parser.add_argument("--input", nargs="*", type=_integer, default=[], help="Entradas para read_int")
     parser.add_argument("--memory-words", type=int, default=VMConfig().memory_words)
+    parser.add_argument("--memory-chip", type=Path, help="Conecta un chip persistente; crea el archivo si no existe")
     parser.add_argument("--gas", type=int, default=1_000_000)
     parser.add_argument("--stack-limit", type=int, default=8_192)
     parser.add_argument("--trace-buffer", type=int, default=4_096, help="0 desactiva la instrumentación")
     parser.add_argument("--output-limit", type=int, default=1_000_000)
     parser.add_argument("--max-instructions", type=int, default=None, help="Límite adicional de esta ejecución")
-    parser.add_argument("--deny-capability", action="append", default=[], help="Deshabilita io/random/memory/etc.")
+    parser.add_argument("--deny-capability", action="append", default=[], help="Deshabilita io/random/memory/memory_chip/etc.")
     parser.add_argument("--breakpoint", action="append", default=[], help="Dirección o etiqueta")
     parser.add_argument("--vector", action="append", default=[], help="Configura VECTOR=ETIQUETA")
     parser.add_argument("--interrupt", action="append", type=_integer, default=[], help="Encola una interrupción")
@@ -196,8 +199,13 @@ def main(argv: list[str] | None = None) -> int:
             pass
     args = build_parser().parse_args(argv)
 
+    memory_chip: NonVolatileMemoryChip | None = None
     try:
+        if args.memory_chip:
+            memory_chip = NonVolatileMemoryChip(args.memory_chip)
         capabilities = set(VMConfig().capabilities) - set(args.deny_capability)
+        if memory_chip is not None and "memory_chip" not in args.deny_capability:
+            capabilities.add("memory_chip")
         config = VMConfig(
             memory_words=args.memory_words,
             gas_limit=args.gas,
@@ -206,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             output_limit=args.output_limit,
             capabilities=frozenset(capabilities),
         )
-        vm = TramoyaVM32(config)
+        vm = TramoyaVM32(config, memory_chip=memory_chip)
         assembled: VMAssemblyResult | None = None
         symbols: dict[str, int] = {}
 
@@ -215,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.load_snapshot.read_bytes(),
                 trace_size=args.trace_buffer,
                 capabilities=frozenset(capabilities),
+                memory_chip=memory_chip,
             )
             symbols = dict(vm.program.symbols) if vm.program else {}
             if args.input:
@@ -266,9 +275,12 @@ def main(argv: list[str] | None = None) -> int:
         if result.state == "FAULTED":
             return 1
         return int(result.exit_code or 0) & 0xFF if result.state == "HALTED" else 0
-    except (VMAssemblyError, VMRuntimeError, ValueError, OSError, MachineError) as exc:
+    except (VMAssemblyError, VMRuntimeError, ValueError, OSError, MachineError, sqlite3.Error) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if memory_chip is not None:
+            memory_chip.close()
 
 
 if __name__ == "__main__":

@@ -50,6 +50,35 @@ puedes iniciarla con el comando `tramoya-ui` después de instalar el proyecto. U
 - **Aritmética extendida** de 64 bits con cadena de carry (3 instrucciones).
 - **Fibras cooperativas** con context switch completo (3 instrucciones).
 
+## Chip de memoria no volátil
+
+El componente `NonVolatileMemoryChip` modela un chip persistente e independiente
+de la RAM de VM32. Su capacidad predeterminada es de **500 MB decimales**
+(500 000 000 bytes, aproximadamente 476,84 MiB). Usa almacenamiento por páginas
+en un archivo SQLite: al crearlo solo se guarda la metadata; el archivo crece al
+escribir datos y el contenido permanece tras cerrar y volver a abrir el chip.
+
+```python
+from cpu_digital import NonVolatileMemoryChip
+
+with NonVolatileMemoryChip("chips/flash_500mb.sqlite") as chip:
+    chip.write(0, b"datos persistentes")
+    print(chip.read(0, 18))
+```
+
+La dirección y la longitud se expresan en bytes. `allocated_bytes` informa el
+contenido guardado, no el espacio total del archivo SQLite ni la RAM del proceso.
+Las syscalls VM32 9 y 10 leen y escriben el chip en bloques de hasta 4 096 bytes;
+la syscall 11 consulta su capacidad. La consola web conecta por defecto
+`chips/flash_500mb.sqlite`. Para la CLI, indica el chip al ejecutar el programa:
+
+```powershell
+.\.venv\Scripts\python.exe tramoya_vm.py programa.tasm --memory-chip chips\flash_500mb.sqlite
+```
+
+Las escrituras de programas son persistentes y quedan fuera de los snapshots de
+RAM VM32.
+
 Benchmark reproducible:
 
 ```powershell

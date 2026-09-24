@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from tramoya import MachineError
 
+from .memory_chip import NonVolatileMemoryChip
 from .vm32 import VMConfig, VMRuntimeError, TramoyaVM32
 from .vm32_assembler import VM32Assembler, VMAssemblyError, VMAssemblyResult
 from .vm32_isa import VM32_MNEMONICS
@@ -62,10 +63,13 @@ def _integer_list(value: Any, name: str) -> list[int]:
 class ConsoleSession:
     """Una sesión VM32 aislada y serializada para la UI local."""
 
-    def __init__(self) -> None:
+    def __init__(self, memory_chip_path: str | Path | None = None) -> None:
         self.lock = threading.RLock()
         self.assembler = VM32Assembler()
-        self.vm = TramoyaVM32()
+        self.memory_chip = (
+            NonVolatileMemoryChip(memory_chip_path) if memory_chip_path is not None else None
+        )
+        self.vm = TramoyaVM32(self._default_config(), memory_chip=self.memory_chip)
         self.source = ""
         self.demo = "hola"
         self.assembly: VMAssemblyResult | None = None
@@ -82,15 +86,21 @@ class ConsoleSession:
     def _load_demo_unlocked(self, name: str) -> None:
         source = self._demo_source(name)
         assembly = self.assembler.assemble(source, source_name=f"demo:{name}")
-        self.vm = TramoyaVM32()
+        self.vm = TramoyaVM32(self._default_config(), memory_chip=self.memory_chip)
         self.vm.load_program(assembly.program)
         self.source = source
         self.demo = name
         self.assembly = assembly
         self.revision += 1
 
-    @staticmethod
-    def _config_from(payload: Mapping[str, Any]) -> VMConfig:
+    def _default_config(self) -> VMConfig:
+        defaults = VMConfig()
+        capabilities = defaults.capabilities
+        if self.memory_chip is not None:
+            capabilities = capabilities | {"memory_chip"}
+        return VMConfig(capabilities=capabilities)
+
+    def _config_from(self, payload: Mapping[str, Any]) -> VMConfig:
         defaults = VMConfig()
         config = payload.get("config", {})
         if not isinstance(config, Mapping):
@@ -103,7 +113,7 @@ class ConsoleSession:
             trace_size=_integer(config.get("trace_size", defaults.trace_size), "Traza", minimum=0, maximum=100_000),
             output_limit=_integer(config.get("output_limit", defaults.output_limit), "Salida", minimum=1),
             protect_code=bool(config.get("protect_code", defaults.protect_code)),
-            capabilities=defaults.capabilities,
+            capabilities=defaults.capabilities | ({"memory_chip"} if self.memory_chip else set()),
         )
 
     def bootstrap(self, memory_start: int = 0, memory_count: int = 64) -> dict[str, Any]:
@@ -146,7 +156,7 @@ class ConsoleSession:
                 source_name="consola.tasm",
                 max_words=config.memory_words,
             )
-            vm = TramoyaVM32(config)
+            vm = TramoyaVM32(config, memory_chip=self.memory_chip)
             vm.load_program(assembly.program, inputs=_integer_list(payload.get("inputs"), "Entrada"))
             self.vm = vm
             self.source = source
@@ -237,7 +247,14 @@ class ConsoleSession:
             except ValueError as exc:
                 if "otro tamaño de memoria" not in str(exc):
                     raise
-                self.vm = TramoyaVM32.from_snapshot_bytes(raw)
+                capabilities = self.vm.config.capabilities
+                if self.memory_chip is not None:
+                    capabilities = capabilities | {"memory_chip"}
+                self.vm = TramoyaVM32.from_snapshot_bytes(
+                    raw,
+                    capabilities=frozenset(capabilities),
+                    memory_chip=self.memory_chip,
+                )
             self.assembly = None
             self.demo = "snapshot"
             self.revision += 1
@@ -247,6 +264,12 @@ class ConsoleSession:
                 "listing": [],
                 "state": self._state_unlocked(),
             }
+
+    def close(self) -> None:
+        with self.lock:
+            if self.memory_chip is not None:
+                self.memory_chip.close()
+                self.memory_chip = None
 
     def _resolve(self, value: Any) -> int:
         if value is None or value == "":
@@ -332,6 +355,12 @@ class ConsoleSession:
                 "memory_allocated_words": self.vm.allocated_memory_words,
                 "memory_allocated_bytes": self.vm.allocated_memory_bytes,
                 "memory_allocated_pages": self.vm.allocated_memory_pages,
+                "memory_chip_capacity_bytes": (
+                    self.memory_chip.capacity_bytes if self.memory_chip is not None else 0
+                ),
+                "memory_chip_allocated_bytes": (
+                    self.memory_chip.allocated_bytes if self.memory_chip is not None else 0
+                ),
                 "stack_limit": config.stack_limit,
                 "trace_size": config.trace_size,
                 "output_limit": config.output_limit,
@@ -479,16 +508,32 @@ class ConsoleHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], *, verbose: bool = False):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        *,
+        verbose: bool = False,
+        memory_chip_path: str | Path | None = Path("chips/flash_500mb.sqlite"),
+    ):
         super().__init__(address, ConsoleHandler)
-        self.session = ConsoleSession()
+        self.session = ConsoleSession(memory_chip_path)
         self.verbose = verbose
+
+    def server_close(self) -> None:
+        self.session.close()
+        super().server_close()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Consola web local de Tramoya VM32")
     parser.add_argument("--host", default="127.0.0.1", help="Interfaz de escucha (por defecto solo local)")
     parser.add_argument("--port", type=int, default=8765, help="Puerto local")
+    parser.add_argument(
+        "--memory-chip",
+        type=Path,
+        default=Path("chips/flash_500mb.sqlite"),
+        help="Chip persistente accesible desde programas; crea el archivo si falta",
+    )
     parser.add_argument("--no-open", action="store_true", help="No abrir el navegador automáticamente")
     parser.add_argument("--verbose", action="store_true", help="Mostrar peticiones HTTP")
     return parser
@@ -498,7 +543,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not 0 <= args.port <= 65_535:
         raise SystemExit("El puerto debe estar entre 0 y 65535")
-    server = ConsoleHTTPServer((args.host, args.port), verbose=args.verbose)
+    server = ConsoleHTTPServer(
+        (args.host, args.port),
+        verbose=args.verbose,
+        memory_chip_path=args.memory_chip,
+    )
     host, port = server.server_address[:2]
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     url = f"http://{display_host}:{port}/"

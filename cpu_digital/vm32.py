@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Mapping
 from tramoya import Machine, MachineBuilder, MachineError
 
 from .memory import PagedMemory
+from .memory_chip import NonVolatileMemoryChip
 from .vm32_assembler import Program32, signed32
 from .vm32_isa import VM32_ISA, VMInstruction, VMOpcode
 
@@ -23,6 +24,7 @@ SNAPSHOT_VERSION = 2
 DEFAULT_MEMORY_WORDS = 1_048_576
 MAX_MEMORY_WORDS = 16_777_216
 MAX_SNAPSHOT_RAW_BYTES = 256 * 1024 * 1024
+MAX_MEMORY_CHIP_TRANSFER_BYTES = 4_096
 RUNNABLE_STATES = frozenset({"READY", "RUNNING", "PAUSED", "WAITING"})
 FINAL_STATES = frozenset({"HALTED", "FAULTED"})
 
@@ -142,8 +144,14 @@ class TramoyaVM32:
     profundidad de la pila y es de solo lectura.
     """
 
-    def __init__(self, config: VMConfig | None = None):
+    def __init__(
+        self,
+        config: VMConfig | None = None,
+        *,
+        memory_chip: NonVolatileMemoryChip | None = None,
+    ):
         self.config = config or VMConfig()
+        self.memory_chip = memory_chip
         self._trace: deque[VMTraceEntry] = deque(maxlen=self.config.trace_size)
         self._syscalls: dict[int, _Syscall] = {}
         self._program: Program32 | None = None
@@ -198,6 +206,10 @@ class TramoyaVM32:
     @property
     def allocated_memory_pages(self) -> int:
         return self._memory.allocated_pages
+
+    def attach_memory_chip(self, chip: NonVolatileMemoryChip | None) -> None:
+        """Conecta o desconecta un chip no volátil controlado por el host."""
+        self.memory_chip = chip
 
     def _initialize_core(self) -> None:
         self._memory = PagedMemory(self.config.memory_words)
@@ -900,6 +912,9 @@ class TramoyaVM32:
         self.register_syscall(6, lambda vm: vm._sys_random(), name="random", capability="random")
         self.register_syscall(7, lambda vm: vm._sys_print_string(), name="print_string", capability="io")
         self.register_syscall(8, lambda vm: vm._sys_alloc(), name="alloc", capability="memory")
+        self.register_syscall(9, lambda vm: vm._sys_memory_chip_read(), name="memory_chip_read", capability="memory_chip")
+        self.register_syscall(10, lambda vm: vm._sys_memory_chip_write(), name="memory_chip_write", capability="memory_chip")
+        self.register_syscall(11, lambda vm: vm._sys_memory_chip_size(), name="memory_chip_size", capability="memory_chip")
 
     def _sys_exit(self) -> None:
         raise _HaltSignal(self._read_register(1))
@@ -951,6 +966,54 @@ class TramoyaVM32:
         address = self._heap_ptr
         self._heap_ptr += count
         self._write_result(1, address)
+
+    def _sys_memory_chip_read(self) -> None:
+        chip = self._require_memory_chip()
+        offset = self._read_register(1)
+        destination = self._read_register(2)
+        count = self._read_memory_chip_transfer_count(self._read_register(3))
+        if destination < 0 or destination + count > len(self._memory):
+            raise _ExecutionFault("Destino de lectura del chip fuera de la RAM")
+        try:
+            data = chip.read(offset, count)
+        except Exception as exc:
+            raise _ExecutionFault(f"Lectura del chip fallida: {exc}") from exc
+        for index, value in enumerate(data):
+            self.write_memory(destination + index, value)
+        self._write_result(1, count)
+
+    def _sys_memory_chip_write(self) -> None:
+        chip = self._require_memory_chip()
+        offset = self._read_register(1)
+        source = self._read_register(2)
+        count = self._read_memory_chip_transfer_count(self._read_register(3))
+        if source < 0 or source + count > len(self._memory):
+            raise _ExecutionFault("Origen de escritura del chip fuera de la RAM")
+        data = bytes(self.read_memory(source + index) & 0xFF for index in range(count))
+        # La escritura es un efecto persistente del host; validar y preparar todos
+        # los datos antes de confirmarla en el chip.
+        self._write_result(1, count)
+        try:
+            chip.write(offset, data)
+        except Exception as exc:
+            raise _ExecutionFault(f"Escritura del chip fallida: {exc}") from exc
+
+    def _sys_memory_chip_size(self) -> None:
+        chip = self._require_memory_chip()
+        self._write_result(1, chip.capacity_bytes)
+
+    def _require_memory_chip(self) -> NonVolatileMemoryChip:
+        if self.memory_chip is None:
+            raise _ExecutionFault("No hay un chip de memoria conectado")
+        return self.memory_chip
+
+    @staticmethod
+    def _read_memory_chip_transfer_count(count: int) -> int:
+        if not 0 <= count <= MAX_MEMORY_CHIP_TRANSFER_BYTES:
+            raise _ExecutionFault(
+                f"La transferencia del chip debe estar entre 0 y {MAX_MEMORY_CHIP_TRANSFER_BYTES} bytes"
+            )
+        return count
 
     def provide_input(self, *values: int) -> str:
         self._input.extend(signed32(int(value)) for value in values)
@@ -1275,6 +1338,7 @@ class TramoyaVM32:
         *,
         trace_size: int | None = None,
         capabilities: frozenset[str] | None = None,
+        memory_chip: NonVolatileMemoryChip | None = None,
     ) -> "TramoyaVM32":
         """Crea una VM con la RAM y límites requeridos por el snapshot."""
         payload = cls._decode_snapshot_payload(snapshot, MAX_SNAPSHOT_RAW_BYTES)
@@ -1316,7 +1380,7 @@ class TramoyaVM32:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("Configuración inválida en snapshot") from exc
-        vm = cls(config)
+        vm = cls(config, memory_chip=memory_chip)
         vm._apply_snapshot(payload)
         vm._trace.clear()
         vm._trace_sequence = 0

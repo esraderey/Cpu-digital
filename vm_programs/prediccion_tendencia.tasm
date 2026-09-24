@@ -1,0 +1,17 @@
+.code
+.entry _start
+
+; Predice el siguiente valor suponiendo una diferencia constante.
+; Muestras: 10, 13 -> diferencia 3 -> predicción 16.
+_start:
+        LEA R4, MUESTRAS
+        LOAD R2, [R4]       ; muestra anterior
+        ADDI R4, R4, 1
+        LOAD R3, [R4]       ; muestra más reciente
+        SUB R5, R3, R2      ; calcula la diferencia
+        ADD R1, R3, R5      ; extrapola una muestra
+        SYSCALL 1           ; imprime la predicción
+        HALT
+
+.data
+MUESTRAS: .WORD 10, 13

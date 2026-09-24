@@ -361,6 +361,12 @@ function renderResources(state) {
   setProgress("#gasProgress", gasUsed, r.gas_limit, "#gasLabel", `${compactNumber(r.gas_remaining)} / ${compactNumber(r.gas_limit)}`);
   setProgress("#stackProgress", stackUsed, r.stack_limit, "#stackLabel", `${stackUsed} / ${compactNumber(r.stack_limit)}`);
   setProgress("#memoryProgress", memoryUsed, r.memory_words, "#memoryLabel", `${compactNumber(memoryUsed)} físicas / ${compactNumber(r.memory_words)} lógicas`);
+  const chipCapacity = r.memory_chip_capacity_bytes || 0;
+  const chipUsed = r.memory_chip_allocated_bytes || 0;
+  const chipLabel = chipCapacity
+    ? `${(chipUsed / 1_000_000).toFixed(2)} / ${(chipCapacity / 1_000_000).toFixed(0)} MB`
+    : "Desconectado";
+  setProgress("#memoryChipProgress", chipUsed, chipCapacity, "#memoryChipLabel", chipLabel);
   setProgress("#outputProgress", r.output_units, r.output_limit, "#outputLabel", `${compactNumber(r.output_units)} / ${compactNumber(r.output_limit)}`);
   $("#heapValue").textContent = hex(r.heap_pointer);
   $("#inputDepth").textContent = r.input_depth;

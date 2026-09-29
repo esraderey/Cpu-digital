@@ -29,11 +29,15 @@ RUNNABLE_STATES = frozenset({"READY", "RUNNING", "PAUSED", "WAITING"})
 FINAL_STATES = frozenset({"HALTED", "FAULTED"})
 
 
+def _is_int32(value: object) -> bool:
+    return type(value) is int and -(1 << 31) <= value < (1 << 31)
+
+
 class VMRuntimeError(RuntimeError):
     pass
 
 
-class _ExecutionFault(Exception):
+class _ExecutionFault(VMRuntimeError):
     pass
 
 
@@ -44,6 +48,10 @@ class _HaltSignal(Exception):
 
 class _WaitSignal(Exception):
     pass
+
+
+class _RetryWaitSignal(_WaitSignal):
+    """Espera que reintenta la instrucción: no completa, no cobra gas ni cuenta."""
 
 
 class _PauseSignal(Exception):
@@ -157,6 +165,7 @@ class TramoyaVM32:
         self._program: Program32 | None = None
         self._pending_event: tuple[str, str | int | None] | None = None
         self._journal: dict[int, int] | None = None
+        self._undo: list[Callable[[], None]] | None = None
         self._initialize_core()
         self.machine = self._build_lifecycle()
         self._install_builtin_syscalls()
@@ -222,7 +231,7 @@ class TramoyaVM32:
         self._output_units = 0
         self._interrupt_vectors: dict[int, int] = {}
         self._pending_interrupts: deque[int] = deque()
-        self._interrupt_stack: list[tuple[int, dict[str, bool], bool]] = []
+        self._interrupt_stack: list[tuple[int, dict[str, bool], bool, int]] = []
         self._interrupts_enabled = True
         self._heap_ptr = 0
         self._random_state = 0x6D2B79F5
@@ -373,12 +382,16 @@ class TramoyaVM32:
         detail = ""
         snapshot = self._core_checkpoint()
         self._journal = {}
+        self._undo = []
 
         try:
-            if self._interrupts_enabled and self._pending_interrupts:
+            # Las interrupciones externas solo se despachan en la fibra principal.
+            if self._interrupts_enabled and self._pending_interrupts and self._current_fiber == 0:
                 if self._gas_remaining < 1:
                     raise _ExecutionFault("Gas agotado al despachar interrupción")
-                vector = self._pending_interrupts.popleft()
+                pending = self._pending_interrupts
+                vector = pending.popleft()
+                self._undo.append(lambda: pending.appendleft(vector))
                 self._enter_interrupt(vector)
                 self._cycles += 1
                 self._gas_remaining -= 1
@@ -410,6 +423,9 @@ class TramoyaVM32:
             self._gas_remaining -= cost
             self._pending_event = ("halt", signal.code)
             detail = f"HALT {signal.code}"
+        except _RetryWaitSignal as signal:
+            self._pending_event = ("wait", str(signal))
+            detail = str(signal)
         except _WaitSignal as signal:
             self._instructions += 1
             self._cycles += cost
@@ -432,6 +448,7 @@ class TramoyaVM32:
             detail = f"FAULT HOST: {exc}"
         finally:
             self._journal = None
+            self._undo = None
             self.machine.ctx["last_instruction"] = {
                 "pc": pc_before,
                 "opcode": opcode_name,
@@ -455,21 +472,20 @@ class TramoyaVM32:
                 )
 
     def _core_checkpoint(self) -> tuple[Any, ...]:
-        # El checkpoint se crea en cada instrucción; una tupla compacta y None
-        # para colecciones vacías reduce asignaciones sin perder atomicidad.
+        # El checkpoint se crea en cada instrucción y debe costar O(1): solo
+        # escalares y referencias. Las colecciones se revierten con el registro
+        # de deshacer (self._undo) que llenan las operaciones que las mutan.
         return (
             self._pc,
             self._registers.copy(),
             (self._flags["Z"], self._flags["N"], self._flags["C"], self._flags["O"]),
-            self._stack.copy() if self._stack else None,
-            tuple(self._input) if self._input else None,
+            self._stack,
+            self._input,
             len(self._output),
             self._output_units,
-            tuple(self._pending_interrupts) if self._pending_interrupts else None,
-            self._interrupt_vectors.copy() if self._interrupt_vectors else None,
-            [(pc, flags.copy(), enabled) for pc, flags, enabled in self._interrupt_stack]
-            if self._interrupt_stack
-            else None,
+            self._pending_interrupts,
+            self._interrupt_vectors,
+            self._interrupt_stack,
             self._interrupts_enabled,
             self._heap_ptr,
             self._random_state,
@@ -478,12 +494,14 @@ class TramoyaVM32:
             self._gas_remaining,
             self._current_fiber,
             self._next_fiber_id,
-            {fid: _FiberContext(f.fiber_id, f.pc, f.registers.copy(), dict(f.flags),
-                                f.stack.copy(), f.state, f.parent_id)
-             for fid, f in self._fibers.items()} if self._fibers else None,
+            self._fibers,
         )
 
     def _rollback_core(self, snapshot: tuple[Any, ...]) -> None:
+        if self._undo:
+            for action in reversed(self._undo):
+                action()
+            self._undo.clear()
         if self._journal:
             for address, old_value in self._journal.items():
                 self._memory[address] = old_value
@@ -491,34 +509,30 @@ class TramoyaVM32:
             self._pc,
             self._registers,
             flags,
-            stack,
-            input_values,
+            self._stack,
+            self._input,
             output_length,
             self._output_units,
-            pending_interrupts,
-            interrupt_vectors,
-            interrupt_stack,
+            self._pending_interrupts,
+            self._interrupt_vectors,
+            self._interrupt_stack,
             self._interrupts_enabled,
             self._heap_ptr,
             self._random_state,
             self._instructions,
             self._cycles,
             self._gas_remaining,
-            current_fiber,
-            next_fiber_id,
-            fibers_snapshot,
+            self._current_fiber,
+            self._next_fiber_id,
+            self._fibers,
         ) = snapshot
         self._flags = dict(zip(("Z", "N", "C", "O"), flags, strict=True))
-        self._stack = [] if stack is None else stack
-        self._input = deque(() if input_values is None else input_values)
         del self._output[output_length:]
-        self._pending_interrupts = deque(() if pending_interrupts is None else pending_interrupts)
-        self._interrupt_vectors = {} if interrupt_vectors is None else interrupt_vectors
-        self._interrupt_stack = [] if interrupt_stack is None else interrupt_stack
-        self._current_fiber = current_fiber
-        self._next_fiber_id = next_fiber_id
-        self._fibers = {} if fibers_snapshot is None else fibers_snapshot
         self._sync_special_registers()
+
+    def _log_undo(self, action: Callable[[], None]) -> None:
+        if self._undo is not None:
+            self._undo.append(action)
 
     def _build_decode_cache(self) -> None:
         if self._program is None:
@@ -569,7 +583,7 @@ class TramoyaVM32:
                 raise _ExecutionFault("División entre cero")
             quotient = self._quotient(dividend, divisor)
             value = quotient if opcode == VMOpcode.DIV else dividend - quotient * divisor
-            self._write_result(a, value)
+            self._write_result(a, value, overflow_check=True)
         elif opcode == VMOpcode.CMP:
             self._set_sub_flags(self._read_register(a), self._read_register(b))
         elif opcode == VMOpcode.CMPI:
@@ -607,6 +621,10 @@ class TramoyaVM32:
         elif opcode == VMOpcode.JC and self._flags["C"]:
             self._jump(a)
         elif opcode == VMOpcode.JNC and not self._flags["C"]:
+            self._jump(a)
+        elif opcode == VMOpcode.JLT and self._flags["N"] != self._flags["O"]:
+            self._jump(a)
+        elif opcode == VMOpcode.JGT and not self._flags["Z"] and self._flags["N"] == self._flags["O"]:
             self._jump(a)
         elif opcode == VMOpcode.PUSH:
             self._push(self._read_register(a))
@@ -666,7 +684,7 @@ class TramoyaVM32:
             if math.isnan(left) or math.isnan(right):
                 self._flags.update(Z=False, N=False, C=True, O=False)
             else:
-                self._set_float_flags(left - right)
+                self._flags.update(Z=left == right, N=left < right, C=False, O=False)
         elif opcode == VMOpcode.FTOI:
             fval = self._float_from_reg(b)
             if math.isnan(fval) or math.isinf(fval):
@@ -789,7 +807,8 @@ class TramoyaVM32:
         """Empaqueta un float en un registro y actualiza banderas flotantes."""
         bits = struct.unpack('I', struct.pack('f', value))[0]
         self._write_register(dest, signed32(bits))
-        self._set_float_flags(value)
+        # Las banderas describen el float32 realmente almacenado, no el double previo.
+        self._set_float_flags(struct.unpack('f', struct.pack('I', bits))[0])
 
     def _set_float_flags(self, value: float) -> None:
         """Z=cero, N=negativo, C=NaN, O=infinito."""
@@ -802,15 +821,19 @@ class TramoyaVM32:
         )
 
     def _push(self, value: int) -> None:
-        if len(self._stack) >= self.config.stack_limit:
+        stack = self._stack
+        if len(stack) >= self.config.stack_limit:
             raise _ExecutionFault("Desbordamiento superior de pila")
-        self._stack.append(signed32(value))
+        stack.append(signed32(value))
+        self._log_undo(stack.pop)
         self._sync_special_registers()
 
     def _pop(self) -> int:
-        if not self._stack:
+        stack = self._stack
+        if not stack:
             raise _ExecutionFault("Desbordamiento inferior de pila")
-        value = self._stack.pop()
+        value = stack.pop()
+        self._log_undo(lambda: stack.append(value))
         self._sync_special_registers()
         return value
 
@@ -920,10 +943,13 @@ class TramoyaVM32:
         raise _HaltSignal(self._read_register(1))
 
     def _sys_read_int(self) -> None:
-        if not self._input:
+        queue = self._input
+        if not queue:
             self._pc -= 4
-            raise _WaitSignal("Esperando entrada para read_int")
-        self._write_result(1, self._input.popleft())
+            raise _RetryWaitSignal("Esperando entrada para read_int")
+        value = queue.popleft()
+        self._log_undo(lambda: queue.appendleft(value))
+        self._write_result(1, value)
 
     def _sys_random(self) -> None:
         value = self._random_state & 0xFFFFFFFF
@@ -1016,7 +1042,11 @@ class TramoyaVM32:
         return count
 
     def provide_input(self, *values: int) -> str:
-        self._input.extend(signed32(int(value)) for value in values)
+        normalized = [signed32(int(value)) for value in values]
+        queue = self._input
+        queue.extend(normalized)
+        if normalized:
+            self._log_undo(lambda: [queue.pop() for _ in normalized])
         if self.state == "WAITING":
             self.machine.trigger("wake")
         return self.state
@@ -1028,38 +1058,56 @@ class TramoyaVM32:
             self._validate_executable(address)
         except _ExecutionFault as exc:
             raise ValueError(str(exc)) from exc
-        self._interrupt_vectors[vector] = address
+        vectors = self._interrupt_vectors
+        if vector in vectors:
+            previous = vectors[vector]
+            self._log_undo(lambda: vectors.__setitem__(vector, previous))
+        else:
+            self._log_undo(lambda: vectors.pop(vector, None))
+        vectors[vector] = address
 
     def request_interrupt(self, vector: int) -> None:
         if not 0 <= vector <= 255:
             raise ValueError("Vector de interrupción inválido")
-        self._pending_interrupts.append(vector)
+        pending = self._pending_interrupts
+        pending.append(vector)
+        self._log_undo(pending.pop)
 
     def _enter_interrupt(self, vector: int) -> None:
+        if self._current_fiber != 0:
+            raise _ExecutionFault("Las interrupciones solo se atienden en la fibra principal")
         if len(self._interrupt_stack) >= self.config.interrupt_depth:
             raise _ExecutionFault("Profundidad máxima de interrupciones excedida")
         if vector not in self._interrupt_vectors:
             raise _ExecutionFault(f"Vector de interrupción {vector} no configurado")
         target = self._interrupt_vectors[vector]
         self._validate_executable(target)
-        self._interrupt_stack.append((self._pc, dict(self._flags), self._interrupts_enabled))
+        frames = self._interrupt_stack
+        frames.append((self._pc, dict(self._flags), self._interrupts_enabled, self._current_fiber))
+        self._log_undo(frames.pop)
         self._pc = target
         self._interrupts_enabled = False
 
     def _return_interrupt(self) -> None:
-        if not self._interrupt_stack:
+        frames = self._interrupt_stack
+        if not frames:
             raise _ExecutionFault("IRET sin interrupción activa")
-        pc, flags, enabled = self._interrupt_stack.pop()
+        if frames[-1][3] != self._current_fiber:
+            raise _ExecutionFault("IRET desde una fibra distinta de la interrumpida")
+        frame = frames.pop()
+        self._log_undo(lambda: frames.append(frame))
+        pc, flags, enabled, _fiber = frame
         self._validate_executable(pc)
         self._pc = pc
-        self._flags = flags
+        self._flags = dict(flags)
         self._interrupts_enabled = enabled
 
     # ── Fibras cooperativas ────────────────────────────────────────
 
     def _spawn_fiber(self, address: int) -> None:
         """Crea una nueva fibra en la dirección dada. Devuelve su ID en R1."""
-        if len(self._fibers) >= self.config.fiber_limit:
+        live = sum(1 for f in self._fibers.values() if f.fiber_id != 0 and f.state != "FINISHED")
+        if live >= self.config.fiber_limit:
             raise _ExecutionFault(f"Límite de fibras alcanzado ({self.config.fiber_limit})")
         self._validate_executable(address)
         fiber_id = self._next_fiber_id
@@ -1073,7 +1121,7 @@ class TramoyaVM32:
             state="READY",
             parent_id=self._current_fiber,
         )
-        self._fibers[fiber_id] = fiber
+        self._store_fiber(fiber)
         self._write_result(1, fiber_id)
 
     def _switch_fiber(self, fiber_id: int) -> None:
@@ -1092,17 +1140,21 @@ class TramoyaVM32:
         """Termina la fibra actual y regresa a la fibra padre."""
         if self._current_fiber == 0:
             raise _ExecutionFault("La fibra principal no puede terminar con FRET")
-        fiber = self._fibers.get(self._current_fiber)
+        fibers = self._fibers
+        fiber = fibers.get(self._current_fiber)
         parent_id = fiber.parent_id if fiber is not None else 0
-        if fiber is not None:
-            fiber.state = "FINISHED"
-        parent = self._fibers.get(parent_id)
+        parent = fibers.get(parent_id)
         if parent is None or parent.state == "FINISHED":
             parent_id = 0
-            parent = self._fibers.get(parent_id)
+            parent = fibers.get(parent_id)
         if parent is None:
             raise _ExecutionFault("No hay fibra padre a la cual regresar")
         self._load_fiber_context(parent_id)
+        if fiber is not None:
+            # La fibra terminada se retira: no cuenta para fiber_limit y
+            # SWITCH hacia ella falla como fibra inexistente.
+            del fibers[fiber.fiber_id]
+            self._log_undo(lambda: fibers.__setitem__(fiber.fiber_id, fiber))
 
     def _save_fiber_context(self) -> None:
         """Guarda el estado actual de ejecución en la fibra activa."""
@@ -1117,8 +1169,9 @@ class TramoyaVM32:
                 state="READY",
                 parent_id=0,
             )
-            self._fibers[self._current_fiber] = fiber
+            self._store_fiber(fiber)
         else:
+            self._remember_fiber(fiber)
             fiber.pc = self._pc
             fiber.registers = self._registers.copy()
             fiber.flags = dict(self._flags)
@@ -1132,9 +1185,29 @@ class TramoyaVM32:
         self._registers = fiber.registers.copy()
         self._flags = dict(fiber.flags)
         self._stack = fiber.stack.copy()
+        self._remember_fiber(fiber)
         fiber.state = "RUNNING"
         self._current_fiber = fiber_id
         self._sync_special_registers()
+
+    def _store_fiber(self, fiber: _FiberContext) -> None:
+        fibers = self._fibers
+        previous = fibers.get(fiber.fiber_id)
+        fibers[fiber.fiber_id] = fiber
+        if previous is None:
+            self._log_undo(lambda: fibers.pop(fiber.fiber_id, None))
+        else:
+            self._log_undo(lambda: fibers.__setitem__(fiber.fiber_id, previous))
+
+    def _remember_fiber(self, fiber: _FiberContext) -> None:
+        # Los campos de una fibra se reasignan, nunca se mutan en sitio, así que
+        # guardar las referencias basta para deshacer el cambio.
+        saved = (fiber.pc, fiber.registers, fiber.flags, fiber.stack, fiber.state, fiber.parent_id)
+
+        def restore() -> None:
+            fiber.pc, fiber.registers, fiber.flags, fiber.stack, fiber.state, fiber.parent_id = saved
+
+        self._log_undo(restore)
 
     def step(self) -> str:
         if self.state == "READY":
@@ -1310,26 +1383,9 @@ class TramoyaVM32:
         return SNAPSHOT_MAGIC + zlib.compress(encoded, level=9)
 
     def restore_bytes(self, snapshot: bytes) -> None:
-        if not snapshot.startswith(SNAPSHOT_MAGIC):
-            raise ValueError("Firma de snapshot VM32 inválida")
-        previous = self.snapshot_bytes() if self._program is not None else None
-        try:
-            payload = self._decode_snapshot(snapshot)
-            self._apply_snapshot(payload)
-        except Exception as exc:
-            if previous is not None:
-                payload = self._decode_snapshot(previous)
-                self._apply_snapshot(payload)
-            else:
-                # Una restauración sobre una VM vacía también es atómica: si
-                # load_dict alcanzó a mutar el ciclo de vida, volver a CREATED.
-                self._initialize_core()
-                self.machine = self._build_lifecycle()
-            if isinstance(exc, (ValueError, MachineError)):
-                raise
-            raise ValueError("Contenido de snapshot VM32 inválido") from exc
-        self._trace.clear()
-        self._trace_sequence = 0
+        """Restaura un snapshot de forma atómica: si falla, la VM no cambia."""
+        payload = self._decode_snapshot_payload(snapshot, MAX_SNAPSHOT_RAW_BYTES)
+        self._commit_snapshot(self._parse_snapshot(payload))
 
     @classmethod
     def from_snapshot_bytes(
@@ -1339,29 +1395,37 @@ class TramoyaVM32:
         trace_size: int | None = None,
         capabilities: frozenset[str] | None = None,
         memory_chip: NonVolatileMemoryChip | None = None,
+        limits: VMConfig | None = None,
     ) -> "TramoyaVM32":
-        """Crea una VM con la RAM y límites requeridos por el snapshot."""
+        """Crea una VM con la RAM que requiere el snapshot.
+
+        Las capacidades las decide el host: sin ``capabilities`` se usan las de
+        ``VMConfig()``, nunca las embebidas en el snapshot. Con ``limits``, cada
+        límite de recursos del snapshot debe caber en el del host.
+        """
         payload = cls._decode_snapshot_payload(snapshot, MAX_SNAPSHOT_RAW_BYTES)
         config_data = payload.get("config")
         if not isinstance(config_data, Mapping):
             raise ValueError("Snapshot sin configuración válida")
         defaults = VMConfig()
-        embedded_capabilities = config_data.get("capabilities", defaults.capabilities)
         if capabilities is None:
-            if not isinstance(embedded_capabilities, (list, tuple, set, frozenset)) or not all(
-                isinstance(value, str) for value in embedded_capabilities
-            ):
-                raise ValueError("Capabilities inválidas en snapshot")
-            capabilities = frozenset(embedded_capabilities)
+            capabilities = defaults.capabilities
+
         def config_integer(name: str, default: int | None = None) -> int:
             value = config_data.get(name, default)
             if type(value) is not int:
                 raise ValueError(f"{name} inválido en snapshot")
+            if limits is not None and name != "memory_words" and value > getattr(limits, name):
+                raise ValueError(
+                    f"{name} del snapshot ({value}) excede el límite del host ({getattr(limits, name)})"
+                )
             return value
 
         protect_code = config_data.get("protect_code", defaults.protect_code)
         if type(protect_code) is not bool:
             raise ValueError("protect_code inválido en snapshot")
+        if limits is not None and limits.protect_code and not protect_code:
+            raise ValueError("El snapshot desactiva protect_code y el host lo exige")
         try:
             config = VMConfig(
                 memory_words=config_integer("memory_words"),
@@ -1376,133 +1440,147 @@ class TramoyaVM32:
                 output_limit=config_integer("output_limit", defaults.output_limit),
                 fiber_limit=config_integer("fiber_limit", defaults.fiber_limit),
                 protect_code=protect_code,
-                capabilities=capabilities,
+                capabilities=frozenset(capabilities),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Configuración inválida en snapshot") from exc
+            raise ValueError(f"Configuración inválida en snapshot: {exc}") from exc
         vm = cls(config, memory_chip=memory_chip)
-        vm._apply_snapshot(payload)
-        vm._trace.clear()
-        vm._trace_sequence = 0
+        vm._commit_snapshot(vm._parse_snapshot(payload))
         return vm
-
-    def _decode_snapshot(self, snapshot: bytes) -> Mapping[str, Any]:
-        maximum = min(
-            self.config.memory_words * 16 + self.config.output_limit * 8 + 2_000_000,
-            MAX_SNAPSHOT_RAW_BYTES,
-        )
-        return self._decode_snapshot_payload(snapshot, maximum)
 
     @staticmethod
     def _decode_snapshot_payload(snapshot: bytes, maximum: int) -> Mapping[str, Any]:
         if not snapshot.startswith(SNAPSHOT_MAGIC):
             raise ValueError("Firma de snapshot VM32 inválida")
         decompressor = zlib.decompressobj()
-        raw = decompressor.decompress(snapshot[len(SNAPSHOT_MAGIC):], maximum + 1)
+        try:
+            raw = decompressor.decompress(snapshot[len(SNAPSHOT_MAGIC):], maximum + 1)
+        except zlib.error as exc:
+            raise ValueError("Snapshot VM32 corrupto") from exc
         if len(raw) > maximum or decompressor.unconsumed_tail or not decompressor.eof:
             raise ValueError("Snapshot VM32 excede el tamaño permitido o está truncado")
         try:
             payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise ValueError("JSON de snapshot VM32 inválido") from exc
         if not isinstance(payload, dict):
             raise ValueError("Estructura de snapshot VM32 inválida")
         return payload
 
-    def _apply_snapshot(self, payload: Mapping[str, Any]) -> None:
+    def _parse_snapshot(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Valida un snapshot decodificado contra esta VM sin modificarla."""
+        try:
+            return self._parse_snapshot_fields(payload)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("Contenido de snapshot VM32 inválido") from exc
+
+    def _parse_snapshot_fields(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        config = self.config
         version = payload.get("version")
         if version not in {1, SNAPSHOT_VERSION}:
             raise ValueError("Versión de snapshot VM32 no compatible")
-        config = payload.get("config")
-        if not isinstance(config, Mapping) or config.get("memory_words") != self.config.memory_words:
+        snapshot_config = payload.get("config")
+        if not isinstance(snapshot_config, Mapping) or snapshot_config.get("memory_words") != config.memory_words:
             raise ValueError("El snapshot requiere otro tamaño de memoria")
         core = payload.get("core")
         program_data = payload.get("program")
         lifecycle = payload.get("lifecycle")
-        if not isinstance(core, Mapping) or not isinstance(program_data, Mapping) or not isinstance(lifecycle, Mapping):
+        if not isinstance(core, Mapping) or not isinstance(program_data, Mapping) or not isinstance(lifecycle, dict):
             raise ValueError("Estructura de snapshot incompleta")
 
         if version == 1:
             dense_memory = core.get("memory")
-            if not isinstance(dense_memory, list) or len(dense_memory) != self.config.memory_words:
+            if not isinstance(dense_memory, list) or len(dense_memory) != config.memory_words:
                 raise ValueError("Memoria densa inválida en snapshot")
-            if not all(type(value) is int and -(1 << 31) <= value < (1 << 31) for value in dense_memory):
+            if not all(_is_int32(value) for value in dense_memory):
                 raise ValueError("Valor de memoria fuera de int32")
-            memory = PagedMemory(self.config.memory_words)
+            memory = PagedMemory(config.memory_words)
             memory.write_block(0, dense_memory)
         else:
             page_words = core.get("memory_page_words", 4096)
             if type(page_words) is not int or not 256 <= page_words <= 65_536:
                 raise ValueError("Tamaño de página inválido")
-            memory = PagedMemory.from_snapshot(
-                self.config.memory_words,
-                core.get("memory_pages"),
-                page_words=page_words,
-            )
+            memory = PagedMemory.from_snapshot(config.memory_words, core.get("memory_pages"), page_words=page_words)
 
-        registers = core.get("registers")
-        if not isinstance(registers, list) or len(registers) != 16 or not all(
-            type(value) is int and -(1 << 31) <= value < (1 << 31) for value in registers
-        ):
+        def int32_list(value: object, name: str) -> list[int]:
+            if not isinstance(value, list) or not all(_is_int32(item) for item in value):
+                raise ValueError(f"{name} inválida en snapshot")
+            return list(value)
+
+        def flag_map(value: object, name: str) -> dict[str, bool]:
+            if not isinstance(value, Mapping) or set(value) != {"Z", "N", "C", "O"} or not all(
+                type(item) is bool for item in value.values()
+            ):
+                raise ValueError(f"{name} inválidas en snapshot")
+            return dict(value)
+
+        registers = int32_list(core.get("registers"), "Registros")
+        if len(registers) != 16:
             raise ValueError("Registros inválidos en snapshot")
-        integer_fields = ("entry", "code_size", "data_size")
-        if not all(type(program_data.get(field)) is int for field in integer_fields):
+        if not all(type(program_data.get(field)) is int for field in ("entry", "code_size", "data_size")):
             raise ValueError("Metadatos de programa inválidos")
-        total = int(program_data["code_size"]) + int(program_data["data_size"])
-        if not 0 < total <= self.config.memory_words:
+        total = program_data["code_size"] + program_data["data_size"]
+        if not 0 < total <= config.memory_words:
             raise ValueError("Tamaño de programa inválido")
+        symbols = program_data.get("symbols", {})
+        if not isinstance(symbols, dict) or not all(
+            isinstance(name, str) and type(value) is int for name, value in symbols.items()
+        ):
+            raise ValueError("Tabla de símbolos inválida en snapshot")
+        source_name = program_data.get("source_name", "<snapshot>")
+        if not isinstance(source_name, str):
+            raise ValueError("Nombre de programa inválido en snapshot")
         program = Program32(
             words=memory.read_block(0, total),
             entry=program_data["entry"],
             code_size=program_data["code_size"],
             data_size=program_data["data_size"],
-            symbols=program_data["symbols"],
-            source_name=program_data["source_name"],
+            symbols=dict(symbols),
+            source_name=source_name,
         )
 
-        flags = core.get("flags")
-        if not isinstance(flags, Mapping) or set(flags) != {"Z", "N", "C", "O"} or not all(
-            type(value) is bool for value in flags.values()
-        ):
-            raise ValueError("Banderas inválidas en snapshot")
+        def executable(address: object) -> bool:
+            return type(address) is int and 0 <= address < program.code_size and address % 4 == 0
 
-        def int32_list(value: object, name: str) -> list[int]:
-            if not isinstance(value, list) or not all(
-                type(item) is int and -(1 << 31) <= item < (1 << 31) for item in value
-            ):
-                raise ValueError(f"{name} inválida en snapshot")
-            return list(value)
-
+        flags = flag_map(core.get("flags"), "Banderas")
         stack = int32_list(core.get("stack"), "Pila")
         input_values = int32_list(core.get("input"), "Entrada")
         output = core.get("output")
-        if not isinstance(output, list) or not all(
-            isinstance(value, str) or type(value) is int and -(1 << 31) <= value < (1 << 31)
-            for value in output
-        ):
+        if not isinstance(output, list) or not all(isinstance(value, str) or _is_int32(value) for value in output):
             raise ValueError("Salida inválida en snapshot")
 
-        interrupt_vectors_raw = core.get("interrupt_vectors")
-        if not isinstance(interrupt_vectors_raw, Mapping):
+        vectors_raw = core.get("interrupt_vectors")
+        if not isinstance(vectors_raw, Mapping):
             raise ValueError("Vectores de interrupción inválidos")
-        try:
-            interrupt_vectors = {int(key): int(value) for key, value in interrupt_vectors_raw.items()}
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Vectores de interrupción inválidos") from exc
+        interrupt_vectors: dict[int, int] = {}
+        for key, target in vectors_raw.items():
+            if not (type(key) is int or (isinstance(key, str) and key.isdigit())) or type(target) is not int:
+                raise ValueError("Vectores de interrupción inválidos")
+            vector = int(key)
+            if not 0 <= vector <= 255:
+                raise ValueError("Vector de interrupción inválido")
+            if not executable(target):
+                raise ValueError(f"Dirección no ejecutable: {target}")
+            interrupt_vectors[vector] = target
         pending_interrupts = int32_list(core.get("pending_interrupts"), "Cola de interrupciones")
-        interrupt_stack_raw = core.get("interrupt_stack")
-        if not isinstance(interrupt_stack_raw, list):
-            raise ValueError("Pila de interrupciones inválida")
-        interrupt_stack: list[tuple[int, dict[str, bool], bool]] = []
-        for item in interrupt_stack_raw:
-            if not isinstance(item, list) or len(item) != 3:
+        if any(not 0 <= vector <= 255 for vector in pending_interrupts):
+            raise ValueError("Interrupción pendiente inválida")
+
+        frames_raw = core.get("interrupt_stack")
+        if not isinstance(frames_raw, list) or len(frames_raw) > config.interrupt_depth:
+            raise ValueError("Pila de interrupciones inválida o excede el límite")
+        interrupt_stack: list[tuple[int, dict[str, bool], bool, int]] = []
+        for item in frames_raw:
+            # Los snapshots anteriores guardaban marcos de tres campos (fibra 0).
+            if not isinstance(item, list) or len(item) not in {3, 4}:
                 raise ValueError("Contexto de interrupción inválido")
-            pc, saved_flags, enabled = item
-            if type(pc) is not int or not isinstance(saved_flags, Mapping) or set(saved_flags) != {"Z", "N", "C", "O"}:
+            pc, saved_flags, enabled = item[:3]
+            frame_fiber = item[3] if len(item) == 4 else 0
+            if type(pc) is not int or type(enabled) is not bool or type(frame_fiber) is not int:
                 raise ValueError("Contexto de interrupción inválido")
-            if not all(type(value) is bool for value in saved_flags.values()) or type(enabled) is not bool:
-                raise ValueError("Contexto de interrupción inválido")
-            interrupt_stack.append((pc, dict(saved_flags), enabled))
+            interrupt_stack.append((pc, flag_map(saved_flags, "Banderas de interrupción"), enabled, frame_fiber))
 
         scalar_names = ("pc", "output_units", "heap_ptr", "random_state", "instructions", "cycles", "gas_remaining")
         if not all(type(core.get(name)) is int for name in scalar_names):
@@ -1510,83 +1588,121 @@ class TramoyaVM32:
         if type(core.get("interrupts_enabled")) is not bool:
             raise ValueError("Estado de interrupciones inválido")
 
-        self.machine.load_dict(lifecycle)
-        self._program = program
-        self._memory = memory
-        self._registers = list(registers)
-        self._flags = dict(flags)
-        self._pc = int(core["pc"])
-        self._stack = stack
-        self._input = deque(input_values)
-        self._output = list(output)
-        self._output_units = int(core.get("output_units", sum(len(v) if isinstance(v, str) else 1 for v in self._output)))
-        self._interrupt_vectors = interrupt_vectors
-        self._pending_interrupts = deque(pending_interrupts)
-        self._interrupt_stack = interrupt_stack
-        self._interrupts_enabled = bool(core["interrupts_enabled"])
-        self._heap_ptr = int(core["heap_ptr"])
-        self._random_state = int(core["random_state"])
-        self._instructions = int(core["instructions"])
-        self._cycles = int(core["cycles"])
-        self._gas_remaining = int(core["gas_remaining"])
-        self._current_fiber = int(core.get("current_fiber", 0))
-        self._next_fiber_id = int(core.get("next_fiber_id", 1))
         fibers_raw = core.get("fibers", [])
-        self._fibers = {}
-        if isinstance(fibers_raw, list):
-            for fdata in fibers_raw:
-                if isinstance(fdata, dict):
-                    fid = int(fdata.get("fiber_id", 0))
-                    self._fibers[fid] = _FiberContext(
-                        fiber_id=fid,
-                        pc=int(fdata.get("pc", 0)),
-                        registers=list(fdata.get("registers", [0] * 16)),
-                        flags=dict(fdata.get("flags", {"Z": True, "N": False, "C": False, "O": False})),
-                        stack=list(fdata.get("stack", [])),
-                        state=str(fdata.get("state", "READY")),
-                        parent_id=int(fdata.get("parent_id", 0)),
-                    )
-        self._validate_restored_state()
+        # La fibra 0 (contexto de la principal) no cuenta para el límite.
+        if not isinstance(fibers_raw, list) or len(fibers_raw) > config.fiber_limit + 1:
+            raise ValueError("Fibras inválidas o exceden el límite")
+        fibers: dict[int, _FiberContext] = {}
+        for data in fibers_raw:
+            if not isinstance(data, Mapping):
+                raise ValueError("Fibra inválida en snapshot")
+            fiber_id, fiber_pc, parent_id = data.get("fiber_id"), data.get("pc"), data.get("parent_id")
+            state = data.get("state")
+            if type(fiber_id) is not int or fiber_id < 0 or fiber_id in fibers:
+                raise ValueError("Identificador de fibra inválido o duplicado")
+            if type(parent_id) is not int or state not in {"READY", "RUNNING", "FINISHED"}:
+                raise ValueError(f"Estado de fibra inválido: {fiber_id}")
+            # Una fibra que cedió con SWITCH como última instrucción guarda pc == code_size.
+            resumable = executable(fiber_pc) or fiber_pc == program.code_size
+            if type(fiber_pc) is not int or (state != "FINISHED" and not resumable):
+                raise ValueError(f"PC de fibra inválido: {fiber_id}")
+            fiber_registers = int32_list(data.get("registers"), "Registros de fibra")
+            fiber_stack = int32_list(data.get("stack"), "Pila de fibra")
+            if len(fiber_registers) != 16 or len(fiber_stack) > config.stack_limit:
+                raise ValueError(f"Contexto de fibra inválido: {fiber_id}")
+            fibers[fiber_id] = _FiberContext(
+                fiber_id=fiber_id,
+                pc=fiber_pc,
+                registers=fiber_registers,
+                flags=flag_map(data.get("flags"), "Banderas de fibra"),
+                stack=fiber_stack,
+                state=state,
+                parent_id=parent_id,
+            )
+        if sum(1 for f in fibers.values() if f.fiber_id != 0 and f.state != "FINISHED") > config.fiber_limit:
+            raise ValueError("Fibras inválidas o exceden el límite")
+        current_fiber = core.get("current_fiber", 0)
+        next_fiber_id = core.get("next_fiber_id", 1)
+        if type(current_fiber) is not int or (current_fiber != 0 and current_fiber not in fibers):
+            raise ValueError("Fibra actual inválida en snapshot")
+        if type(next_fiber_id) is not int or next_fiber_id <= max(fibers, default=0):
+            raise ValueError("Siguiente identificador de fibra inválido")
+
+        state_name = lifecycle.get("state")
+        if state_name not in FINAL_STATES and not executable(core["pc"]):
+            raise ValueError(f"Dirección no ejecutable: {core['pc']}")
+        if len(stack) > config.stack_limit:
+            raise ValueError("Pila excede el límite configurado")
+        if not len(program.words) <= core["heap_ptr"] <= config.memory_words:
+            raise ValueError("Puntero de heap inválido")
+        if not 0 <= core["gas_remaining"] <= config.gas_limit:
+            raise ValueError("Gas inválido")
+        if core["instructions"] < 0 or core["cycles"] < 0:
+            raise ValueError("Contadores de ejecución inválidos")
+        expected_output_units = sum(len(value) if isinstance(value, str) else 1 for value in output)
+        if core["output_units"] != expected_output_units or not 0 <= expected_output_units <= config.output_limit:
+            raise ValueError("Salida excede el límite configurado")
+
+        return {
+            "lifecycle": lifecycle,
+            "program": program,
+            "memory": memory,
+            "registers": registers,
+            "flags": flags,
+            "pc": core["pc"],
+            "stack": stack,
+            "input": input_values,
+            "output": list(output),
+            "output_units": expected_output_units,
+            "interrupt_vectors": interrupt_vectors,
+            "pending_interrupts": pending_interrupts,
+            "interrupt_stack": interrupt_stack,
+            "interrupts_enabled": core["interrupts_enabled"],
+            "heap_ptr": core["heap_ptr"],
+            "random_state": core["random_state"],
+            "instructions": core["instructions"],
+            "cycles": core["cycles"],
+            "gas_remaining": core["gas_remaining"],
+            "fibers": fibers,
+            "current_fiber": current_fiber,
+            "next_fiber_id": next_fiber_id,
+        }
+
+    def _commit_snapshot(self, restored: Mapping[str, Any]) -> None:
+        # load_dict es atómico y es el único paso que puede fallar: si lo hace,
+        # todavía no se ha tocado ningún campo de la VM.
+        try:
+            self.machine.load_dict(restored["lifecycle"])
+        except MachineError:
+            raise
+        except Exception as exc:
+            raise ValueError("Ciclo de vida de snapshot inválido") from exc
+        self._program = restored["program"]
+        self._memory = restored["memory"]
+        self._registers = restored["registers"]
+        self._flags = restored["flags"]
+        self._pc = restored["pc"]
+        self._stack = restored["stack"]
+        self._input = deque(restored["input"])
+        self._output = restored["output"]
+        self._output_units = restored["output_units"]
+        self._interrupt_vectors = restored["interrupt_vectors"]
+        self._pending_interrupts = deque(restored["pending_interrupts"])
+        self._interrupt_stack = restored["interrupt_stack"]
+        self._interrupts_enabled = restored["interrupts_enabled"]
+        self._heap_ptr = restored["heap_ptr"]
+        self._random_state = restored["random_state"]
+        self._instructions = restored["instructions"]
+        self._cycles = restored["cycles"]
+        self._gas_remaining = restored["gas_remaining"]
+        self._fibers = restored["fibers"]
+        self._current_fiber = restored["current_fiber"]
+        self._next_fiber_id = restored["next_fiber_id"]
+        self._pending_event = None
         self._build_decode_cache()
         self._sync_special_registers()
-
-    def _validate_restored_state(self) -> None:
-        if self._program is None:
-            raise ValueError("Snapshot sin programa")
-        if self.state not in FINAL_STATES:
-            self._validate_executable(self._pc)
-        if len(self._stack) > self.config.stack_limit:
-            raise ValueError("Pila excede el límite configurado")
-        program_end = len(self._program.words)
-        if not program_end <= self._heap_ptr <= len(self._memory):
-            raise ValueError("Puntero de heap inválido")
-        if not 0 <= self._gas_remaining <= self.config.gas_limit:
-            raise ValueError("Gas inválido")
-        if self._instructions < 0 or self._cycles < 0:
-            raise ValueError("Contadores de ejecución inválidos")
-        expected_output_units = sum(len(value) if isinstance(value, str) else 1 for value in self._output)
-        if self._output_units != expected_output_units or not 0 <= self._output_units <= self.config.output_limit:
-            raise ValueError("Salida excede el límite configurado")
-        if any(not 0 <= vector <= 255 for vector in self._pending_interrupts):
-            raise ValueError("Interrupción pendiente inválida")
-        for vector, target in self._interrupt_vectors.items():
-            if not 0 <= vector <= 255:
-                raise ValueError("Vector de interrupción inválido")
-            try:
-                self._validate_executable(target)
-            except _ExecutionFault as exc:
-                raise ValueError(str(exc)) from exc
-        if len(self._interrupt_stack) > self.config.interrupt_depth:
-            raise ValueError("Pila de interrupciones excede el límite")
-        if len(self._fibers) > self.config.fiber_limit:
-            raise ValueError("Número de fibras excede el límite")
-        for fiber in self._fibers.values():
-            if fiber.state not in {"READY", "RUNNING", "FINISHED"}:
-                raise ValueError(f"Estado de fibra inválido: {fiber.state}")
-            if len(fiber.registers) != 16:
-                raise ValueError("Registros de fibra inválidos")
-            if len(fiber.stack) > self.config.stack_limit:
-                raise ValueError("Pila de fibra excede el límite")
+        self._trace.clear()
+        self._trace_sequence = 0
 
     def save_snapshot(self, path: str | Path) -> Path:
         destination = Path(path)

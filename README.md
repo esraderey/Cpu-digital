@@ -32,7 +32,11 @@ banderas, memoria, pila, recursos, salida, símbolos y traza en tiempo real.
 .\.venv\Scripts\python.exe -m cpu_digital.ui_server
 ```
 
-La consola abre `http://127.0.0.1:8765/` y solo escucha en el equipo local. También
+La consola abre `http://127.0.0.1:8765/` y solo escucha en el equipo local. La API
+rechaza peticiones con un `Host` u `Origin` ajenos y exige `Content-Type` JSON, de modo
+que otras páginas abiertas en el navegador no pueden controlarla. Con `--host` solo se
+aceptan los nombres de loopback y ese mismo host: para abrirla desde la red local usa
+`--host <IP-de-la-máquina>` y entra por esa IP (`0.0.0.0` solo admite loopback). También
 puedes iniciarla con el comando `tramoya-ui` después de instalar el proyecto. Usa
 `--no-open` si no quieres que abra el navegador automáticamente.
 
@@ -45,7 +49,7 @@ puedes iniciarla con el comando `tramoya-ui` después de instalar el proyecto. U
 - Ejecución continua optimizada; `step()` conserva instrumentación completa.
 - Snapshots v2 dispersos y compatibles con snapshots densos v1.
 - Ensamblador limitado antes de reservar `.space` para evitar agotamiento accidental.
-- **51 instrucciones** en formato fijo de 4 palabras.
+- **61 instrucciones** en formato fijo de 4 palabras.
 - **FPU softcore** IEEE 754 single-precision (9 instrucciones).
 - **Aritmética extendida** de 64 bits con cadena de carry (3 instrucciones).
 - **Fibras cooperativas** con context switch completo (3 instrucciones).
@@ -215,7 +219,7 @@ caracteres (`'A'`). Las etiquetas no distinguen mayúsculas de minúsculas.
 | Datos | `LOAD`, `LOADI`, `SAVE` |
 | Aritmética | `ADD`, `ADDI`, `SUB`, `SUBI`, `MUL`, `MULI`, `DIV`, `MOD` |
 | Comparación | `CMP`, `CMPI` |
-| Saltos | `JMP`, `JZ`, `JNZ`, `JNEG`, `JPOS` |
+| Saltos | `JMP`, `JZ`, `JNZ`, `JNEG`, `JPOS`, `JLT`, `JGT` |
 | Entrada/salida | `IN`, `OUT`, `OUTC` |
 | Pila | `PUSH`, `POP`, `CALL`, `RET` |
 | Bits | `AND`, `OR`, `XOR`, `NOT`, `SHL`, `SHR` |
@@ -274,7 +278,7 @@ cpu_digital/
   isa.py                  ISA de 16 bits
   assembler.py            ensamblador/desensamblador (16 bits)
   vm32.py                 VM de 32 bits con FPU, aritmética 64-bit y fibras
-  vm32_isa.py             ISA de 32 bits (51 instrucciones)
+  vm32_isa.py             ISA de 32 bits (61 instrucciones)
   vm32_assembler.py       ensamblador/desensamblador (VM32)
   memory.py               memoria paginada de palabras int32
   ui_server.py            consola web de instrumentación

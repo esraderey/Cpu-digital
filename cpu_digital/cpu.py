@@ -30,7 +30,9 @@ _ADDRESS_OPS = frozenset(
         Opcode.XOR,
     }
 )
-_TARGET_OPS = frozenset({Opcode.JMP, Opcode.JZ, Opcode.JNZ, Opcode.JNEG, Opcode.JPOS, Opcode.CALL})
+_TARGET_OPS = frozenset(
+    {Opcode.JMP, Opcode.JZ, Opcode.JNZ, Opcode.JNEG, Opcode.JPOS, Opcode.JLT, Opcode.JGT, Opcode.CALL}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +464,10 @@ class CPU:
             ctx["pc"] = operand
         elif opcode == Opcode.JPOS and not ctx["flags"]["Z"] and not ctx["flags"]["N"]:
             ctx["pc"] = operand
+        elif opcode == Opcode.JLT and ctx["flags"]["N"] != ctx["flags"]["O"]:
+            ctx["pc"] = operand
+        elif opcode == Opcode.JGT and not ctx["flags"]["Z"] and ctx["flags"]["N"] == ctx["flags"]["O"]:
+            ctx["pc"] = operand
         elif opcode == Opcode.OUT:
             ctx["output"].append(acc)
         elif opcode == Opcode.OUTC:
@@ -587,6 +593,7 @@ class CPU:
         previous = self.machine.to_dict()
         try:
             data = json.loads(snapshot)
+            self._validate_snapshot(data)
             self.machine.load_dict(data)
             self._validate_context()
         except (json.JSONDecodeError, KeyError, TypeError, ValueError, MachineError):
@@ -603,15 +610,63 @@ class CPU:
     def load_snapshot(self, path: str | Path) -> None:
         self.restore(Path(path).read_text(encoding="utf-8"))
 
+    def _validate_snapshot(self, data: Any) -> None:
+        """Valida el snapshot antes de tocar la máquina (load_dict no ve el contexto CPU)."""
+        if not isinstance(data, dict):
+            return  # load_dict rechaza lo que no sea un dict
+        if "initial" in data and data["initial"] != "FETCH":
+            raise ValueError("Estado inicial inválido en snapshot")
+        ctx = data.get("ctx", {})
+        if isinstance(ctx, dict):
+            self._check_context(ctx, data.get("state"))
+        history = data.get("history", [])
+        if isinstance(history, list):
+            for entry in history:
+                if isinstance(entry, dict) and isinstance(entry.get("ctx", {}), dict):
+                    self._check_context(entry.get("ctx", {}), entry.get("state"), history=True)
+
     def _validate_context(self) -> None:
-        if not isinstance(self.ctx.get("memory"), list) or len(self.ctx["memory"]) != self.memory_size:
+        self._check_context(self.ctx, self.state)
+
+    def _check_context(self, ctx: Mapping[str, Any], state: Any, *, history: bool = False) -> None:
+        def int_list(name: str, low: int | None, high: int | None) -> list[int]:
+            values = ctx.get(name)
+            if not isinstance(values, list) or not all(
+                type(item) is int and (low is None or low <= item) and (high is None or item <= high)
+                for item in values
+            ):
+                raise ValueError(f"{name} inválida en snapshot")
+            return values
+
+        if len(int_list("memory", -32768, 32767)) != self.memory_size:
             raise ValueError("El snapshot no corresponde al tamaño de memoria de esta CPU")
-        if not _valid_address(self.ctx, self.ctx.get("pc")) and self.state not in TERMINAL_STATES:
+        pc = ctx.get("pc")
+        if history:
+            if type(pc) is not int or pc < 0:
+                raise ValueError("PC inválido en snapshot")
+        elif not _valid_address(ctx, pc) and state not in TERMINAL_STATES:
             raise ValueError("PC inválido en snapshot")
-        if not isinstance(self.ctx.get("stack"), list):
-            raise ValueError("Pila inválida en snapshot")
-        if not isinstance(self.ctx.get("flags"), dict):
+        acc = ctx.get("acc")
+        if type(acc) is not int or not -32768 <= acc <= 32767:
+            raise ValueError("Acumulador inválido en snapshot")
+        flags = ctx.get("flags")
+        if not isinstance(flags, dict) or set(flags) != {"Z", "N", "O"} or not all(
+            type(value) is bool for value in flags.values()
+        ):
             raise ValueError("Banderas inválidas en snapshot")
+        if type(ctx.get("stack_limit")) is not int or ctx["stack_limit"] != self.stack_limit:
+            raise ValueError("stack_limit del snapshot no corresponde a esta CPU")
+        if len(int_list("stack", -32768, 65535)) > self.stack_limit:
+            raise ValueError("Pila excede el límite configurado")
+        int_list("input", None, None)
+        output = ctx.get("output")
+        if not isinstance(output, list) or not all(type(item) is int or isinstance(item, str) for item in output):
+            raise ValueError("Salida inválida en snapshot")
+        cycles = ctx.get("cycles")
+        if type(cycles) is not int or cycles < 0:
+            raise ValueError("Ciclos inválidos en snapshot")
+        if ctx.get("resume_state") not in ACTIVE_STATES:
+            raise ValueError("resume_state inválido en snapshot")
 
     def diagram_mermaid(self) -> str:
         return self.machine.to_mermaid()

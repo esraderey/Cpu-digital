@@ -12,12 +12,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from tramoya import MachineError
 
 from .memory_chip import NonVolatileMemoryChip
-from .vm32 import VMConfig, VMRuntimeError, TramoyaVM32
+from .vm32 import MAX_MEMORY_WORDS, VMConfig, VMRuntimeError, TramoyaVM32
 from .vm32_assembler import VM32Assembler, VMAssemblyError, VMAssemblyResult
 from .vm32_isa import VM32_MNEMONICS
 
@@ -25,6 +25,20 @@ from .vm32_isa import VM32_MNEMONICS
 UI_DIR = Path(__file__).resolve().parent / "ui"
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
+MAX_GAS_LIMIT = 1_000_000_000
+MAX_STACK_LIMIT = 65_536
+MAX_OUTPUT_LIMIT = 1_000_000
+MAX_TRACE_SIZE = 100_000
+LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+# Techo de recursos que la consola acepta, tanto en /api/load como en snapshots.
+CONSOLE_LIMITS = VMConfig(
+    memory_words=MAX_MEMORY_WORDS,
+    gas_limit=MAX_GAS_LIMIT,
+    stack_limit=MAX_STACK_LIMIT,
+    trace_size=MAX_TRACE_SIZE,
+    output_limit=MAX_OUTPUT_LIMIT,
+    protect_code=False,
+)
 
 DEMOS: Mapping[str, tuple[str, str]] = {
     "hola": ("Hola, VM32", "hola.tasm"),
@@ -58,6 +72,14 @@ def _integer_list(value: Any, name: str) -> list[int]:
     if not isinstance(values, list):
         raise ValueError(f"{name} debe ser una lista")
     return [_integer(item, name) for item in values]
+
+
+def _same_host(netloc: str, names: frozenset[str] | set[str], port: int, *, default_port: int) -> bool:
+    try:
+        parts = urlsplit(f"//{netloc}")
+        return (parts.hostname or "") in names and (parts.port or default_port) == port
+    except ValueError:
+        return False
 
 
 class ConsoleSession:
@@ -107,11 +129,11 @@ class ConsoleSession:
             raise ValueError("config debe ser un objeto")
         return VMConfig(
             memory_words=_integer(config.get("memory_words", defaults.memory_words), "Memoria", minimum=256, maximum=16_777_216),
-            gas_limit=_integer(config.get("gas_limit", defaults.gas_limit), "Gas", minimum=1),
-            stack_limit=_integer(config.get("stack_limit", defaults.stack_limit), "Pila", minimum=1),
+            gas_limit=_integer(config.get("gas_limit", defaults.gas_limit), "Gas", minimum=1, maximum=MAX_GAS_LIMIT),
+            stack_limit=_integer(config.get("stack_limit", defaults.stack_limit), "Pila", minimum=1, maximum=MAX_STACK_LIMIT),
             interrupt_depth=defaults.interrupt_depth,
-            trace_size=_integer(config.get("trace_size", defaults.trace_size), "Traza", minimum=0, maximum=100_000),
-            output_limit=_integer(config.get("output_limit", defaults.output_limit), "Salida", minimum=1),
+            trace_size=_integer(config.get("trace_size", defaults.trace_size), "Traza", minimum=0, maximum=MAX_TRACE_SIZE),
+            output_limit=_integer(config.get("output_limit", defaults.output_limit), "Salida", minimum=1, maximum=MAX_OUTPUT_LIMIT),
             protect_code=bool(config.get("protect_code", defaults.protect_code)),
             capabilities=defaults.capabilities | ({"memory_chip"} if self.memory_chip else set()),
         )
@@ -254,6 +276,7 @@ class ConsoleSession:
                     raw,
                     capabilities=frozenset(capabilities),
                     memory_chip=self.memory_chip,
+                    limits=CONSOLE_LIMITS,
                 )
             self.assembly = None
             self.demo = "snapshot"
@@ -428,8 +451,35 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             raise ValueError("El cuerpo JSON debe ser un objeto")
         return payload
 
+    def _request_allowed(self, content_type: str | None = None) -> bool:
+        """Solo la propia consola puede usar la API: Host local, mismo Origin y,
+        en POST, un Content-Type que el navegador no envía entre sitios sin preflight."""
+        port = self.server.server_address[1]
+        names = self.server.allowed_names  # type: ignore[attr-defined]
+        if not _same_host(self.headers.get("Host", ""), names, port, default_port=80):
+            self._send_json({"ok": False, "error": "Host no permitido"}, HTTPStatus.FORBIDDEN)
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            try:
+                parts = urlsplit(origin)
+            except ValueError:
+                parts = urlsplit("")
+            if parts.scheme != "http" or not _same_host(parts.netloc, names, port, default_port=80):
+                self._send_json({"ok": False, "error": "Origen no permitido"}, HTTPStatus.FORBIDDEN)
+                return False
+        if content_type is not None and self.headers.get_content_type() != content_type:
+            self._send_json(
+                {"ok": False, "error": f"Content-Type debe ser {content_type}"},
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+            return False
+        return True
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if not self._request_allowed():
+            return
         try:
             if parsed.path == "/api/bootstrap":
                 query = parse_qs(parsed.query)
@@ -454,6 +504,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        expected_type = "application/octet-stream" if parsed.path == "/api/restore" else "application/json"
+        if not self._request_allowed(expected_type):
+            return
         try:
             if parsed.path == "/api/load":
                 self._send_json(self.session.load(self._read_json()))
@@ -516,6 +569,8 @@ class ConsoleHTTPServer(ThreadingHTTPServer):
         memory_chip_path: str | Path | None = Path("chips/flash_500mb.sqlite"),
     ):
         super().__init__(address, ConsoleHandler)
+        bind_host = str(address[0]).strip("[]").lower()
+        self.allowed_names = LOOPBACK_NAMES | ({bind_host} if bind_host not in {"", "0.0.0.0", "::"} else set())
         self.session = ConsoleSession(memory_chip_path)
         self.verbose = verbose
 

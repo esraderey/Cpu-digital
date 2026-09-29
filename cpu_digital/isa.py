@@ -37,6 +37,8 @@ class Opcode(IntEnum):
     JNZ = 42
     JNEG = 43
     JPOS = 44
+    JLT = 45
+    JGT = 46
 
     OUT = 50
     OUTC = 51
@@ -90,6 +92,8 @@ _INSTRUCTIONS = (
     Instruction(Opcode.JNZ, "JNZ", "target", "Salta si Z está inactiva"),
     Instruction(Opcode.JNEG, "JNEG", "target", "Salta si N está activa"),
     Instruction(Opcode.JPOS, "JPOS", "target", "Salta si el resultado es positivo"),
+    Instruction(Opcode.JLT, "JLT", "target", "Salta si menor con signo (N ≠ O)"),
+    Instruction(Opcode.JGT, "JGT", "target", "Salta si mayor con signo (Z=0 y N = O)"),
     Instruction(Opcode.OUT, "OUT", description="Emite ACC como número"),
     Instruction(Opcode.OUTC, "OUTC", description="Emite el byte bajo de ACC como carácter"),
     Instruction(Opcode.IN, "IN", description="Consume un valor de la cola de entrada"),

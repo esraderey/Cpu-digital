@@ -458,6 +458,8 @@ Los saltos solo aceptan destinos ejecutables y alineados.
 | `JNZ` | `Z=0` |
 | `JNEG` | `N=1` |
 | `JPOS` | `Z=0 ∧ N=0` |
+| `JLT` | `N ≠ O` (menor con signo tras `CMP`) |
+| `JGT` | `Z=0 ∧ N = O` (mayor con signo tras `CMP`) |
 | `JC` | `C=1` |
 | `JNC` | `C=0` |
 
@@ -556,6 +558,8 @@ Todos los costes omitidos son 1.
 | Salto | `JNZ target` | dir | 1 | Salta si no cero. |
 | Salto | `JNEG target` | dir | 1 | Salta si negativo. |
 | Salto | `JPOS target` | dir | 1 | Salta si positivo. |
+| Salto | `JLT target` | dir | 1 | Salta si menor con signo. |
+| Salto | `JGT target` | dir | 1 | Salta si mayor con signo. |
 | Salto | `JC target` | dir | 1 | Salta si carry. |
 | Salto | `JNC target` | dir | 1 | Salta si no carry. |
 | Pila | `PUSH Rs` | reg | 2 | Apila valor. |
@@ -573,7 +577,7 @@ Todos los costes omitidos son 1.
 | Depuración | `BREAK` | — | 1 | Entra en `PAUSED`. |
 | Terminación | `HALT` | — | 1 | Finaliza con código 0. |
 
-Aliases de ensamblador: `JE=JZ`, `JNE=JNZ`, `JLT=JNEG`, `JGT=JPOS`, `BRK=BREAK`
+Aliases de ensamblador: `JE=JZ`, `JNE=JNZ`, `BRK=BREAK`
 y `SYS=SYSCALL`.
 
 ## 17. Ensamblador

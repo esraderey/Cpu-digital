@@ -58,6 +58,8 @@ class VMOpcode(IntEnum):
     JPOS = 44
     JC = 45
     JNC = 46
+    JLT = 47
+    JGT = 48
 
     PUSH = 50
     POP = 51
@@ -138,6 +140,8 @@ _SPECS = (
     VMInstruction(VMOpcode.JPOS, "JPOS", "target"),
     VMInstruction(VMOpcode.JC, "JC", "target"),
     VMInstruction(VMOpcode.JNC, "JNC", "target"),
+    VMInstruction(VMOpcode.JLT, "JLT", "target", 1, "Salta si menor con signo (N ≠ O)"),
+    VMInstruction(VMOpcode.JGT, "JGT", "target", 1, "Salta si mayor con signo (Z=0 y N = O)"),
     VMInstruction(VMOpcode.PUSH, "PUSH", "reg", 2),
     VMInstruction(VMOpcode.POP, "POP", "reg", 2),
     VMInstruction(VMOpcode.CALL, "CALL", "target", 3),
@@ -183,8 +187,6 @@ VM32_ALIASES: Mapping[str, str] = MappingProxyType(
     {
         "JE": "JZ",
         "JNE": "JNZ",
-        "JLT": "JNEG",
-        "JGT": "JPOS",
         "BRK": "BREAK",
         "SYS": "SYSCALL",
     }

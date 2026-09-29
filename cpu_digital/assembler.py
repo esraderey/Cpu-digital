@@ -12,6 +12,7 @@ from .isa import ISA, Instruction, Opcode, instruction_for_mnemonic
 
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LABEL = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):")
+ADDRESS_SPACE = 0x10000  # la CPU direcciona 65536 palabras
 _SYMBOL_EXPR = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_]*)(?:([+-])((?:0[xX][0-9a-fA-F]+)|(?:0[bB][01]+)|(?:\d+)))?$"
 )
@@ -88,7 +89,7 @@ def _split_values(text: str) -> list[str]:
 def _parse_string(text: str, line: int) -> str:
     try:
         value = ast.literal_eval(text.strip())
-    except (SyntaxError, ValueError) as exc:
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError) as exc:
         raise AssemblyError("Cadena inválida en .STRING", line) from exc
     if not isinstance(value, str):
         raise AssemblyError(".STRING requiere una cadena entre comillas", line)
@@ -102,7 +103,7 @@ def _literal(text: str) -> int | None:
         pass
     try:
         value = ast.literal_eval(text)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
         return None
     if isinstance(value, str) and len(value) == 1:
         return ord(value)
@@ -124,9 +125,14 @@ def _resolve(expression: str, symbols: Mapping[str, int], line: int) -> int:
         raise AssemblyError(f"Símbolo no definido: {name}", line)
     value = symbols[key]
     if operator and offset_text:
-        offset = int(offset_text, 0)
+        offset = int(offset_text, 0 if offset_text[:2].lower() in {"0x", "0b"} else 10)
         value = value + offset if operator == "+" else value - offset
     return value
+
+
+def _check_extent(location: int, line: int) -> None:
+    if location > ADDRESS_SPACE:
+        raise AssemblyError(f"El programa excede el espacio de {ADDRESS_SPACE} palabras", line)
 
 
 def _validate_word(value: int, line: int) -> int:
@@ -178,6 +184,7 @@ class Assembler:
                     raise AssemblyError(".ORG no puede retroceder ni solapar datos", line_number)
                 if new_location < 0:
                     raise AssemblyError("La dirección de .ORG no puede ser negativa", line_number)
+                _check_extent(new_location, line_number)
                 location = new_location
                 highest = max(highest, location)
                 continue
@@ -188,6 +195,7 @@ class Assembler:
                     raise AssemblyError(".WORD requiere al menos un valor", line_number)
                 records.append(_Record(line_number, location, "word", values, original.strip()))
                 location += len(values)
+                _check_extent(location, line_number)
                 highest = max(highest, location)
                 continue
 
@@ -195,6 +203,7 @@ class Assembler:
                 value = _parse_string(tail, line_number)
                 records.append(_Record(line_number, location, "string", value, original.strip()))
                 location += len(value) + 1
+                _check_extent(location, line_number)
                 highest = max(highest, location)
                 continue
 
@@ -213,6 +222,7 @@ class Assembler:
                 _Record(line_number, location, "instruction", (instruction, operand), original.strip())
             )
             location += instruction.words
+            _check_extent(location, line_number)
             highest = max(highest, location)
 
         memory = [0] * highest

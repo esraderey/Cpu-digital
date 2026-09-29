@@ -9,9 +9,9 @@ import struct
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping
 
-from .vm32_isa import VM32_ISA, VMInstruction, VMOpcode, vm32_instruction
+from .vm32_isa import VM32_ISA, VMInstruction, vm32_instruction
 
 
 MAGIC = b"TVM2"
@@ -99,8 +99,10 @@ class Program32:
             raise ValueError("Longitud de bytecode inconsistente")
         try:
             metadata = json.loads(data[_HEADER.size + 4:payload_start].decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise ValueError("Metadatos de bytecode inválidos") from exc
+        if not isinstance(metadata, dict):
+            raise ValueError("Metadatos de bytecode inválidos")
         payload = data[payload_start:]
         if zlib.crc32(payload) & 0xFFFFFFFF != expected_crc:
             raise ValueError("CRC de bytecode inválido")
@@ -222,7 +224,7 @@ def _literal(text: str) -> int | None:
         pass
     try:
         value = ast.literal_eval(text)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
         return None
     if isinstance(value, str) and len(value) == 1:
         return ord(value)
@@ -242,7 +244,7 @@ def _resolve(expression: str, symbols: Mapping[str, int], line: int) -> int:
         raise VMAssemblyError(f"Símbolo no definido: {name}", line)
     value = symbols[key]
     if operator and offset_text:
-        offset = int(offset_text, 0)
+        offset = int(offset_text, 0 if offset_text[:2].lower() in {"0x", "0b"} else 10)
         value = value + offset if operator == "+" else value - offset
     return value
 
@@ -384,7 +386,7 @@ class VM32Assembler:
             elif head == ".STRING":
                 try:
                     value = ast.literal_eval(tail)
-                except (SyntaxError, ValueError) as exc:
+                except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError) as exc:
                     raise VMAssemblyError("Cadena inválida", line_number) from exc
                 if not isinstance(value, str):
                     raise VMAssemblyError(".STRING requiere texto entre comillas", line_number)

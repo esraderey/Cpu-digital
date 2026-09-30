@@ -11,6 +11,7 @@ from tramoya import MachineError
 
 from cpu_digital.vm32 import VMConfig, VMRuntimeError, TramoyaVM32
 from cpu_digital.memory_chip import NonVolatileMemoryChip
+from cpu_digital.tnu import TensorROM, TramoyaNeuralUnit
 from cpu_digital.vm32_assembler import (
     Program32,
     VM32Assembler,
@@ -29,6 +30,7 @@ DEMOS = {
     "entrada": ROOT / "vm_programs" / "entrada.tasm",
     "interrupcion": ROOT / "vm_programs" / "interrupcion.tasm",
     "proteccion": ROOT / "vm_programs" / "proteccion.tasm",
+    "llama2": ROOT / "vm_programs" / "llama2.tasm",
 }
 
 
@@ -51,12 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", nargs="*", type=_integer, default=[], help="Entradas para read_int")
     parser.add_argument("--memory-words", type=int, default=VMConfig().memory_words)
     parser.add_argument("--memory-chip", type=Path, help="Conecta un chip persistente; crea el archivo si no existe")
+    parser.add_argument("--npu-rom", type=Path, help="Conecta el chip TNU con esta ROM de tensores (habilita npu)")
     parser.add_argument("--gas", type=int, default=1_000_000)
     parser.add_argument("--stack-limit", type=int, default=8_192)
     parser.add_argument("--trace-buffer", type=int, default=4_096, help="0 desactiva la instrumentación")
     parser.add_argument("--output-limit", type=int, default=1_000_000)
     parser.add_argument("--max-instructions", type=int, default=None, help="Límite adicional de esta ejecución")
-    parser.add_argument("--deny-capability", action="append", default=[], help="Deshabilita io/random/memory/memory_chip/etc.")
+    parser.add_argument("--deny-capability", action="append", default=[], help="Deshabilita io/random/memory/memory_chip/npu/etc.")
     parser.add_argument("--breakpoint", action="append", default=[], help="Dirección o etiqueta")
     parser.add_argument("--vector", action="append", default=[], help="Configura VECTOR=ETIQUETA")
     parser.add_argument("--interrupt", action="append", type=_integer, default=[], help="Encola una interrupción")
@@ -206,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         capabilities = set(VMConfig().capabilities) - set(args.deny_capability)
         if memory_chip is not None and "memory_chip" not in args.deny_capability:
             capabilities.add("memory_chip")
+        npu = TramoyaNeuralUnit(TensorROM.from_file(args.npu_rom)) if args.npu_rom else None
+        if npu is not None and "npu" not in args.deny_capability:
+            capabilities.add("npu")
         config = VMConfig(
             memory_words=args.memory_words,
             gas_limit=args.gas,
@@ -214,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             output_limit=args.output_limit,
             capabilities=frozenset(capabilities),
         )
-        vm = TramoyaVM32(config, memory_chip=memory_chip)
+        vm = TramoyaVM32(config, memory_chip=memory_chip, npu=npu)
         assembled: VMAssemblyResult | None = None
         symbols: dict[str, int] = {}
 
@@ -224,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                 trace_size=args.trace_buffer,
                 capabilities=frozenset(capabilities),
                 memory_chip=memory_chip,
+                npu=npu,
             )
             symbols = dict(vm.program.symbols) if vm.program else {}
             if args.input:

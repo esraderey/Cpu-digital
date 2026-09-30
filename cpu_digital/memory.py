@@ -133,6 +133,60 @@ class PagedMemory:
             address += chunk_size
             cursor += chunk_size
 
+    def view_bytes(self, start: int, count: int) -> memoryview:
+        """Bytes nativos de ``count`` palabras (formato ``'B'``).
+
+        Sin copia si el rango cae en una sola página asignada; si cruza páginas
+        o toca páginas no asignadas, devuelve una copia contigua. La vista sin
+        copia refleja escrituras posteriores: el llamador debe consumirla antes
+        de escribir.
+        """
+        if not isinstance(start, int) or not isinstance(count, int) or start < 0 or count < 0 or start + count > self._size:
+            raise ValueError("Rango de memoria inválido")
+        page_index, offset = divmod(start, self._page_words)
+        if offset + count <= self._page_words:
+            page = self._pages.get(page_index)
+            if page is None:
+                return memoryview(bytes(4 * count))
+            return memoryview(page).cast("B")[4 * offset:4 * (offset + count)]
+        result = bytearray(4 * count)
+        address = start
+        cursor = 0
+        while cursor < count:
+            page_index, offset = divmod(address, self._page_words)
+            chunk_size = min(count - cursor, self._page_words - offset)
+            page = self._pages.get(page_index)
+            if page is not None:
+                result[4 * cursor:4 * (cursor + chunk_size)] = memoryview(page).cast("B")[
+                    4 * offset:4 * (offset + chunk_size)
+                ]
+            address += chunk_size
+            cursor += chunk_size
+        return memoryview(result)
+
+    def write_bytes(self, start: int, data: bytes | bytearray | memoryview) -> None:
+        """Escribe palabras dadas como bytes nativos; no materializa páginas con ceros."""
+        view = memoryview(data).cast("B")
+        if len(view) % 4:
+            raise ValueError("Los datos deben ocupar palabras completas")
+        count = len(view) // 4
+        if not isinstance(start, int) or start < 0 or start + count > self._size:
+            raise ValueError("Rango de memoria inválido")
+        address = start
+        cursor = 0
+        while cursor < count:
+            page_index, offset = divmod(address, self._page_words)
+            chunk_size = min(count - cursor, self._page_words - offset)
+            chunk = view[4 * cursor:4 * (cursor + chunk_size)]
+            page = self._pages.get(page_index)
+            if page is None and chunk.tobytes().count(0) != len(chunk):
+                page = self._new_page(page_index)
+                self._pages[page_index] = page
+            if page is not None:
+                memoryview(page).cast("B")[4 * offset:4 * (offset + chunk_size)] = chunk
+            address += chunk_size
+            cursor += chunk_size
+
     def snapshot_pages(self) -> list[list[object]]:
         """Devuelve páginas no vacías, recortadas por la derecha."""
         encoded: list[list[object]] = []

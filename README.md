@@ -8,7 +8,9 @@ El repositorio ahora contiene dos arquitecturas:
 
 - **Tramoya VM32:** runtime RISC de 32 bits para scripts seguros, automatización,
   videojuegos, reglas de negocio y extensiones embebidas. Incluye FPU IEEE 754,
-  aritmética de 64 bits y fibras cooperativas. Es la opción recomendada
+  aritmética de 64 bits, fibras cooperativas y el **Chip Neuronal Tramoya (TNU)**,
+  un coprocesador vectorial con el que un programa `.tasm` ejecuta llama2.c.
+  Es la opción recomendada
   para aplicaciones reales. Consulta [VM32.md](VM32.md) y la especificación técnica
   [RFC EXP 00015](RFC-EXP-00015.md).
 - **CPU Digital 16:** arquitectura pequeña para inspección ciclo a ciclo y
@@ -49,10 +51,11 @@ puedes iniciarla con el comando `tramoya-ui` después de instalar el proyecto. U
 - Ejecución continua optimizada; `step()` conserva instrumentación completa.
 - Snapshots v2 dispersos y compatibles con snapshots densos v1.
 - Ensamblador limitado antes de reservar `.space` para evitar agotamiento accidental.
-- **61 instrucciones** en formato fijo de 4 palabras.
+- **79 instrucciones** en formato fijo de 4 palabras.
 - **FPU softcore** IEEE 754 single-precision (9 instrucciones).
 - **Aritmética extendida** de 64 bits con cadena de carry (3 instrucciones).
 - **Fibras cooperativas** con context switch completo (3 instrucciones).
+- **TNU**: 18 instrucciones vectoriales ejecutadas por el host (capacidad `npu`).
 
 ## Chip de memoria no volátil
 
@@ -88,6 +91,26 @@ Benchmark reproducible:
 ```powershell
 .\.venv\Scripts\python.exe benchmarks\benchmark_vm32.py
 ```
+
+## Chip Neuronal Tramoya (TNU)
+
+Coprocesador conectado a VM32 tras la capacidad `npu`. Ejecuta en el host
+productos matriz-vector (float32 e int8), softmax, RMSNorm, RoPE, SiLU y muestreo
+sobre la memoria del invitado, y mapea una ROM de pesos de solo lectura que no
+entra en los snapshots (solo su sha256). El invitado orquesta el transformer: el
+demo `vm_programs/llama2.tasm` ejecuta modelos de llama2.c y escribe texto.
+
+```powershell
+# Modelos de https://huggingface.co/karpathy/tinyllamas (descarga manual a models/)
+.\.venv\Scripts\python.exe -m cpu_digital.tnu_models models\stories260K.bin models\tok512.bin models\stories260K.trom
+.\.venv\Scripts\python.exe tramoya_vm.py --demo llama2 --npu-rom models\stories260K.trom --gas 2000000000 --trace-buffer 0 --input 128 0 1 0
+.\.venv\Scripts\python.exe benchmarks\benchmark_tnu.py
+```
+
+Medido en Python 3.13.2 / Windows x64 (`benchmarks/benchmark_tnu.py`): stories260K
+a ~42 tok/s, stories15M a ~3,0 tok/s en float32 y ~3,5 tok/s en int8, con salida
+idéntica entre ejecuciones con la misma semilla. Requiere Python ≥ 3.12. Detalles en
+[VM32.md](VM32.md) y en la propuesta P5 de [RFC-EXP-00016](RFC-EXP-00016.md).
 
 ## Qué puede hacer
 
@@ -278,7 +301,9 @@ cpu_digital/
   isa.py                  ISA de 16 bits
   assembler.py            ensamblador/desensamblador (16 bits)
   vm32.py                 VM de 32 bits con FPU, aritmética 64-bit y fibras
-  vm32_isa.py             ISA de 32 bits (61 instrucciones)
+  vm32_isa.py             ISA de 32 bits (79 instrucciones)
+  tnu.py                  Chip Neuronal Tramoya: ROM de tensores y núcleos vectoriales
+  tnu_models.py           ROM de llama2.c, BPE y referencia de host
   vm32_assembler.py       ensamblador/desensamblador (VM32)
   memory.py               memoria paginada de palabras int32
   ui_server.py            consola web de instrumentación

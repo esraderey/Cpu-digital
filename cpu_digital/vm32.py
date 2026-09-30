@@ -6,6 +6,7 @@ import json
 import math
 import struct
 import zlib
+from array import array
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,9 +15,11 @@ from typing import Any, Callable, Iterable, Mapping
 from tramoya import Machine, MachineBuilder, MachineError
 
 from .memory import PagedMemory
+from . import tnu
 from .memory_chip import NonVolatileMemoryChip
+from .tnu import MAX_TNU_LENGTH, MAX_TNU_WORK, ROM_BASE, TramoyaNeuralUnit
 from .vm32_assembler import Program32, signed32
-from .vm32_isa import VM32_ISA, VMInstruction, VMOpcode
+from .vm32_isa import TNU_FIRST_OPCODE, VM32_ISA, VMInstruction, VMOpcode
 
 
 SNAPSHOT_MAGIC = b"TVMS32\x01"
@@ -25,6 +28,7 @@ DEFAULT_MEMORY_WORDS = 1_048_576
 MAX_MEMORY_WORDS = 16_777_216
 MAX_SNAPSHOT_RAW_BYTES = 256 * 1024 * 1024
 MAX_MEMORY_CHIP_TRANSFER_BYTES = 4_096
+MAX_ROPE_HEAD_SIZE = 256
 RUNNABLE_STATES = frozenset({"READY", "RUNNING", "PAUSED", "WAITING"})
 FINAL_STATES = frozenset({"HALTED", "FAULTED"})
 
@@ -157,9 +161,12 @@ class TramoyaVM32:
         config: VMConfig | None = None,
         *,
         memory_chip: NonVolatileMemoryChip | None = None,
+        npu: TramoyaNeuralUnit | None = None,
     ):
         self.config = config or VMConfig()
         self.memory_chip = memory_chip
+        self.npu: TramoyaNeuralUnit | None = None
+        self.attach_npu(npu)
         self._trace: deque[VMTraceEntry] = deque(maxlen=self.config.trace_size)
         self._syscalls: dict[int, _Syscall] = {}
         self._program: Program32 | None = None
@@ -220,6 +227,17 @@ class TramoyaVM32:
         """Conecta o desconecta un chip no volátil controlado por el host."""
         self.memory_chip = chip
 
+    def attach_npu(self, npu: TramoyaNeuralUnit | None) -> None:
+        """Conecta o desconecta el coprocesador TNU (requiere además la capacidad ``npu``)."""
+        if npu is not None and not isinstance(npu, TramoyaNeuralUnit):
+            raise TypeError("npu debe ser TramoyaNeuralUnit o None")
+        self.npu = npu
+
+    @property
+    def tnu_config(self) -> tuple[int, int, int]:
+        """Configuración vectorial (VL, VR, VS); (0, 0, 0) si no se ejecutó VCFG."""
+        return (self._vl, self._vr, self._vs)
+
     def _initialize_core(self) -> None:
         self._memory = PagedMemory(self.config.memory_words)
         self._registers = [0] * 16
@@ -245,6 +263,7 @@ class TramoyaVM32:
         self._fibers: dict[int, _FiberContext] = {}
         self._current_fiber: int = 0
         self._next_fiber_id: int = 1
+        self._vl = self._vr = self._vs = 0
         self._sync_special_registers()
 
     def _fresh_lifecycle_context(self) -> dict[str, Any]:
@@ -732,6 +751,8 @@ class TramoyaVM32:
             self._switch_fiber(self._read_register(a))
         elif opcode == VMOpcode.FRET:
             self._finish_fiber()
+        elif opcode >= TNU_FIRST_OPCODE:
+            self._execute_tnu(opcode, a, b, c)
 
     def _effective_address(self, base_register: int, offset: int) -> int:
         return self._read_register(base_register) + offset
@@ -847,11 +868,25 @@ class TramoyaVM32:
 
     def read_memory(self, address: int) -> int:
         if not isinstance(address, int) or not 0 <= address < len(self._memory):
-            raise _ExecutionFault(f"Lectura fuera de memoria: {address!r}")
+            return self._read_rom_word(address)
         return self._memory[address]
+
+    def _read_rom_word(self, address: object) -> int:
+        # Camino frío: solo se llega aquí si la dirección no está en la RAM.
+        rom = self._rom_if_enabled()
+        if rom is not None and type(address) is int and ROM_BASE <= address < ROM_BASE + rom.words:
+            return rom.word(address - ROM_BASE)
+        raise _ExecutionFault(f"Lectura fuera de memoria: {address!r}")
+
+    def _rom_if_enabled(self) -> tnu.TensorROM | None:
+        if self.npu is None or "npu" not in self.config.capabilities:
+            return None
+        return self.npu.rom
 
     def write_memory(self, address: int, value: int) -> None:
         if not isinstance(address, int) or not 0 <= address < len(self._memory):
+            if isinstance(address, int) and address >= ROM_BASE and self._rom_if_enabled() is not None:
+                raise _ExecutionFault(f"La ROM TNU es de solo lectura: {address}")
             raise _ExecutionFault(f"Escritura fuera de memoria: {address!r}")
         if self.config.protect_code and self._program is not None and address < self._program.code_size:
             raise _ExecutionFault(f"Intento de modificar código protegido en {address}")
@@ -938,6 +973,7 @@ class TramoyaVM32:
         self.register_syscall(9, lambda vm: vm._sys_memory_chip_read(), name="memory_chip_read", capability="memory_chip")
         self.register_syscall(10, lambda vm: vm._sys_memory_chip_write(), name="memory_chip_write", capability="memory_chip")
         self.register_syscall(11, lambda vm: vm._sys_memory_chip_size(), name="memory_chip_size", capability="memory_chip")
+        self.register_syscall(12, lambda vm: vm._sys_npu_info(), name="npu_info", capability="npu")
 
     def _sys_exit(self) -> None:
         raise _HaltSignal(self._read_register(1))
@@ -1032,6 +1068,16 @@ class TramoyaVM32:
         if self.memory_chip is None:
             raise _ExecutionFault("No hay un chip de memoria conectado")
         return self.memory_chip
+
+    def _sys_npu_info(self) -> None:
+        npu = self._require_npu()
+        self._write_register(2, npu.rom.words if npu.rom is not None else 0)
+        self._write_result(1, ROM_BASE)
+
+    def _require_npu(self) -> TramoyaNeuralUnit:
+        if self.npu is None:
+            raise _ExecutionFault("No hay un chip TNU conectado")
+        return self.npu
 
     @staticmethod
     def _read_memory_chip_transfer_count(count: int) -> int:
@@ -1209,6 +1255,198 @@ class TramoyaVM32:
 
         self._log_undo(restore)
 
+    # ── TNU: coprocesador vectorial ────────────────────────────────
+    # Orden fijo en cada instrucción: permisos → parámetros → tope de trabajo →
+    # gas → lectura de regiones → cálculo → una única escritura con deshacer.
+    # Hasta la escritura no hay efectos; la escritura registra el contenido
+    # previo en self._undo, así que cualquier fallo se revierte completo.
+
+    def _execute_tnu(self, opcode: VMOpcode, a: int, b: int, c: int) -> None:
+        if "npu" not in self.config.capabilities:
+            raise _ExecutionFault("Capacidad npu no autorizada")
+        self._require_npu()
+        if opcode == VMOpcode.VCFG:
+            self._tnu_configure(self._read_register(a), self._read_register(b), self._read_register(c))
+            return
+        vl = self._vl
+        if not vl:
+            raise _ExecutionFault("VCFG no configurado: VL = 0")
+        reg = self._read_register
+
+        # El destino se valida antes de cobrar y calcular: un destino inválido no
+        # hace trabajo de host que luego el rollback devolvería como gas no gastado.
+        if opcode in {VMOpcode.VADD, VMOpcode.VMUL}:
+            destination = self._tnu_destination(reg(a), vl)
+            self._tnu_charge(opcode, 2 * vl)
+            left, right = self._tnu_floats(reg(b), vl), self._tnu_floats(reg(c), vl)
+            kernel = tnu.vadd if opcode == VMOpcode.VADD else tnu.vmul
+            self._tnu_store(destination, kernel(left, right))
+        elif opcode == VMOpcode.VSCALE:
+            destination = self._tnu_destination(reg(a), vl)
+            self._tnu_charge(opcode, 2 * vl)
+            self._tnu_store(destination, tnu.vscale(self._tnu_floats(reg(b), vl), self._float_from_reg(c)))
+        elif opcode == VMOpcode.VCOPY:
+            destination = self._tnu_destination(reg(a), vl)
+            self._tnu_charge(opcode, vl)
+            self._tnu_store(destination, bytes(self._tnu_bytes(reg(b), vl)))
+        elif opcode == VMOpcode.FDOT:
+            self._tnu_charge(opcode, vl)
+            value = tnu.fdot(self._tnu_floats(reg(b), vl), self._tnu_floats(reg(c), vl))
+            self._float_to_reg(a, array("f", [value])[0])
+        elif opcode in {VMOpcode.MATVEC, VMOpcode.MATTV}:
+            rows, stride = self._tnu_rows(), self._vs or vl
+            span = (rows - 1) * stride + vl
+            is_matvec = opcode == VMOpcode.MATVEC
+            destination = self._tnu_destination(reg(a), rows if is_matvec else vl)
+            # Se cobra lo que se toca: MAC más un coste fijo por producto (fila de
+            # MATVEC, columna de MATTV) y, si el paso es disperso, la región entera.
+            products = rows if is_matvec else vl
+            self._tnu_charge(opcode, max(rows * vl + tnu.TNU_ROW_UNITS * products, span))
+            weights = self._tnu_floats(reg(b), span)
+            if is_matvec:
+                result = tnu.matvec(weights, rows, vl, stride, self._tnu_floats(reg(c), vl))
+            else:
+                result = tnu.mattv(weights, rows, vl, stride, self._tnu_floats(reg(c), rows))
+            self._tnu_store(destination, result)
+        elif opcode == VMOpcode.RMSNORM:
+            destination = self._tnu_destination(reg(a), vl)
+            self._tnu_charge(opcode, 3 * vl)
+            self._tnu_store(destination, tnu.rmsnorm(self._tnu_floats(reg(b), vl), self._tnu_floats(reg(c), vl)))
+        elif opcode in {VMOpcode.VSOFTMAX, VMOpcode.VEXP, VMOpcode.VSILU}:
+            destination = self._tnu_destination(reg(a), vl)
+            self._tnu_charge(opcode, 5 * vl if opcode == VMOpcode.VSOFTMAX else 4 * vl)
+            kernel = {VMOpcode.VSOFTMAX: tnu.softmax, VMOpcode.VEXP: tnu.vexp, VMOpcode.VSILU: tnu.silu}[opcode]
+            self._tnu_store(destination, kernel(self._tnu_floats(reg(b), vl)))
+        elif opcode == VMOpcode.ROPE:
+            position, head_size = reg(b), reg(c)
+            if position < 0:
+                raise _ExecutionFault(f"Posición ROPE inválida: {position}")
+            if not 2 <= head_size <= MAX_ROPE_HEAD_SIZE or head_size % 2 or vl % head_size:
+                raise _ExecutionFault(f"Tamaño de cabeza ROPE inválido: {head_size} con VL={vl}")
+            destination = self._tnu_destination(reg(a), vl)
+            self._tnu_charge(opcode, 4 * vl)
+            self._tnu_store(destination, tnu.rope(self._tnu_floats(destination, vl), position, head_size))
+        elif opcode == VMOpcode.VARGMAX:
+            self._tnu_charge(opcode, 2 * vl)
+            self._write_result(a, tnu.argmax(self._tnu_floats(reg(b), vl)))
+        elif opcode == VMOpcode.VSAMPLE:
+            self._tnu_charge(opcode, 2 * vl)
+            self._write_result(a, tnu.sample(self._tnu_floats(reg(b), vl), self._float_from_reg(c)))
+        elif opcode == VMOpcode.VQUANT:
+            self._tnu_require_q8(vl)
+            destination = self._tnu_destination(reg(a), vl // 4 + 1)
+            self._tnu_charge(opcode, 3 * vl)
+            try:
+                levels, scale = tnu.quantize(self._tnu_floats(reg(b), vl))
+            except ValueError as exc:
+                raise _ExecutionFault(str(exc)) from exc
+            self._tnu_store(destination, levels + array("f", [scale]).tobytes())
+        elif opcode == VMOpcode.QMATVEC:
+            self._tnu_require_q8(vl)
+            rows = self._tnu_rows()
+            destination = self._tnu_destination(reg(a), rows)
+            self._tnu_charge(opcode, rows * vl + tnu.TNU_ROW_UNITS * rows)
+            matrix = self._tnu_bytes(reg(b), rows * vl // 4 + rows)
+            vector = self._tnu_bytes(reg(c), vl // 4 + 1)
+            result = tnu.qmatvec(
+                matrix[:rows * vl], matrix[rows * vl:].cast("f"), rows, vl,
+                vector[:vl], vector[vl:].cast("f")[0],
+            )
+            self._tnu_store(destination, result)
+        elif opcode == VMOpcode.QROW:
+            self._tnu_require_q8(vl)
+            rows, row, base = self._tnu_rows(), reg(c), reg(b)
+            if not 0 <= row < rows:
+                raise _ExecutionFault(f"Fila Q8 fuera de rango: {row} (VR={rows})")
+            destination = self._tnu_destination(reg(a), vl)
+            self._tnu_charge(opcode, 2 * vl)
+            # Se valida el rango de la matriz completa sin leerla: solo se tocan la
+            # fila pedida y su escala, que es el trabajo cobrado.
+            self._tnu_region(base, rows * vl // 4 + rows)
+            row_bytes = self._tnu_bytes(base + row * vl // 4, vl // 4)
+            scale = self._tnu_floats(base + rows * vl // 4 + row, 1)[0]
+            self._tnu_store(destination, tnu.qrow(row_bytes, scale))
+        else:
+            raise _ExecutionFault(f"Opcode TNU no implementado: {int(opcode)}")
+
+    def _tnu_configure(self, vl: int, vr: int, vs: int) -> None:
+        if not 1 <= vl <= MAX_TNU_LENGTH or not 0 <= vr <= MAX_TNU_LENGTH or not 0 <= vs <= MAX_TNU_LENGTH:
+            raise _ExecutionFault(f"VCFG inválido: VL={vl}, VR={vr}, VS={vs}")
+        previous = (self._vl, self._vr, self._vs)
+
+        def restore() -> None:
+            self._vl, self._vr, self._vs = previous
+
+        self._log_undo(restore)
+        self._vl, self._vr, self._vs = vl, vr, vs
+
+    def _tnu_rows(self) -> int:
+        if self._vr < 1:
+            raise _ExecutionFault("La operación de matriz requiere VR ≥ 1")
+        return self._vr
+
+    def _tnu_require_q8(self, vl: int) -> None:
+        if vl % 4:
+            raise _ExecutionFault(f"Las operaciones Q8 requieren VL múltiplo de 4 (VL={vl})")
+        if self._vs:
+            raise _ExecutionFault("Las operaciones Q8 requieren VS = 0")
+
+    def _tnu_charge(self, opcode: VMOpcode, units: int) -> None:
+        if units > MAX_TNU_WORK:
+            raise _ExecutionFault(f"Trabajo TNU excede el límite por instrucción ({units} > {MAX_TNU_WORK})")
+        extra = tnu.gas_extra(units)
+        required = VM32_ISA[int(opcode)].cost + extra
+        if self._gas_remaining < required:
+            raise _ExecutionFault(f"Gas agotado: {opcode.name} requiere {required}")
+        # El coste base lo cobra _execute_one al terminar; el checkpoint revierte ambos.
+        self._gas_remaining -= extra
+        self._cycles += extra
+
+    def _tnu_region(self, address: int, count: int) -> tnu.TensorROM | None:
+        """Valida una región de ``count`` palabras entera en RAM (devuelve None) o en ROM."""
+        if 0 <= address and address + count <= len(self._memory):
+            return None
+        rom = self._rom_if_enabled()
+        if rom is not None and ROM_BASE <= address and address + count <= ROM_BASE + rom.words:
+            return rom
+        raise _ExecutionFault(f"Región TNU fuera de RAM y ROM: [{address}, {address + count})")
+
+    def _tnu_bytes(self, address: int, count: int) -> memoryview:
+        """Región de ``count`` palabras en RAM o ROM (nunca a caballo entre ambas)."""
+        rom = self._tnu_region(address, count)
+        if rom is None:
+            return self._memory.view_bytes(address, count)
+        return rom.bytes_view(address - ROM_BASE, count)
+
+    def _tnu_floats(self, address: int, count: int) -> memoryview:
+        return self._tnu_bytes(address, count).cast("f")
+
+    def _tnu_destination(self, address: int, count: int) -> int:
+        """Valida un destino de ``count`` palabras: solo RAM y nunca código protegido."""
+        if not (0 <= address and address + count <= len(self._memory)):
+            if address + count > ROM_BASE and self._rom_if_enabled() is not None:
+                raise _ExecutionFault(f"La ROM TNU es de solo lectura: destino {address}")
+            raise _ExecutionFault(f"Destino TNU fuera de la RAM: [{address}, {address + count})")
+        program = self._program
+        if program is not None and address < program.code_size and self.config.protect_code:
+            raise _ExecutionFault(f"Intento de modificar código protegido en {address}")
+        return address
+
+    def _tnu_store(self, address: int, payload: array | bytes) -> None:
+        data = memoryview(payload).cast("B")
+        count = len(data) // 4
+        memory = self._memory
+        self._tnu_destination(address, count)
+        program = self._program
+        touches_code = program is not None and address < program.code_size
+        previous = bytes(memory.view_bytes(address, count))
+        self._log_undo(lambda: memory.write_bytes(address, previous))
+        memory.write_bytes(address, data)
+        if touches_code:
+            last = min(address + count, program.code_size) - 1
+            for index in range(address // 4, last // 4 + 1):
+                self._decode_cache[index] = None
+
     def step(self) -> str:
         if self.state == "READY":
             self.machine.trigger("start")
@@ -1379,6 +1617,12 @@ class TramoyaVM32:
                 "next_fiber_id": self._next_fiber_id,
             },
         }
+        # Las claves TNU solo aparecen si hay estado o ROM: los snapshots de
+        # programas sin TNU no cambian. La ROM nunca se copia, solo su huella.
+        if self.tnu_config != (0, 0, 0):
+            payload["core"]["tnu"] = {"vl": self._vl, "vr": self._vr, "vs": self._vs}
+        if self.npu is not None and self.npu.rom is not None:
+            payload["rom"] = self.npu.rom.reference()
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return SNAPSHOT_MAGIC + zlib.compress(encoded, level=9)
 
@@ -1396,6 +1640,7 @@ class TramoyaVM32:
         capabilities: frozenset[str] | None = None,
         memory_chip: NonVolatileMemoryChip | None = None,
         limits: VMConfig | None = None,
+        npu: TramoyaNeuralUnit | None = None,
     ) -> "TramoyaVM32":
         """Crea una VM con la RAM que requiere el snapshot.
 
@@ -1444,7 +1689,7 @@ class TramoyaVM32:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Configuración inválida en snapshot: {exc}") from exc
-        vm = cls(config, memory_chip=memory_chip)
+        vm = cls(config, memory_chip=memory_chip, npu=npu)
         vm._commit_snapshot(vm._parse_snapshot(payload))
         return vm
 
@@ -1643,6 +1888,29 @@ class TramoyaVM32:
         if core["output_units"] != expected_output_units or not 0 <= expected_output_units <= config.output_limit:
             raise ValueError("Salida excede el límite configurado")
 
+        tnu_state = core.get("tnu", {"vl": 0, "vr": 0, "vs": 0})
+        if not isinstance(tnu_state, Mapping) or set(tnu_state) != {"vl", "vr", "vs"}:
+            raise ValueError("Estado TNU inválido en snapshot")
+        tnu_config = (tnu_state["vl"], tnu_state["vr"], tnu_state["vs"])
+        if not all(type(value) is int for value in tnu_config) or not (
+            tnu_config == (0, 0, 0)
+            or (
+                1 <= tnu_config[0] <= MAX_TNU_LENGTH
+                and 0 <= tnu_config[1] <= MAX_TNU_LENGTH
+                and 0 <= tnu_config[2] <= MAX_TNU_LENGTH
+            )
+        ):
+            raise ValueError("Configuración TNU inválida en snapshot")
+        rom_reference = payload.get("rom")
+        if rom_reference is not None:
+            # El snapshot solo nombra la ROM; nunca se abre la ruta que trae. El
+            # host conecta la ROM y aquí se exige que su huella coincida.
+            if not isinstance(rom_reference, Mapping) or not isinstance(rom_reference.get("sha256"), str):
+                raise ValueError("Referencia de ROM TNU inválida en snapshot")
+            attached = self.npu.rom if self.npu is not None else None
+            if attached is None or attached.sha256 != rom_reference["sha256"]:
+                raise ValueError(f"El snapshot requiere la ROM TNU sha256={rom_reference['sha256']}")
+
         return {
             "lifecycle": lifecycle,
             "program": program,
@@ -1666,6 +1934,7 @@ class TramoyaVM32:
             "fibers": fibers,
             "current_fiber": current_fiber,
             "next_fiber_id": next_fiber_id,
+            "tnu": tnu_config,
         }
 
     def _commit_snapshot(self, restored: Mapping[str, Any]) -> None:
@@ -1698,6 +1967,7 @@ class TramoyaVM32:
         self._fibers = restored["fibers"]
         self._current_fiber = restored["current_fiber"]
         self._next_fiber_id = restored["next_fiber_id"]
+        self._vl, self._vr, self._vs = restored["tnu"]
         self._pending_event = None
         self._build_decode_cache()
         self._sync_special_registers()

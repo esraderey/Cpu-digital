@@ -99,6 +99,29 @@ class VMOpcode(IntEnum):
     SWITCH = 121
     FRET = 122
 
+    # TNU — coprocesador vectorial (capacidad npu)
+    VCFG = 130
+    VCOPY = 131
+    VADD = 132
+    VMUL = 133
+    VSCALE = 134
+    FDOT = 135
+    MATVEC = 136
+    MATTV = 137
+    RMSNORM = 138
+    VSOFTMAX = 139
+    VEXP = 140
+    VSILU = 141
+    ROPE = 142
+    VARGMAX = 143
+    VSAMPLE = 144
+    VQUANT = 145
+    QMATVEC = 146
+    QROW = 147
+
+
+TNU_FIRST_OPCODE = int(VMOpcode.VCFG)
+
 
 @dataclass(frozen=True, slots=True)
 class VMInstruction:
@@ -174,6 +197,25 @@ _SPECS = (
     VMInstruction(VMOpcode.SPAWN, "SPAWN", "target", 5),
     VMInstruction(VMOpcode.SWITCH, "SWITCH", "reg", 5),
     VMInstruction(VMOpcode.FRET, "FRET", "none", 3),
+    # TNU: el coste base se suma a ceil(trabajo / TNU_GAS_DIVISOR); ver tnu.py
+    VMInstruction(VMOpcode.VCFG, "VCFG", "reg_reg_reg", 1, "VL=Ra, VR=Rb, VS=Rc"),
+    VMInstruction(VMOpcode.VCOPY, "VCOPY", "reg_reg", 2, "[Rd..] = [Ra..] (VL palabras)"),
+    VMInstruction(VMOpcode.VADD, "VADD", "reg_reg_reg", 2, "[Rd] = [Ra] + [Rb] (f32)"),
+    VMInstruction(VMOpcode.VMUL, "VMUL", "reg_reg_reg", 2, "[Rd] = [Ra] * [Rb] (f32)"),
+    VMInstruction(VMOpcode.VSCALE, "VSCALE", "reg_reg_reg", 2, "[Rd] = [Ra] * f32(Rb)"),
+    VMInstruction(VMOpcode.FDOT, "FDOT", "reg_reg_reg", 2, "Rd = f32(Σ [Ra]·[Rb])"),
+    VMInstruction(VMOpcode.MATVEC, "MATVEC", "reg_reg_reg", 2, "[Rd] = W[Ra] @ [Rb]"),
+    VMInstruction(VMOpcode.MATTV, "MATTV", "reg_reg_reg", 2, "[Rd] = [Rb] @ W[Ra]"),
+    VMInstruction(VMOpcode.RMSNORM, "RMSNORM", "reg_reg_reg", 2, "[Rd] = rmsnorm([Ra]) * [Rb]"),
+    VMInstruction(VMOpcode.VSOFTMAX, "VSOFTMAX", "reg_reg", 2, "[Rd] = softmax([Ra])"),
+    VMInstruction(VMOpcode.VEXP, "VEXP", "reg_reg", 2, "[Rd] = exp([Ra])"),
+    VMInstruction(VMOpcode.VSILU, "VSILU", "reg_reg", 2, "[Rd] = silu([Ra])"),
+    VMInstruction(VMOpcode.ROPE, "ROPE", "reg_reg_reg", 2, "RoPE en [Rd], posición Ra, cabeza Rb"),
+    VMInstruction(VMOpcode.VARGMAX, "VARGMAX", "reg_reg", 2, "Rd = argmax([Ra])"),
+    VMInstruction(VMOpcode.VSAMPLE, "VSAMPLE", "reg_reg_reg", 2, "Rd = muestra de [Ra] con moneda f32(Rb)"),
+    VMInstruction(VMOpcode.VQUANT, "VQUANT", "reg_reg", 2, "Q8([Rd]) = cuantiza([Ra])"),
+    VMInstruction(VMOpcode.QMATVEC, "QMATVEC", "reg_reg_reg", 2, "[Rd] = Q8 W[Ra] @ Q8 [Rb]"),
+    VMInstruction(VMOpcode.QROW, "QROW", "reg_reg_reg", 2, "[Rd] = fila Rb de Q8 W[Ra]"),
 )
 
 VM32_ISA: Mapping[int, VMInstruction] = MappingProxyType(

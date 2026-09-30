@@ -1,0 +1,610 @@
+; llama2.tasm — transformer tipo llama2.c ejecutado por VM32 con el chip TNU.
+;
+; El invitado orquesta todo el modelo (capas, cabezas, caché KV, muestreo,
+; decodificación de texto); el TNU solo ejecuta núcleos vectoriales.
+; Requiere las capacidades npu, io y memory, y una ROM creada con
+; cpu_digital.tnu_models.build_rom (f32 o q8).
+;
+; Entradas (read_int):  pasos, 1/temperatura como bits f32 (0 = voraz),
+;                       semilla, n_prompt, n_prompt tokens (el primero suele ser BOS=1).
+; Salida: texto con print_string; tokens generados en [TOKENS_PTR], cantidad en NGEN.
+; Códigos de salida: 0 bien, 2 prompt inválido, 3 ROM no reconocida.
+
+.equ BOS 1
+.equ ROM_MAGIC 0x31554E54
+.equ H_QUANT 2
+.equ H_DIM 3
+.equ H_HIDDEN 4
+.equ H_LAYERS 5
+.equ H_HEADS 6
+.equ H_VOCAB 8
+.equ H_SEQ 9
+.equ H_HS 10
+.equ H_KVDIM 11
+.equ H_KVMUL 12
+.equ H_INVSQ 13
+.equ H_TOK 16
+.equ H_RMSATT 17
+.equ H_WQ 18
+.equ H_WK 19
+.equ H_WV 20
+.equ H_WO 21
+.equ H_RMSFFN 22
+.equ H_W1 23
+.equ H_W2 24
+.equ H_W3 25
+.equ H_RMSF 26
+.equ H_WCLS 27
+.equ H_VTAB 28
+.equ H_SWQ 32
+.equ H_SWK 33
+.equ H_SWV 34
+.equ H_SWO 35
+.equ H_SW1 36
+.equ H_SW2 37
+.equ H_SW3 38
+
+.code
+.entry _start
+
+_start:
+        SYSCALL 12                  ; R1 = base de la ROM, R2 = palabras
+        LOAD R3, [R1]
+        MOVI R4, ROM_MAGIC
+        CMP R3, R4
+        JNZ BAD_ROM
+        LOAD R3, [R1+H_QUANT]
+        STORE R3, [QUANT]
+        LOAD R3, [R1+H_DIM]
+        STORE R3, [DIM]
+        LOAD R3, [R1+H_HIDDEN]
+        STORE R3, [HIDDEN]
+        LOAD R3, [R1+H_LAYERS]
+        STORE R3, [LAYERS]
+        LOAD R3, [R1+H_HEADS]
+        STORE R3, [HEADS]
+        LOAD R3, [R1+H_VOCAB]
+        STORE R3, [VOCAB]
+        LOAD R3, [R1+H_SEQ]
+        STORE R3, [SEQ]
+        LOAD R3, [R1+H_HS]
+        STORE R3, [HS]
+        LOAD R3, [R1+H_KVDIM]
+        STORE R3, [KVDIM]
+        LOAD R3, [R1+H_KVMUL]
+        STORE R3, [KVMUL]
+        LOAD R3, [R1+H_INVSQ]
+        STORE R3, [INVSQ]
+        LOAD R3, [R1+H_TOK]
+        STORE R3, [P_TOK]
+        LOAD R3, [R1+H_RMSATT]
+        STORE R3, [P_RMSATT]
+        LOAD R3, [R1+H_WQ]
+        STORE R3, [P_WQ]
+        LOAD R3, [R1+H_WK]
+        STORE R3, [P_WK]
+        LOAD R3, [R1+H_WV]
+        STORE R3, [P_WV]
+        LOAD R3, [R1+H_WO]
+        STORE R3, [P_WO]
+        LOAD R3, [R1+H_RMSFFN]
+        STORE R3, [P_RMSFFN]
+        LOAD R3, [R1+H_W1]
+        STORE R3, [P_W1]
+        LOAD R3, [R1+H_W2]
+        STORE R3, [P_W2]
+        LOAD R3, [R1+H_W3]
+        STORE R3, [P_W3]
+        LOAD R3, [R1+H_RMSF]
+        STORE R3, [P_RMSF]
+        LOAD R3, [R1+H_WCLS]
+        STORE R3, [P_WCLS]
+        LOAD R3, [R1+H_VTAB]
+        STORE R3, [P_VTAB]
+        LOAD R3, [R1+H_SWQ]
+        STORE R3, [S_WQ]
+        LOAD R3, [R1+H_SWK]
+        STORE R3, [S_WK]
+        LOAD R3, [R1+H_SWV]
+        STORE R3, [S_WV]
+        LOAD R3, [R1+H_SWO]
+        STORE R3, [S_WO]
+        LOAD R3, [R1+H_SW1]
+        STORE R3, [S_W1]
+        LOAD R3, [R1+H_SW2]
+        STORE R3, [S_W2]
+        LOAD R3, [R1+H_SW3]
+        STORE R3, [S_W3]
+
+; ── Buffers en RAM (alloc) ─────────────────────────────────────────────
+        LOAD R1, [DIM]
+        SYSCALL 8
+        STORE R1, [B_X]
+        LOAD R1, [DIM]
+        SYSCALL 8
+        STORE R1, [B_XB]
+        LOAD R1, [DIM]
+        SYSCALL 8
+        STORE R1, [B_XB2]
+        LOAD R1, [DIM]
+        SYSCALL 8
+        STORE R1, [B_Q]
+        LOAD R1, [HIDDEN]
+        SYSCALL 8
+        STORE R1, [B_HB]
+        LOAD R1, [HIDDEN]
+        SYSCALL 8
+        STORE R1, [B_HB2]
+        LOAD R1, [SEQ]
+        SYSCALL 8
+        STORE R1, [B_ATT]
+        LOAD R1, [VOCAB]
+        SYSCALL 8
+        STORE R1, [B_LOGITS]
+        LOAD R1, [DIM]
+        LOAD R2, [HIDDEN]
+        ADD R1, R1, R2              ; sobra para un vector Q8 de dim o hidden
+        SYSCALL 8
+        STORE R1, [B_XQ]
+        LOAD R1, [LAYERS]           ; caché KV: capas × seq × kv_dim
+        LOAD R2, [SEQ]
+        MUL R1, R1, R2
+        LOAD R2, [KVDIM]
+        MUL R1, R1, R2
+        STORE R1, [KV_WORDS]
+        SYSCALL 8
+        STORE R1, [B_KC]
+        LOAD R1, [KV_WORDS]
+        SYSCALL 8
+        STORE R1, [B_VC]
+        LOAD R1, [SEQ]
+        SYSCALL 8
+        STORE R1, [B_PROMPT]
+        LOAD R1, [SEQ]
+        SYSCALL 8
+        STORE R1, [TOKENS_PTR]
+
+; ── Entradas ────────────────────────────────────────────────────────────
+        SYSCALL 3                   ; pasos
+        LOAD R2, [SEQ]
+        CMP R1, R2
+        JGT STEPS_CLAMP
+        CMPI R1, 0
+        JGT STEPS_OK
+STEPS_CLAMP:
+        MOV R1, R2
+STEPS_OK:
+        STORE R1, [STEPS]
+        SYSCALL 3                   ; 1/temperatura (bits f32)
+        STORE R1, [INVT]
+        SYSCALL 3                   ; semilla
+        CMPI R1, 0
+        JNZ SEED_OK
+        MOVI R1, 1
+SEED_OK:
+        STORE R1, [RNG]
+        SYSCALL 3                   ; n_prompt
+        CMPI R1, 0
+        JLT BAD_PROMPT
+        LOAD R2, [SEQ]
+        CMP R1, R2
+        JGT BAD_PROMPT
+        CMPI R1, 0
+        JNZ PROMPT_READ
+        LOAD R2, [B_PROMPT]
+        MOVI R3, BOS
+        STORE R3, [R2]
+        MOVI R1, 1
+        STORE R1, [NPROMPT]
+        JMP PROMPT_DONE
+PROMPT_READ:
+        STORE R1, [NPROMPT]
+        MOVI R5, 0                  ; índice
+PROMPT_LOOP:
+        SYSCALL 3
+        CMPI R1, 0
+        JLT BAD_PROMPT
+        LOAD R2, [VOCAB]
+        CMP R1, R2
+        JLT PROMPT_TOKEN_OK
+        JMP BAD_PROMPT
+PROMPT_TOKEN_OK:
+        LOAD R2, [B_PROMPT]
+        ADD R2, R2, R5
+        STORE R1, [R2]
+        ADDI R5, R5, 1
+        LOAD R2, [NPROMPT]
+        CMP R5, R2
+        JLT PROMPT_LOOP
+PROMPT_DONE:
+
+; ── Bucle de generación ─────────────────────────────────────────────────
+        LOAD R2, [B_PROMPT]
+        LOAD R1, [R2]
+        STORE R1, [TOKEN]
+        STORE R0, [POS]
+        STORE R0, [NGEN]
+GEN_LOOP:
+        LOAD R1, [POS]
+        LOAD R2, [STEPS]
+        CMP R1, R2
+        JLT GEN_STEP
+        JMP GEN_DONE
+GEN_STEP:
+        CALL FORWARD
+        LOAD R1, [POS]
+        LOAD R2, [NPROMPT]
+        SUBI R2, R2, 1
+        CMP R1, R2
+        JLT NEXT_FROM_PROMPT
+        LOAD R4, [VOCAB]
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R1, [B_LOGITS]
+        LOAD R6, [INVT]
+        MOVI R4, 0x7FFFFFFF         ; ±0.0 → voraz (compara el valor, no el signo)
+        AND R4, R6, R4
+        CMPI R4, 0
+        JNZ NEXT_SAMPLE
+        VARGMAX R7, R1
+        JMP NEXT_READY
+NEXT_SAMPLE:
+        VSCALE R1, R1, R6
+        VSOFTMAX R1, R1
+        LOAD R2, [RNG]              ; xorshift32
+        SHL R3, R2, 13
+        XOR R2, R2, R3
+        SHR R3, R2, 17
+        MOVI R4, 0x7FFF
+        AND R3, R3, R4
+        XOR R2, R2, R3
+        SHL R3, R2, 5
+        XOR R2, R2, R3
+        STORE R2, [RNG]
+        SHR R3, R2, 8               ; moneda = (estado >>> 8) · 2^-24
+        MOVI R4, 0xFFFFFF
+        AND R3, R3, R4
+        ITOF R3, R3
+        MOVI R4, 0x33800000
+        FMUL R3, R3, R4
+        VSAMPLE R7, R1, R3
+        JMP NEXT_READY
+NEXT_FROM_PROMPT:
+        LOAD R2, [B_PROMPT]
+        ADD R2, R2, R1
+        LOAD R7, [R2+1]
+NEXT_READY:
+        CMPI R7, BOS
+        JZ GEN_DONE
+        LOAD R2, [TOKENS_PTR]       ; TOKENS[NGEN] = siguiente
+        LOAD R3, [NGEN]
+        ADD R2, R2, R3
+        STORE R7, [R2]
+        ADDI R3, R3, 1
+        STORE R3, [NGEN]
+        LOAD R2, [P_VTAB]           ; texto de la pieza
+        ADD R2, R2, R7
+        LOAD R1, [R2]
+        LOAD R3, [TOKEN]
+        CMPI R3, BOS
+        JNZ PRINT_PIECE
+        LOAD R3, [R1]               ; tras BOS se quita el espacio inicial
+        CMPI R3, 32
+        JNZ PRINT_PIECE
+        ADDI R1, R1, 1
+PRINT_PIECE:
+        MOVI R2, 0
+        SYSCALL 7
+        STORE R7, [TOKEN]
+        LOAD R1, [POS]
+        ADDI R1, R1, 1
+        STORE R1, [POS]
+        JMP GEN_LOOP
+GEN_DONE:
+        HALT
+
+BAD_PROMPT:
+        MOVI R1, 2
+        SYSCALL 0
+BAD_ROM:
+        MOVI R1, 3
+        SYSCALL 0
+
+; ── MATMUL: [R1] = W[R2] @ [R3], R4 filas, R5 columnas (f32 o Q8) ────────
+MATMUL:
+        VCFG R5, R4, R0
+        LOAD R7, [QUANT]
+        CMPI R7, 0
+        JZ MATMUL_F32
+        LOAD R8, [B_XQ]
+        VQUANT R8, R3
+        QMATVEC R1, R2, R8
+        RET
+MATMUL_F32:
+        MATVEC R1, R2, R3
+        RET
+
+; ── FORWARD: logits de [TOKEN] en la posición [POS] ─────────────────────
+FORWARD:
+        LOAD R4, [DIM]
+        LOAD R2, [QUANT]
+        CMPI R2, 0
+        JZ EMBED_F32
+        LOAD R5, [VOCAB]
+        VCFG R4, R5, R0
+        LOAD R1, [B_X]
+        LOAD R2, [P_TOK]
+        LOAD R3, [TOKEN]
+        QROW R1, R2, R3
+        JMP EMBED_DONE
+EMBED_F32:
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R3, [TOKEN]
+        MUL R3, R3, R4
+        LOAD R2, [P_TOK]
+        ADD R2, R2, R3
+        LOAD R1, [B_X]
+        VCOPY R1, R2
+EMBED_DONE:
+        STORE R0, [LAYER]
+LAYER_LOOP:
+        ; xb = rmsnorm(x, rms_att[l])
+        LOAD R4, [DIM]
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R6, [LAYER]
+        MUL R7, R6, R4
+        LOAD R2, [P_RMSATT]
+        ADD R2, R2, R7
+        LOAD R1, [B_XB]
+        LOAD R3, [B_X]
+        RMSNORM R1, R3, R2
+        ; posición de la fila en la caché KV
+        LOAD R7, [SEQ]
+        MUL R8, R6, R7
+        STORE R8, [LSEQ]            ; l·seq
+        LOAD R7, [POS]
+        ADD R8, R8, R7
+        LOAD R7, [KVDIM]
+        MUL R8, R8, R7
+        LOAD R1, [B_KC]
+        ADD R1, R1, R8
+        STORE R1, [KSLOT]
+        LOAD R1, [B_VC]
+        ADD R1, R1, R8
+        STORE R1, [VSLOT]
+        ; q, k, v
+        LOAD R1, [B_Q]
+        LOAD R2, [S_WQ]
+        MUL R2, R2, R6
+        LOAD R7, [P_WQ]
+        ADD R2, R2, R7
+        LOAD R3, [B_XB]
+        LOAD R4, [DIM]
+        LOAD R5, [DIM]
+        CALL MATMUL
+        LOAD R6, [LAYER]
+        LOAD R1, [KSLOT]
+        LOAD R2, [S_WK]
+        MUL R2, R2, R6
+        LOAD R7, [P_WK]
+        ADD R2, R2, R7
+        LOAD R3, [B_XB]
+        LOAD R4, [KVDIM]
+        LOAD R5, [DIM]
+        CALL MATMUL
+        LOAD R6, [LAYER]
+        LOAD R1, [VSLOT]
+        LOAD R2, [S_WV]
+        MUL R2, R2, R6
+        LOAD R7, [P_WV]
+        ADD R2, R2, R7
+        LOAD R3, [B_XB]
+        LOAD R4, [KVDIM]
+        LOAD R5, [DIM]
+        CALL MATMUL
+        ; RoPE en q y k; luego q ·= 1/√hs
+        LOAD R4, [DIM]
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R1, [B_Q]
+        LOAD R2, [POS]
+        LOAD R3, [HS]
+        ROPE R1, R2, R3
+        LOAD R6, [INVSQ]
+        VSCALE R1, R1, R6
+        LOAD R4, [KVDIM]
+        VCFG R4, R5, R0
+        LOAD R1, [KSLOT]
+        ROPE R1, R2, R3
+        ; bases de la capa en la caché KV
+        LOAD R8, [LSEQ]
+        LOAD R7, [KVDIM]
+        MUL R8, R8, R7
+        LOAD R1, [B_KC]
+        ADD R1, R1, R8
+        STORE R1, [LKC]
+        LOAD R1, [B_VC]
+        ADD R1, R1, R8
+        STORE R1, [LVC]
+        ; atención por cabeza
+        LOAD R12, [POS]
+        ADDI R12, R12, 1            ; filas = pos + 1
+        LOAD R13, [KVDIM]
+        LOAD R7, [HS]
+        MOVI R6, 0
+HEAD_LOOP:
+        LOAD R8, [KVMUL]
+        DIV R8, R6, R8
+        MUL R8, R8, R7              ; desplazamiento de la cabeza KV
+        LOAD R9, [LKC]
+        ADD R9, R9, R8
+        LOAD R10, [LVC]
+        ADD R10, R10, R8
+        MUL R11, R6, R7             ; h · hs
+        VCFG R7, R12, R13
+        LOAD R1, [B_ATT]
+        LOAD R3, [B_Q]
+        ADD R3, R3, R11
+        MATVEC R1, R9, R3           ; puntuaciones = K · q_h
+        MOVI R5, 1
+        VCFG R12, R5, R0
+        VSOFTMAX R1, R1
+        VCFG R7, R12, R13
+        LOAD R2, [B_XB]
+        ADD R2, R2, R11
+        MATTV R2, R10, R1           ; xb_h = Σ att[t] · v_t
+        ADDI R6, R6, 1
+        LOAD R8, [HEADS]
+        CMP R6, R8
+        JLT HEAD_LOOP
+        ; x += wo @ xb
+        LOAD R6, [LAYER]
+        LOAD R1, [B_XB2]
+        LOAD R2, [S_WO]
+        MUL R2, R2, R6
+        LOAD R7, [P_WO]
+        ADD R2, R2, R7
+        LOAD R3, [B_XB]
+        LOAD R4, [DIM]
+        LOAD R5, [DIM]
+        CALL MATMUL
+        LOAD R4, [DIM]
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R1, [B_X]
+        LOAD R2, [B_XB2]
+        VADD R1, R1, R2
+        ; xb = rmsnorm(x, rms_ffn[l])
+        LOAD R6, [LAYER]
+        MUL R7, R6, R4
+        LOAD R2, [P_RMSFFN]
+        ADD R2, R2, R7
+        LOAD R3, [B_XB]
+        RMSNORM R3, R1, R2
+        ; hb = silu(w1 @ xb) · (w3 @ xb)
+        LOAD R1, [B_HB]
+        LOAD R2, [S_W1]
+        MUL R2, R2, R6
+        LOAD R7, [P_W1]
+        ADD R2, R2, R7
+        LOAD R3, [B_XB]
+        LOAD R4, [HIDDEN]
+        LOAD R5, [DIM]
+        CALL MATMUL
+        LOAD R6, [LAYER]
+        LOAD R1, [B_HB2]
+        LOAD R2, [S_W3]
+        MUL R2, R2, R6
+        LOAD R7, [P_W3]
+        ADD R2, R2, R7
+        LOAD R3, [B_XB]
+        LOAD R4, [HIDDEN]
+        LOAD R5, [DIM]
+        CALL MATMUL
+        LOAD R4, [HIDDEN]
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R1, [B_HB]
+        VSILU R1, R1
+        LOAD R2, [B_HB2]
+        VMUL R1, R1, R2
+        ; x += w2 @ hb
+        LOAD R6, [LAYER]
+        LOAD R1, [B_XB]
+        LOAD R2, [S_W2]
+        MUL R2, R2, R6
+        LOAD R7, [P_W2]
+        ADD R2, R2, R7
+        LOAD R3, [B_HB]
+        LOAD R4, [DIM]
+        LOAD R5, [HIDDEN]
+        CALL MATMUL
+        LOAD R4, [DIM]
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R1, [B_X]
+        LOAD R2, [B_XB]
+        VADD R1, R1, R2
+        ; siguiente capa
+        LOAD R6, [LAYER]
+        ADDI R6, R6, 1
+        STORE R6, [LAYER]
+        LOAD R7, [LAYERS]
+        CMP R6, R7
+        JLT LAYER_LOOP
+        ; logits = wcls @ rmsnorm(x, rms_final)
+        LOAD R4, [DIM]
+        MOVI R5, 1
+        VCFG R4, R5, R0
+        LOAD R1, [B_X]
+        LOAD R2, [P_RMSF]
+        RMSNORM R1, R1, R2
+        LOAD R1, [B_LOGITS]
+        LOAD R2, [P_WCLS]
+        LOAD R3, [B_X]
+        LOAD R4, [VOCAB]
+        LOAD R5, [DIM]
+        CALL MATMUL
+        RET
+
+.data
+QUANT:      .WORD 0
+DIM:        .WORD 0
+HIDDEN:     .WORD 0
+LAYERS:     .WORD 0
+HEADS:      .WORD 0
+VOCAB:      .WORD 0
+SEQ:        .WORD 0
+HS:         .WORD 0
+KVDIM:      .WORD 0
+KVMUL:      .WORD 0
+INVSQ:      .WORD 0
+P_TOK:      .WORD 0
+P_RMSATT:   .WORD 0
+P_WQ:       .WORD 0
+P_WK:       .WORD 0
+P_WV:       .WORD 0
+P_WO:       .WORD 0
+P_RMSFFN:   .WORD 0
+P_W1:       .WORD 0
+P_W2:       .WORD 0
+P_W3:       .WORD 0
+P_RMSF:     .WORD 0
+P_WCLS:     .WORD 0
+P_VTAB:     .WORD 0
+S_WQ:       .WORD 0
+S_WK:       .WORD 0
+S_WV:       .WORD 0
+S_WO:       .WORD 0
+S_W1:       .WORD 0
+S_W2:       .WORD 0
+S_W3:       .WORD 0
+B_X:        .WORD 0
+B_XB:       .WORD 0
+B_XB2:      .WORD 0
+B_Q:        .WORD 0
+B_HB:       .WORD 0
+B_HB2:      .WORD 0
+B_ATT:      .WORD 0
+B_LOGITS:   .WORD 0
+B_XQ:       .WORD 0
+B_KC:       .WORD 0
+B_VC:       .WORD 0
+B_PROMPT:   .WORD 0
+KV_WORDS:   .WORD 0
+TOKENS_PTR: .WORD 0
+STEPS:      .WORD 0
+INVT:       .WORD 0
+RNG:        .WORD 0
+NPROMPT:    .WORD 0
+TOKEN:      .WORD 0
+POS:        .WORD 0
+NGEN:       .WORD 0
+LAYER:      .WORD 0
+LSEQ:       .WORD 0
+KSLOT:      .WORD 0
+VSLOT:      .WORD 0
+LKC:        .WORD 0
+LVC:        .WORD 0

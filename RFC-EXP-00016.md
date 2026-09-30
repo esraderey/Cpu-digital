@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Identificador | RFC-EXP-00016 |
-| Estado | PROPUESTO |
+| Estado | PROPUESTO (P1–P4); P5 IMPLEMENTADA y medida (2026-09-29) |
 | Fecha | 2026-09-29 |
 | Firmado | OMRI |
 | Relacionado | RFC EXP 00015 (Tramoya VM32) |
@@ -13,7 +13,7 @@
 
 ## 1. Resumen
 
-La VM no necesita GPU: el cuello de botella es la sobrecarga del intérprete Python por instrucción, no el dibujo. Proponemos cuatro piezas en orden de construcción. **P1**: un modo de ejecución por frames con gas por frame, preempción sin fallo y reproducción exacta, cuya imagen se deriva de cuatro páginas de la memoria invitada (VRAM, paleta, sprites y lista de dibujo) y la rasteriza el host en microsegundos. **P2**: un traductor de bloques básicos a Python que conserva gas exacto, atomicidad y breakpoints mediante deoptimización por repetición. **P3**: 3D por software con la geometría en el invitado y el relleno de filas en el host, con una instrucción `XFORM`. **P4**: un banco de pruebas para LLMs con contraejemplos visuales. P1 y P3 son viables hoy sin acelerar la VM; P2 multiplica su margen.
+La VM no necesita GPU: el cuello de botella es la sobrecarga del intérprete Python por instrucción, no el dibujo. Proponemos cuatro piezas en orden de construcción. **P1**: un modo de ejecución por frames con gas por frame, preempción sin fallo y reproducción exacta, cuya imagen se deriva de cuatro páginas de la memoria invitada (VRAM, paleta, sprites y lista de dibujo) y la rasteriza el host en microsegundos. **P2**: un traductor de bloques básicos a Python que conserva gas exacto, atomicidad y breakpoints mediante deoptimización por repetición. **P3**: 3D por software con la geometría en el invitado y el relleno de filas en el host, con una instrucción `XFORM`. **P4**: un banco de pruebas para LLMs con contraejemplos visuales. P1 y P3 son viables hoy sin acelerar la VM; P2 multiplica su margen. **P5**, añadida tras la expedición, ya está construida: el Chip Neuronal Tramoya (TNU), un coprocesador de 18 instrucciones vectoriales que ejecuta el host tras la capacidad `npu`, con la ROM de pesos fuera de los snapshots. Con él, un programa `.tasm` ejecuta llama2.c y genera texto de forma determinista a ~42 tok/s (stories260K) y ~3,5 tok/s (stories15M en int8) (HECHO [L2]).
 
 ## 2. Estado del arte
 
@@ -114,7 +114,62 @@ Ataca la frontera de §2.5.
 - Cada tarea: especificación, registro de entradas y oráculo por propiedades sobre la RAM de P0–P3 (por ejemplo, «sprite 0 en x=40 en el frame 30») u hashes de frame.
 - Ante un fallo, el arnés devuelve el primer frame divergente como ASCII 40×30 (esperado, obtenido y diferencias), los comandos de la lista de dibujo con el PC que escribió cada palabra por última vez (mapa de procedencia, solo en el arnés) y el gas por frame, más el keyframe N−1 de P1 para probar arreglos sin repetir la partida.
 - Diseño experimental: ≥100 tareas o muestras emparejadas, la ISA documentada en el prompt, y un control con información equivalente (volcado de traza de la misma longitud) para separar el efecto de la localización del de «más texto».
-- Inferencia sobre la VM: un modelo de 260K costaría ~4 M instrucciones por token, 11–20 s por token hoy (CONJETURA); es plausible como demostración, no como uso. La VM es más valiosa como sandbox determinista con gas y capacidades para código generado.
+- Inferencia sobre la VM: un modelo de 260K costaría ~4 M instrucciones por token, 11–20 s por token hoy (CONJETURA); es plausible como demostración, no como uso. La VM es más valiosa como sandbox determinista con gas y capacidades para código generado. *P5 supera esta estimación: con el TNU, el mismo modelo cuesta ~2 000 instrucciones por token y corre a ~42 tok/s (HECHO [L2]).*
+
+### P5. Chip Neuronal Tramoya (TNU): instrucciones vectoriales ejecutadas por el host — IMPLEMENTADA
+
+Ataca la frontera de §2.5 y la conjetura de P4 sobre inferencia. Todo lo marcado [L2] se midió con `benchmarks/benchmark_tnu.py` (Python 3.13.2, Windows x64, 2026-09-29) sobre stories260K y stories15M de karpathy/tinyllamas con sus tokenizers.
+
+**Punto de partida medido en el host (HECHO [L2]).**
+- *float32:* `math.sumprod` sobre vistas `memoryview(página).cast('B').cast('f')`, sin copias. MATVEC 288×288 tarda 2,34 ms (35 M MAC/s) con ambos operandos como `memoryview`, y 1,47 ms (**56 M MAC/s**) si `x` se convierte antes a lista.
+- *int8:* con una vista con signo `'b'`, 32–38 M MAC/s, porque CPython crea un objeto nuevo por cada entero negativo (solo cachea −5…256). Con bytes sin signo desplazados +128 y un término de corrección, **68 M MAC/s**.
+- *Elemento a elemento:* `exp` vectorial a 10,8 M/s; suma vectorial a 14,3 M/s.
+- *Dentro de la VM, sin TNU:* 346 000–363 000 instr/s (2,75–2,89 µs por unidad de gas, según la corrida) y 32 000 MAC/s con `LOAD`/`FMUL`/`FADD`.
+
+**Diseño (PROPUESTA, construida).**
+- *Conexión.* `TramoyaNeuralUnit` se conecta como el chip de memoria (`TramoyaVM32(..., npu=...)` o `attach_npu`) y exige la capacidad `npu`, que no viene por defecto. Sin ella, o sin chip, cualquier opcode 130–147 falla sin efectos. El chip no tiene estado mutable: la configuración vectorial (VL, VR, VS) vive en el núcleo de la VM, así que la cubren el registro de deshacer y los snapshots.
+- *ISA.* `VCFG` (fija VL, VR y VS, al estilo `vsetvl`), `VCOPY`, `VADD`, `VMUL`, `VSCALE`, `FDOT`, `MATVEC`, `MATTV` (suma ponderada de filas, para la atención), `RMSNORM`, `VSOFTMAX`, `VEXP`, `VSILU`, `ROPE`, `VARGMAX`, `VSAMPLE`, `VQUANT`, `QMATVEC` y `QROW`. Los operandos son registros que contienen direcciones. VS permite recorrer la caché KV con paso `kv_dim` sin copiar cabezas. La tabla completa está en `VM32.md`.
+- *ROM de pesos (punto 5 de la misión).* Ventana fija de solo lectura desde `0x40000000`, fuera de la RAM. `LOAD` y `print_string` la leen si hay `npu`; nada la escribe. `TensorROM` copia el archivo y calcula su sha256 al abrirlo. El snapshot guarda solo `{sha256, size_bytes, path}`. Para restaurar, el host tiene que conectar una ROM con la misma huella; la ruta del snapshot **nunca se abre**, porque un snapshot es entrada no confiable.
+- *Memoria (punto 8).* `MAX_MEMORY_WORDS` no sube. Con la ROM aparte, la RAM de stories15M solo contiene la caché KV y las activaciones: como máximo 0,9 M palabras con 256 posiciones, y 188 416 palabras asignadas tras 80 000 instrucciones [L2]. La ROM ocupa 15,4 M palabras en f32 y 4,08 M en Q8 [L2].
+- *Carga de pesos (punto 6).* En el host, `python -m cpu_digital.tnu_models CKPT TOK SALIDA [--quant q8]` y `--npu-rom` en el CLI. En el invitado, la syscall 12 `npu_info` y una cabecera de 64 palabras con las dimensiones, punteros absolutos y el paso por capa. Sin `.WORD` gigantes.
+- *Numérica (puntos 1–4).*
+  - Se calcula en doble precisión con **un solo redondeo** a float32 al guardar.
+  - `VADD`, `VMUL` y `VSCALE` coinciden bit a bit con `FADD`/`FMUL` (verificado por un ancla).
+  - `FDOT` y `MATVEC` acumulan con `sumprod`: son deterministas, pero no iguales a una cadena de `FMUL`+`FADD`.
+  - Un desbordamiento da ±inf, sin fallo.
+  - Q8: cuantización simétrica con escala float32 **por fila** en los pesos y por vector en las activaciones; los productos enteros son exactos.
+  - Las filas en ROM nunca cruzan páginas, porque el buffer es contiguo. En RAM, una región que cruza páginas se reúne con una sola copia contigua: es el camino lento y se cobra como trabajo (ver gas).
+- *Gas (punto 7), política declarada.*
+  - Coste = coste base (1 para `VCFG`, 2 para el resto) + `ceil(unidades/64)`.
+  - Unidades: una por MAC en los productos, más 8 por fila (`MATVEC`, `QMATVEC`) o columna (`MATTV`), que es el coste fijo de cada llamada a `sumprod`; en `MATVEC`/`MATTV`, además, al menos la región tocada, para no subcobrar pasos dispersos; de 1 a 5 por elemento en el resto.
+  - Tope de 2²⁶ unidades por instrucción. El gas se comprueba y se cobra **antes** de leer o calcular.
+  - Calibración final [L2], en µs por unidad de gas y relativa a los 2,89 µs/gas del intérprete en la misma corrida: VADD 0,85×, VSCALE 0,78×, VEXP 0,57×, VSILU 0,99×, VSOFTMAX 0,88×, RMSNORM 0,97×, ROPE 1,07×, FDOT 0,65×, MATVEC 0,43×, MATTV 0,56×, QMATVEC 0,33×, VARGMAX 0,69×. El peritaje midió además formas adversas: antes del término por fila, MATVEC con VL=1 llegaba a ~6,5×.
+  - Ninguna operación medida cuesta al host más de ~1,1× lo que costaría el mismo gas interpretado. La propuesta inicial `1 + n/32` habría cobrado ~2× de más en FDOT.
+- *Atomicidad.* Orden fijo: permisos → parámetros → tope → gas → lectura → cálculo → **una** escritura. Antes de escribir se guarda el contenido previo con `_log_undo`. Si la escritura toca código desprotegido, se invalida la caché de decodificación; si el destino es código protegido o la ROM, falla.
+- *Tokenizer y muestreo (punto 9).* La codificación BPE del prompt va en el host (`tnu_models.encode`): es una búsqueda de fusiones por puntuación, difícil de acotar con gas y que se usa una sola vez. En el invitado quedan la decodificación de piezas (cadenas en la ROM, sin el espacio inicial tras BOS), el muestreo (xorshift32 propio + `VSAMPLE`, o `VARGMAX` a temperatura 0) y la parada en BOS.
+- *Programa.* `vm_programs/llama2.tasm` orquesta capas, cabezas con GQA, caché KV, RoPE, FFN SwiGLU y muestreo. Coincide **bit a bit** con `tnu_models.reference_generate` (mismos núcleos, mismo orden). En modo voraz f32 coincide en tokens con un llama2.c ingenuo en doble precisión escrito aparte. Las anclas están en `tests/test_tnu_llama.py`.
+
+**Experimentos (criterios de muerte fijados por la misión antes de medir).**
+
+| # | Experimento | Criterio de muerte | Resultado [L2] | Veredicto |
+|---|---|---|---|---|
+| T1 (E1 de la misión) | FDOT dentro de la VM, contando el dispatch | < 20 M MAC/s | 29,4 M MAC/s con VL=4096; 12,0 M con VL=288; MATVEC 288×288 en 1,59 ms (52,2 M MAC/s) | VIVE |
+| T2 (E2) | stories260K, 256 tokens | < 20 tok/s, o tokens distintos con la misma semilla | 41,6 tok/s voraz; 42,6 y 40,8 con muestreo; tokens idénticos; 1 990 instr/token | VIVE |
+| T3 (E3) | stories15M int8, 128 tokens | < 1 tok/s | Q8: 3,53 tok/s; f32: 3,00 tok/s; ~2 100 instr/token | VIVE |
+| T4 (E4) | snapshot con la ROM de 15M conectada | ≥ 100 ms | 0,7 ms recién cargado; a mitad de generación la ROM aporta **+0,3 ms** (ruido) y 109 B | VIVE en lo que mide |
+
+**Matiz de T4 (HECHO [L2]).** A mitad de generación el snapshot tarda 234 ms con 90 112 palabras de RAM y 478 ms con 188 416, con o sin ROM conectada. De unos 231 ms perfilados, 226 los gasta `zlib` nivel 9 comprimiendo la caché KV, que es incompresible; con nivel 6 serían ~51 ms y con nivel 1, ~10 ms. Es una propiedad del formato de snapshot existente, no del TNU. Queda como PROPUESTA aparte (bajar el nivel de compresión o codificar las páginas en binario); este cambio no la aplica.
+
+**Proyectado frente a medido.**
+- *stories260K:* ~60 tok/s proyectados, 41,6 medidos. La proyección solo contaba MAC; a este tamaño pesan más la sobrecarga por fila (`sumprod` sobre filas de 8–172 elementos) y las ~2 000 instrucciones interpretadas por token (~5,5 ms).
+- *stories15M:* ~2 tok/s proyectados en f32 y 3–4 en int8, frente a 3,00 y 3,53 medidos. La f32 supera la proyección gracias a pasar `x` como lista (56 frente a 35 M MAC/s). La int8 no llega a la relación 68/56 porque el clasificador y la reunión de la caché KV cuestan igual en ambos formatos.
+- *Referencia externa:* un 486 DX2-66 da ≈ 2 tok/s con 260K [R27]; VM32+TNU en un PC actual es 20× más rápido.
+
+**Límites honestos.**
+- `math.sumprod` exige Python ≥ 3.12. El TNU lo comprueba al construirse; el resto de VM32 sigue funcionando en 3.10.
+- `exp`, `cos`, `sin` y `pow` vienen de la libm del host. El determinismo está verificado en una sola plataforma; la igualdad bit a bit entre sistemas operativos es CONJETURA (el redondeo final a float32 suele absorber una diferencia de 1 ulp en doble).
+- La escala Q8 por fila es más gruesa que los grupos de `runq.c`. Aun así, en los primeros 32 tokens voraces de stories15M, Q8 coincide con f32 [L2].
+- Cuantizar la ROM Q8 de 15M tarda 3,6 s en Python puro [L2].
 
 ## 4. Alternativas consideradas
 
@@ -173,3 +228,4 @@ Todas consultadas el 2026-09-29. Las marcadas con † fueron confirmadas por el 
 - [R29] A. Karpathy, «llama2.c». https://github.com/karpathy/llama2.c
 - [R30] arXiv 2603.08721, KernelCraft, 2026-02-10. https://arxiv.org/abs/2603.08721
 - [L] Mediciones locales del director: `scratchpad/medir_vm.py` de la sesión de expedición, Python 3.13.2 sobre Windows x64, 2026-09-29.
+- [L2] Mediciones de P5: `benchmarks/benchmark_tnu.py` (reproducible; `--json` guarda el informe completo), Python 3.13.2 sobre Windows x64, 2026-09-29. Modelos stories260K y stories15M de https://huggingface.co/karpathy/tinyllamas; tokenizers de https://github.com/karpathy/llama2.c.

@@ -57,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gas", type=int, default=1_000_000)
     parser.add_argument("--stack-limit", type=int, default=8_192)
     parser.add_argument("--trace-buffer", type=int, default=4_096, help="0 desactiva la instrumentación")
+    parser.add_argument("--no-loop-acceleration", action="store_true", help="Ejecuta todos los bucles en el intérprete")
     parser.add_argument("--output-limit", type=int, default=1_000_000)
     parser.add_argument("--max-instructions", type=int, default=None, help="Límite adicional de esta ejecución")
     parser.add_argument("--deny-capability", action="append", default=[], help="Deshabilita io/random/memory/memory_chip/npu/etc.")
@@ -218,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
             stack_limit=args.stack_limit,
             trace_size=args.trace_buffer,
             output_limit=args.output_limit,
+            accelerate_loops=not args.no_loop_acceleration,
             capabilities=frozenset(capabilities),
         )
         vm = TramoyaVM32(config, memory_chip=memory_chip, npu=npu)
@@ -231,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
                 capabilities=frozenset(capabilities),
                 memory_chip=memory_chip,
                 npu=npu,
+                accelerate_loops=not args.no_loop_acceleration,
             )
             symbols = dict(vm.program.symbols) if vm.program else {}
             if args.input:

@@ -1619,8 +1619,12 @@ class TramoyaVM32:
         executed_at_start = self._instructions
         # El acelerador de bucles solo actúa sin traza, sin breakpoints y sin
         # interrupciones pendientes: en esos casos cada instrucción debe pasar
-        # por el camino instrumentado.
-        accelerate = self.config.accelerate_loops and not self.config.trace_size and not breakpoint_set
+        # por el camino instrumentado. Tampoco si la clase o la instancia cambian
+        # la semántica que reproduce el código generado.
+        accelerate = (
+            self.config.accelerate_loops and not self.config.trace_size and not breakpoint_set
+            and _loop_semantics_intact(self)
+        )
         candidates = self._loop_candidates
         while self.state == "RUNNING":
             if self._pc in breakpoint_set and self._pc != skip_breakpoint:
@@ -1665,9 +1669,9 @@ class TramoyaVM32:
             return compiled
 
     def _run_loop(self, loop: CompiledLoop, budget: int) -> bool:
-        """Ejecuta iteraciones completas del bucle; False si no avanzó ninguna instrucción."""
+        """Ejecuta iteraciones del bucle; False si no avanzó ninguna instrucción."""
         program = self._program
-        pc, steps, used = loop.run(
+        pc, steps, used, last = loop.run(
             self, self._registers, self._flags, self._memory, len(self._memory),
             program.code_size if program is not None else 0, self._gas_remaining, budget,
         )
@@ -1678,8 +1682,11 @@ class TramoyaVM32:
         self._cycles += used
         self._gas_remaining -= used
         self._accelerated_instructions += steps
-        backedge_pc, mnemonic, operands = loop.backedge
-        self._last_instruction = (backedge_pc, mnemonic, operands, "OK")
+        # Última instrucción: el salto de vuelta, o el de salida si el bucle salió por él. Si
+        # devolvió el control a mitad del cuerpo, el intérprete ejecuta ya esa instrucción y
+        # la sobrescribe.
+        jump_pc, mnemonic, operands = loop.exits[last - 1] if last else loop.backedge
+        self._last_instruction = (jump_pc, mnemonic, operands, "OK")
         return True
 
     @property
@@ -2164,6 +2171,28 @@ class TramoyaVM32:
 
 
 _HANDLER_TABLES: dict[type, dict[int, Callable[..., None]]] = {}
+
+# Métodos cuya semántica reproduce el código que genera vm32_loops. Si una subclase o
+# una instancia sustituye alguno (manejadores _op_*, ayudantes o el paso por
+# instrucción), el acelerador no puede garantizar el mismo estado y no actúa.
+_LOOP_SEMANTICS = frozenset(
+    [f"_op_{opcode.name.lower()}" for opcode in VMOpcode if int(opcode) < TNU_FIRST_OPCODE]
+    + ["_execute_one", "_fetch_decoded", "_read_register", "_write_register", "_write_result",
+       "_set_flags", "_sync_special_registers", "_add", "_subtract", "_set_sub_flags", "_quotient",
+       "_float_from_reg", "_float_to_reg", "_set_float_flags", "_effective_address", "read_memory",
+       "write_memory", "_push", "_pop", "_jump", "_validate_executable"]
+)
+_LOOPS_ALLOWED: dict[type, bool] = {}
+
+
+def _loop_semantics_intact(vm: TramoyaVM32) -> bool:
+    cls = type(vm)
+    intact = _LOOPS_ALLOWED.get(cls)
+    if intact is None:
+        intact = _LOOPS_ALLOWED[cls] = all(
+            getattr(cls, name) is getattr(TramoyaVM32, name) for name in _LOOP_SEMANTICS
+        )
+    return intact and _LOOP_SEMANTICS.isdisjoint(vars(vm))
 
 
 def _handlers_for(cls: type) -> dict[int, Callable[..., None]]:

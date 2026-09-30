@@ -49,7 +49,9 @@ puedes iniciarla con el comando `tramoya-ui` después de instalar el proyecto. U
 - Páginas físicas de 16 KiB asignadas bajo demanda.
 - Caché de instrucciones con invalidación para código automodificable.
 - Ejecución continua optimizada (~0,55 M instr/s) con acelerador de bucles
-  internos que conserva el estado exacto del intérprete (~5,5 M instr/s en bucles).
+  internos que conserva el estado exacto del intérprete (~5,5 M instr/s en bucles;
+  3,2× en el raycaster de referencia, con el 86 % de sus instrucciones en bucles
+  compilados). Requiere ejecutar sin traza (`--trace-buffer 0`).
 - Snapshots v2 dispersos y compatibles con snapshots densos v1.
 - Ensamblador limitado antes de reservar `.space` para evitar agotamiento accidental.
 - **79 instrucciones** en formato fijo de 4 palabras.
@@ -87,10 +89,13 @@ la syscall 11 consulta su capacidad. La consola web conecta por defecto
 Las escrituras de programas son persistentes y quedan fuera de los snapshots de
 RAM VM32.
 
-Benchmark reproducible:
+Benchmarks reproducibles: velocidad del intérprete y cobertura del acelerador de
+bucles en código de juego (`vm_programs/juego_raycaster.tasm`, con desglose por
+fase y por bucle):
 
 ```powershell
 .\.venv\Scripts\python.exe benchmarks\benchmark_vm32.py
+.\.venv\Scripts\python.exe benchmarks\benchmark_cobertura.py --frames 20
 ```
 
 ## Chip Neuronal Tramoya (TNU)

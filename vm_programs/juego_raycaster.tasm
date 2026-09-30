@@ -1,0 +1,792 @@
+; =====================================================================
+;  Raycaster tipo Wolfenstein 3D con entidades moviles para VM32
+;  Framebuffer 160x120 en FB = 0x10000, paleta PICO-8 (indices 0..15).
+;
+;  Numeros
+;    - Geometria continua (jugador, rayos, entidades, proyeccion de sprites):
+;      float32 de la FPU; FADD/FMUL/FDIV son una sola instruccion cada una.
+;    - Coordenadas de pantalla: enteros. Muestreo de texturas: punto fijo 16.16.
+;
+;  Camara: direccion y plano (|plano| = 0.66, FOV ~66 grados) rotan 3 grados por
+;    frame con cos/sin constantes; plano = 0.66*(-dirY, dirX), de modo que la
+;    imagen no sale en espejo respecto al minimapa (x a la derecha, y hacia abajo).
+;
+;  RENDER_MUROS: DDA de lodev. rayDir se actualiza por suma (plano/80) en vez de
+;    usar una tabla de cameraX; deltaDist = |1/rayDir| (un FDIV); el puntero a
+;    la celda del mapa avanza +-1 / +-16 y el bucle del DDA ocupa 6 instrucciones
+;    por paso (FCMP, salto, FADD, ADD, LOAD, salto). El relleno de la columna es
+;    techo / muro / suelo con bucles desenrollados x4 y parametros de la tabla
+;    PROF[lineHeight] que calcula INICIO; los tramos se redondean a multiplos de
+;    4 filas y el exceso lo tapa el tramo siguiente (el del suelo puede llegar
+;    hasta 3 filas por debajo del framebuffer: hay RAM libre tras FB+19200).
+;
+;  RENDER_SPRITES: claves dist^2, ordenacion por insercion de ORDER (persistente
+;    entre frames, casi ordenada), inversa de la matriz de camara en float32,
+;    tamano = 120/transformY en x e y, recorte a pantalla, y por columna visible
+;    (transformY < ZBUF) bucle de texels con un acumulador 16.16 que lleva la
+;    direccion del texel en la parte entera. Texturas por columnas de 17 palabras
+;    (la 17a es un texel transparente que permite desenrollar x2 sin resto).
+;
+;  Salida (SYSCALL 1, en este orden): F; X e Y del jugador (bits float32 como
+;  entero con signo); HITS (pares entidad-jugador a menos de 0.5 en x e y,
+;  acumulados por frame); suma de control h = h*31 + palabra sobre las 64
+;  palabras de ENT (x, y, vx, vy de las 16 entidades), con envoltura de 32 bits.
+;
+;  Disposicion del codigo (el ejecutor atribuye instrucciones por fase):
+;  _start, INICIO, MOVER_JUGADOR, FISICA, COLISIONES, RENDER_MUROS,
+;  RENDER_SPRITES, MINIMAPA.
+; =====================================================================
+.code
+.entry _start
+
+; ---- constantes del sistema
+.equ FB        65536          ; base del framebuffer (160x120 palabras)
+
+; ---- constantes float32 (bits IEEE 754)
+.equ F_ONE     0x3F800000     ; 1.0
+.equ F_HALF    0x3F000000     ; 0.5
+.equ F_80      0x42A00000     ; 80.0  (mitad del ancho)
+.equ F_120     0x42F00000     ; 120.0 (alto de pantalla)
+.equ F_NEAR    0x3E000000     ; 0.125 (plano cercano de los sprites)
+.equ F_MINDIST 0x3C800000     ; 1/64  (distancia minima de un muro)
+.equ F_HUGE    0x7149F2CA     ; 1e30  (deltaDist de un rayo paralelo al eje)
+.equ F_MOVE    0x3D4CCCCD     ; 0.05  (avance del jugador por frame)
+.equ F_COS     0x3F7FA62F     ; cos(3 grados)
+.equ F_SIN     0x3D565E3A     ; sin(3 grados)
+.equ F_INC     0x3C4CCCCD     ; 0.0125 = 1/80 (incremento de cameraX por columna)
+
+; =====================================================================
+;  Programa principal
+; =====================================================================
+_start:
+        SYSCALL 3                     ; R1 = F (numero de frames)
+        STORE   R1, [NFR]
+        STORE   R1, [REST]
+        CALL    INICIO
+FRAME:
+        LOAD    R1, [REST]
+        CMPI    R1, 1
+        JLT     FIN                   ; no quedan frames
+        SUBI    R1, R1, 1
+        STORE   R1, [REST]
+        CALL    MOVER_JUGADOR
+        CALL    FISICA
+        CALL    COLISIONES
+        CALL    RENDER_MUROS
+        CALL    RENDER_SPRITES
+        CALL    MINIMAPA
+        JMP     FRAME
+FIN:
+        LOAD    R1, [NFR]
+        SYSCALL 1                     ; F
+        LOAD    R1, [PX]
+        SYSCALL 1                     ; X del jugador (bits float32)
+        LOAD    R1, [PY]
+        SYSCALL 1                     ; Y del jugador (bits float32)
+        LOAD    R1, [HITS]
+        SYSCALL 1                     ; HITS
+        MOVI    R1, 0                 ; suma de control: h = h*31 + palabra
+        LEA     R2, ENT
+        MOVI    R3, 64                ; 16 entidades x 4 palabras
+CHK:
+        LOAD    R4, [R2]
+        MULI    R1, R1, 31
+        ADD     R1, R1, R4
+        ADDI    R2, R2, 1
+        SUBI    R3, R3, 1
+        JNZ     CHK
+        SYSCALL 1
+        HALT
+
+; =====================================================================
+;  INICIO: preparacion unica. Tabla PROF[lineHeight] (0..120), 8 palabras:
+;    +0 g1 = grupos de 4 filas de techo    +1 A*160 = desplazamiento del muro
+;    +2 g2 = grupos de 4 filas de muro     +3 B*160 = desplazamiento del suelo
+;    +4 g3 = grupos de 4 filas de suelo
+;  con A = 60 - lh/2 (primera fila de muro) y B = min(61 + lh/2, 120)
+;  (fila siguiente a la ultima de muro). Asi el relleno de columnas no
+;  calcula nada por columna.
+; =====================================================================
+INICIO:
+        MOVI    R1, 0                 ; lineHeight
+        LEA     R2, PROF              ; puntero a la entrada
+INI_LOOP:
+        SHR     R3, R1, 1             ; mitad
+        MOVI    R4, 60
+        SUB     R4, R4, R3            ; A (>= 0 porque lh <= 120)
+        ADDI    R5, R3, 61
+        CMPI    R5, 120
+        JLT     INI_B
+        MOVI    R5, 120               ; B recortado a la pantalla
+INI_B:
+        ADDI    R6, R4, 3
+        SHR     R6, R6, 2             ; g1 = ceil(A/4)
+        SUB     R7, R5, R4            ; filas de muro
+        ADDI    R7, R7, 3
+        SHR     R7, R7, 2             ; g2 = ceil((B-A)/4)
+        MOVI    R8, 123
+        SUB     R8, R8, R5
+        SHR     R8, R8, 2             ; g3 = ceil((120-B)/4)
+        MULI    R4, R4, 160           ; A*160
+        MULI    R5, R5, 160           ; B*160
+        STORE   R6, [R2]
+        STORE   R4, [R2+1]
+        STORE   R7, [R2+2]
+        STORE   R5, [R2+3]
+        STORE   R8, [R2+4]
+        ADDI    R2, R2, 8
+        ADDI    R1, R1, 1
+        CMPI    R1, 121
+        JLT     INI_LOOP
+        RET
+
+; =====================================================================
+;  MOVER_JUGADOR: rota dir y plano 3 grados y avanza 0.05 si hay sitio
+; =====================================================================
+MOVER_JUGADOR:
+        MOVI    R1, F_COS
+        MOVI    R2, F_SIN
+        LOAD    R3, [DX]
+        LOAD    R4, [DY]
+        FMUL    R5, R3, R1            ; dx' = dx*cos - dy*sin
+        FMUL    R6, R4, R2
+        FSUB    R5, R5, R6
+        FMUL    R6, R3, R2            ; dy' = dx*sin + dy*cos
+        FMUL    R7, R4, R1
+        FADD    R6, R6, R7
+        STORE   R5, [DX]
+        STORE   R6, [DY]
+        LOAD    R3, [PLX]
+        LOAD    R4, [PLY]
+        FMUL    R7, R3, R1            ; plano: misma rotacion
+        FMUL    R8, R4, R2
+        FSUB    R7, R7, R8
+        FMUL    R8, R3, R2
+        FMUL    R9, R4, R1
+        FADD    R8, R8, R9
+        STORE   R7, [PLX]
+        STORE   R8, [PLY]
+        MOVI    R1, F_MOVE            ; avance = dir * 0.05
+        FMUL    R7, R5, R1
+        FMUL    R8, R6, R1
+        LOAD    R9, [PX]
+        LOAD    R10, [PY]
+        FADD    R11, R9, R7           ; destino en x
+        FTOI    R12, R11
+        FTOI    R13, R10
+        SHL     R13, R13, 4
+        ADD     R12, R12, R13
+        LOAD    R12, [R12+MAPA]       ; celda (int(nx), int(y))
+        JNZ     MJ_Y                  ; muro: no avanza en x
+        MOV     R9, R11
+MJ_Y:
+        FADD    R11, R10, R8          ; destino en y (con la x ya actualizada)
+        FTOI    R12, R9
+        FTOI    R13, R11
+        SHL     R13, R13, 4
+        ADD     R12, R12, R13
+        LOAD    R12, [R12+MAPA]
+        JNZ     MJ_FIN
+        MOV     R10, R11
+MJ_FIN:
+        STORE   R9, [PX]
+        STORE   R10, [PY]
+        RET
+
+; =====================================================================
+;  FISICA: cada entidad avanza; rebota (invierte la velocidad) contra muros
+; =====================================================================
+FISICA:
+        LEA     R1, ENT
+        MOVI    R2, 16
+FIS_LOOP:
+        LOAD    R3, [R1]              ; x
+        LOAD    R4, [R1+1]            ; y
+        LOAD    R5, [R1+2]            ; vx
+        LOAD    R6, [R1+3]            ; vy
+        FADD    R7, R3, R5            ; destino en x
+        FTOI    R8, R7
+        FTOI    R9, R4
+        SHL     R9, R9, 4
+        ADD     R8, R8, R9
+        LOAD    R8, [R8+MAPA]
+        JNZ     FIS_XW
+        MOV     R3, R7                ; libre: se mueve
+        JMP     FIS_Y
+FIS_XW:
+        FSUB    R5, R0, R5            ; muro: vx = -vx
+FIS_Y:
+        FADD    R7, R4, R6            ; destino en y (con la x ya actualizada)
+        FTOI    R8, R3
+        FTOI    R9, R7
+        SHL     R9, R9, 4
+        ADD     R8, R8, R9
+        LOAD    R8, [R8+MAPA]
+        JNZ     FIS_YW
+        MOV     R4, R7
+        JMP     FIS_ST
+FIS_YW:
+        FSUB    R6, R0, R6            ; muro: vy = -vy
+FIS_ST:
+        STORE   R3, [R1]
+        STORE   R4, [R1+1]
+        STORE   R5, [R1+2]
+        STORE   R6, [R1+3]
+        ADDI    R1, R1, 4
+        SUBI    R2, R2, 1
+        JNZ     FIS_LOOP
+        RET
+
+; =====================================================================
+;  COLISIONES: pares i<j a menos de 0.5 en x e y intercambian velocidades;
+;  cada entidad a menos de 0.5 del jugador suma 1 a HITS
+; =====================================================================
+COLISIONES:
+        LEA     R1, ENT               ; entidad i
+        MOVI    R2, 15                ; i restantes (0..14)
+        MOVI    R14, F_HALF
+COL_I:
+        LOAD    R3, [R1]              ; xi
+        LOAD    R4, [R1+1]            ; yi
+        ADDI    R5, R1, 4             ; entidad j = i+1
+        MOV     R6, R2                ; j restantes
+COL_J:
+        LOAD    R7, [R5]              ; xj
+        FSUB    R7, R3, R7
+        FABS    R7, R7
+        FCMP    R7, R14               ; |dx| < 0.5 ?
+        JLT     COL_Y
+COL_NX:
+        ADDI    R5, R5, 4
+        SUBI    R6, R6, 1
+        JNZ     COL_J
+        ADDI    R1, R1, 4
+        SUBI    R2, R2, 1
+        JNZ     COL_I
+        JMP     COL_HIT
+COL_Y:
+        LOAD    R8, [R5+1]            ; yj
+        FSUB    R8, R4, R8
+        FABS    R8, R8
+        FCMP    R8, R14               ; |dy| < 0.5 ?
+        JLT     COL_SW
+        JMP     COL_NX
+COL_SW:
+        LOAD    R8, [R1+2]            ; intercambia (vx, vy) de i y j
+        LOAD    R9, [R1+3]
+        LOAD    R10, [R5+2]
+        LOAD    R11, [R5+3]
+        STORE   R10, [R1+2]
+        STORE   R11, [R1+3]
+        STORE   R8, [R5+2]
+        STORE   R9, [R5+3]
+        JMP     COL_NX
+COL_HIT:
+        LOAD    R3, [PX]
+        LOAD    R4, [PY]
+        LEA     R1, ENT
+        MOVI    R2, 16
+        MOVI    R9, 0                 ; golpes de este frame
+COL_H:
+        LOAD    R5, [R1]
+        FSUB    R5, R5, R3
+        FABS    R5, R5
+        FCMP    R5, R14
+        JLT     COL_HY
+COL_HN:
+        ADDI    R1, R1, 4
+        SUBI    R2, R2, 1
+        JNZ     COL_H
+        LOAD    R5, [HITS]
+        ADD     R5, R5, R9
+        STORE   R5, [HITS]
+        RET
+COL_HY:
+        LOAD    R5, [R1+1]
+        FSUB    R5, R5, R4
+        FABS    R5, R5
+        FCMP    R5, R14
+        JLT     COL_HH
+        JMP     COL_HN
+COL_HH:
+        ADDI    R9, R9, 1
+        JMP     COL_HN
+
+; =====================================================================
+;  RENDER_MUROS: DDA de lodev por columna + relleno de la columna entera
+;
+;  Registros del bucle de columnas:
+;    R1 x            R2,R3 rayDirX,Y (se actualizan por columna, sin tabla)
+;    R4,R5 deltaDistX,Y   R6,R7 sideDistX,Y   R8 puntero a la celda del mapa
+;    R9,R10 paso del puntero (+-1, +-16)      R11 celda   R12 1.0
+;    R13 distancia perpendicular   R14 color del muro / auxiliar
+; =====================================================================
+RENDER_MUROS:
+        LOAD    R1, [PX]
+        LOAD    R2, [PY]
+        FTOI    R3, R1                ; mapX
+        FTOI    R4, R2                ; mapY
+        ITOF    R5, R3
+        ITOF    R6, R4
+        FSUB    R5, R1, R5            ; fxlo = posX - mapX
+        FSUB    R6, R2, R6            ; fylo = posY - mapY
+        MOVI    R12, F_ONE
+        FSUB    R7, R12, R5           ; fxhi = mapX + 1 - posX
+        FSUB    R8, R12, R6           ; fyhi
+        STORE   R5, [FXT]
+        STORE   R7, [FXT+1]
+        STORE   R6, [FYT]
+        STORE   R8, [FYT+1]
+        SHL     R4, R4, 4
+        ADD     R3, R3, R4
+        ADDI    R3, R3, MAPA
+        STORE   R3, [IDX0]            ; puntero a la celda del jugador
+        LOAD    R4, [DX]
+        LOAD    R5, [PLX]
+        FSUB    R2, R4, R5            ; rayDirX(x=0) = dirX - planeX (cameraX = -1)
+        LOAD    R4, [DY]
+        LOAD    R6, [PLY]
+        FSUB    R3, R4, R6            ; rayDirY(x=0)
+        MOVI    R7, F_INC
+        FMUL    R5, R5, R7            ; incremento por columna = plano/80
+        FMUL    R6, R6, R7
+        STORE   R5, [INCX]
+        STORE   R6, [INCY]
+        MOVI    R1, 0                 ; x = 0
+RM_COL:
+        FCMP    R2, R0                ; ---- eje x: deltaDistX, stepX, sideDistX
+        JZ      RM_XZ
+        FDIV    R4, R12, R2           ; 1/rayDirX
+        SHR     R14, R2, 31           ; signo: 0 (+) o -1 (-)
+        LOAD    R6, [R14+FXT+1]       ; fraccion hacia el borde (fxlo si <0, fxhi si >0)
+        LOAD    R9, [R14+STPX+1]      ; paso del puntero: -1 / +1
+        FABS    R4, R4                ; deltaDistX = |1/rayDirX|
+        FMUL    R6, R6, R4            ; sideDistX
+RM_XD:
+        FCMP    R3, R0                ; ---- eje y
+        JZ      RM_YZ
+        FDIV    R5, R12, R3
+        SHR     R14, R3, 31
+        LOAD    R7, [R14+FYT+1]
+        LOAD    R10, [R14+STPY+1]     ; paso del puntero: -16 / +16
+        FABS    R5, R5
+        FMUL    R7, R7, R5
+RM_YD:
+        LOAD    R8, [IDX0]
+RM_DDA:                               ; bucle interno del DDA: 6 instrucciones por paso
+        FCMP    R6, R7
+        JLT     RM_SX                 ; sideDistX < sideDistY: paso en x
+        FADD    R7, R7, R5
+        ADD     R8, R8, R10
+        LOAD    R11, [R8]             ; celda del mapa (fija Z)
+        JZ      RM_DDA
+        FSUB    R13, R7, R5           ; choque en cara y: dist = sideDistY - deltaDistY
+        LOAD    R14, [R11+WCOLY]      ; color oscuro de la cara y
+        JMP     RM_HIT
+RM_SX:
+        FADD    R6, R6, R4
+        ADD     R8, R8, R9
+        LOAD    R11, [R8]
+        JZ      RM_DDA
+        FSUB    R13, R6, R4           ; choque en cara x: dist = sideDistX - deltaDistX
+        LOAD    R14, [R11+WCOLX]
+RM_HIT:
+        MOVI    R4, F_MINDIST
+        FCMP    R13, R4
+        JLT     RM_NEAR               ; dist < 1/64: se fija el minimo (evita /0)
+RM_DOK:
+        STORE   R13, [R1+ZBUF]        ; ZBUF[x]
+        MOVI    R4, F_120
+        FDIV    R4, R4, R13           ; 120/dist
+        FTOI    R4, R4                ; lineHeight
+        CMPI    R4, 120
+        JLT     RM_LH
+        MOVI    R4, 120               ; columna entera de muro
+RM_LH:
+        SHL     R4, R4, 3             ; entrada de PROF
+        MOVI    R8, 1                 ; techo
+        MOV     R7, R1                ; p = x (fila 0)
+        LOAD    R6, [R4+PROF]         ; g1
+        JZ      RM_WALL
+RM_CEIL:
+        STORE   R8, [R7+FB]
+        STORE   R8, [R7+FB+160]
+        STORE   R8, [R7+FB+320]
+        STORE   R8, [R7+FB+480]
+        ADDI    R7, R7, 640
+        SUBI    R6, R6, 1
+        JNZ     RM_CEIL
+RM_WALL:                              ; el techo se pasa a veces hasta 3 filas: el muro lo tapa
+        LOAD    R7, [R4+PROF+1]
+        ADD     R7, R7, R1            ; p = x + A*160
+        LOAD    R6, [R4+PROF+2]       ; g2 >= 1
+RM_WL:
+        STORE   R14, [R7+FB]
+        STORE   R14, [R7+FB+160]
+        STORE   R14, [R7+FB+320]
+        STORE   R14, [R7+FB+480]
+        ADDI    R7, R7, 640
+        SUBI    R6, R6, 1
+        JNZ     RM_WL
+        LOAD    R7, [R4+PROF+3]
+        ADD     R7, R7, R1            ; p = x + B*160
+        MOVI    R8, 5                 ; suelo
+        LOAD    R6, [R4+PROF+4]       ; g3
+        JZ      RM_NXT
+RM_FL:                                ; el suelo tapa el posible exceso del muro
+        STORE   R8, [R7+FB]
+        STORE   R8, [R7+FB+160]
+        STORE   R8, [R7+FB+320]
+        STORE   R8, [R7+FB+480]
+        ADDI    R7, R7, 640
+        SUBI    R6, R6, 1
+        JNZ     RM_FL
+RM_NXT:
+        LOAD    R4, [INCX]            ; rayDir += plano/80
+        FADD    R2, R2, R4
+        LOAD    R4, [INCY]
+        FADD    R3, R3, R4
+        ADDI    R1, R1, 1
+        CMPI    R1, 160
+        JLT     RM_COL
+        RET
+RM_XZ:                                ; rayDirX == 0: el rayo nunca cruza lineas x
+        MOVI    R4, F_HUGE
+        MOV     R6, R4
+        MOVI    R9, 1
+        JMP     RM_XD
+RM_YZ:
+        MOVI    R5, F_HUGE
+        MOV     R7, R5
+        MOVI    R10, 16
+        JMP     RM_YD
+RM_NEAR:
+        MOV     R13, R4
+        JMP     RM_DOK
+
+; =====================================================================
+;  RENDER_SPRITES: claves de distancia, ordenacion por insercion
+;  (lejos -> cerca; el orden del frame anterior es casi el buen orden),
+;  transformacion con la inversa de la matriz de camara y dibujo por columnas
+;  con textura 16x16 muestreada con paso en punto fijo 16.16.
+; =====================================================================
+RENDER_SPRITES:
+        LOAD    R1, [PX]
+        LOAD    R2, [PY]
+        LOAD    R3, [DX]
+        LOAD    R4, [DY]
+        LOAD    R5, [PLX]
+        LOAD    R6, [PLY]
+        FMUL    R7, R5, R4            ; det = planeX*dirY - dirX*planeY
+        FMUL    R8, R3, R6
+        FSUB    R7, R7, R8
+        MOVI    R8, F_ONE
+        FDIV    R7, R8, R7            ; invDet
+        STORE   R7, [INVDET]
+        LEA     R8, ENT               ; KEYS[i] = distancia^2 al jugador
+        LEA     R9, KEYS
+        MOVI    R10, 16
+RS_KEY:
+        LOAD    R11, [R8]
+        LOAD    R12, [R8+1]
+        FSUB    R11, R11, R1
+        FSUB    R12, R12, R2
+        FMUL    R11, R11, R11
+        FMUL    R12, R12, R12
+        FADD    R11, R11, R12
+        STORE   R11, [R9]
+        ADDI    R8, R8, 4
+        ADDI    R9, R9, 1
+        SUBI    R10, R10, 1
+        JNZ     RS_KEY
+        MOVI    R1, 1                 ; ordenacion por insercion de ORDER (mayor clave primero)
+RS_SI:
+        LOAD    R2, [R1+ORDER]        ; e = ORDER[i]
+        LOAD    R3, [R2+KEYS]
+        MOV     R4, R1                ; j = i
+RS_SJ:
+        LOAD    R5, [R4+ORDER-1]
+        LOAD    R6, [R5+KEYS]
+        FCMP    R6, R3
+        JLT     RS_SH                 ; clave previa menor: e va antes
+RS_PL:
+        STORE   R2, [R4+ORDER]
+        ADDI    R1, R1, 1
+        CMPI    R1, 16
+        JLT     RS_SI
+        JMP     RS_DRAW
+RS_SH:
+        STORE   R5, [R4+ORDER]
+        SUBI    R4, R4, 1
+        JNZ     RS_SJ
+        JMP     RS_PL
+RS_DRAW:
+        MOVI    R1, 0
+        STORE   R1, [RS_K]
+RS_SPR:                               ; ---- un sprite, de lejos a cerca
+        LOAD    R1, [RS_K]
+        LOAD    R2, [R1+ORDER]
+        SHL     R2, R2, 2
+        LOAD    R3, [R2+ENT]
+        LOAD    R4, [R2+ENT+1]
+        LOAD    R5, [PX]
+        LOAD    R6, [PY]
+        FSUB    R3, R3, R5            ; spriteX relativo al jugador
+        FSUB    R4, R4, R6            ; spriteY
+        LOAD    R5, [DX]
+        LOAD    R6, [DY]
+        LOAD    R7, [PLX]
+        LOAD    R8, [PLY]
+        LOAD    R9, [INVDET]
+        FMUL    R11, R6, R3           ; transformX = invDet*(dirY*sx - dirX*sy)
+        FMUL    R12, R5, R4
+        FSUB    R11, R11, R12
+        FMUL    R11, R11, R9
+        FMUL    R10, R7, R4           ; transformY = invDet*(planeX*sy - planeY*sx)
+        FMUL    R12, R8, R3
+        FSUB    R10, R10, R12
+        FMUL    R10, R10, R9          ; R10 = transformY (profundidad)
+        MOVI    R12, F_NEAR
+        FCMP    R10, R12
+        JLT     RS_NEXT               ; detras del jugador (o casi en el plano de camara)
+        FDIV    R11, R11, R10         ; transformX/transformY
+        MOVI    R12, F_80
+        FMUL    R11, R11, R12
+        FADD    R11, R11, R12         ; 80*(1 + tX/tY)
+        FTOI    R11, R11              ; spriteScreenX
+        MOVI    R12, F_120
+        FDIV    R12, R12, R10
+        FTOI    R12, R12              ; alto = ancho = 120/transformY
+        CMPI    R12, 1
+        JLT     RS_NEXT
+        MOVI    R2, 1048575           ; paso = ceil(16.0 en 16.16 / tamano), vale para x e y
+        ADD     R2, R2, R12
+        DIV     R2, R2, R12
+        SHR     R13, R12, 1
+        SUB     R11, R11, R13         ; left = screenX - tam/2
+        MOVI    R3, 60
+        SUB     R3, R3, R13           ; top = 60 - tam/2
+        MOV     R7, R11               ; xs = max(left, 0)
+        JNEG    RS_CL
+RS_CLB:
+        ADD     R8, R11, R12          ; xEnd = min(left + tam, 160)
+        CMPI    R8, 160
+        JLT     RS_CRB
+        MOVI    R8, 160
+RS_CRB:
+        SUB     R8, R8, R7            ; columnas visibles
+        JPOS    RS_CH
+        JMP     RS_NEXT               ; fuera de pantalla
+RS_CH:
+        SUB     R9, R7, R11           ; columnas recortadas a la izquierda
+        MUL     R9, R9, R2            ; accX inicial (16.16)
+        MOV     R4, R3                ; yStart = max(top, 0)
+        JNEG    RS_CT
+RS_CTB:
+        ADD     R13, R3, R12          ; yEnd = min(top + tam, 120)
+        CMPI    R13, 120
+        JLT     RS_CBB
+        MOVI    R13, 120
+RS_CBB:
+        SUB     R13, R13, R4          ; filas visibles
+        ADDI    R13, R13, 1
+        SHR     R13, R13, 1           ; pares de filas (la fila impar sobrante cae en el texel centinela)
+        SUB     R11, R4, R3           ; filas recortadas arriba
+        MUL     R11, R11, R2          ; accY inicial (16.16)
+        MULI    R12, R4, 160
+        ADDI    R12, R12, FB          ; direccion de la primera fila visible (x = 0)
+RS_STRIPE:                            ; ---- una columna del sprite
+        LOAD    R14, [R7+ZBUF]        ; R10 = transformY, R2 = paso
+        FCMP    R10, R14
+        JLT     RS_VIS                ; visible si transformY < ZBUF[columna]
+RS_ADV:
+        ADD     R9, R9, R2            ; accX += paso
+        ADDI    R7, R7, 1
+        SUBI    R8, R8, 1
+        JNZ     RS_STRIPE
+        JMP     RS_NEXT
+RS_VIS:
+        SHR     R1, R9, 16            ; texX
+        MULI    R1, R1, 17            ; columnas de 17 texels
+        ADDI    R1, R1, TEXC          ; direccion de la columna de textura
+        SHL     R1, R1, 16            ; el acumulador lleva la direccion en la parte entera
+        ADD     R1, R1, R11           ;   y la fraccion de texY en la decimal
+        ADD     R5, R12, R7           ; puntero al primer pixel de la columna
+        MOV     R6, R13               ; pares de filas
+RS_PIX:                               ; bucle desenrollado x2: dos texels por vuelta
+        SHR     R3, R1, 16            ; direccion del texel
+        LOAD    R4, [R3]
+        JZ      RS_S1                 ; 0 = transparente
+        STORE   R4, [R5]
+RS_S1:
+        ADD     R1, R1, R2            ; siguiente texel (paso en punto fijo)
+        SHR     R3, R1, 16
+        LOAD    R4, [R3]
+        JZ      RS_S2
+        STORE   R4, [R5+160]
+RS_S2:
+        ADD     R1, R1, R2
+        ADDI    R5, R5, 320
+        SUBI    R6, R6, 1
+        JNZ     RS_PIX
+        JMP     RS_ADV
+RS_NEXT:
+        LOAD    R1, [RS_K]
+        ADDI    R1, R1, 1
+        STORE   R1, [RS_K]
+        CMPI    R1, 16
+        JLT     RS_SPR
+        RET
+RS_CL:
+        MOVI    R7, 0
+        JMP     RS_CLB
+RS_CT:
+        MOVI    R4, 0
+        JMP     RS_CTB
+
+; =====================================================================
+;  MINIMAPA: esquina superior izquierda, 2x2 pixeles por celda
+; =====================================================================
+MINIMAPA:
+        LEA     R1, MAPA
+        MOVI    R2, FB
+        MOVI    R3, 16
+MM_ROW:
+        MOVI    R4, 16
+MM_CEL:
+        LOAD    R5, [R1]
+        LOAD    R5, [R5+WCOLX]        ; color del tipo de muro (0 = vacio)
+        STORE   R5, [R2]
+        STORE   R5, [R2+1]
+        STORE   R5, [R2+160]
+        STORE   R5, [R2+161]
+        ADDI    R1, R1, 1
+        ADDI    R2, R2, 2
+        SUBI    R4, R4, 1
+        JNZ     MM_CEL
+        ADDI    R2, R2, 288           ; siguiente par de filas (320 - 32)
+        SUBI    R3, R3, 1
+        JNZ     MM_ROW
+        LEA     R1, ENT               ; entidades: 1 pixel color 10
+        MOVI    R2, 16
+        MOVI    R6, 10
+MM_ENT:
+        LOAD    R3, [R1]
+        LOAD    R4, [R1+1]
+        FADD    R3, R3, R3            ; 2 pixeles por celda
+        FADD    R4, R4, R4
+        FTOI    R3, R3
+        FTOI    R4, R4
+        MULI    R4, R4, 160
+        ADD     R3, R3, R4
+        STORE   R6, [R3+FB]
+        ADDI    R1, R1, 4
+        SUBI    R2, R2, 1
+        JNZ     MM_ENT
+        LOAD    R3, [PX]              ; jugador: bloque 2x2 color 7
+        LOAD    R4, [PY]
+        FADD    R3, R3, R3
+        FADD    R4, R4, R4
+        FTOI    R3, R3
+        FTOI    R4, R4
+        MULI    R4, R4, 160
+        ADD     R3, R3, R4
+        MOVI    R6, 7
+        STORE   R6, [R3+FB]
+        STORE   R6, [R3+FB+1]
+        STORE   R6, [R3+FB+160]
+        STORE   R6, [R3+FB+161]
+        RET
+
+; =====================================================================
+;  DATOS
+; =====================================================================
+.data
+; colores por tipo de muro: cara x (clara) y cara y (oscura)
+WCOLX:  .word 0, 8, 12, 11, 6
+WCOLY:  .word 0, 2, 1, 3, 5
+; tablas de signo: [negativo, positivo]
+STPX:   .word -1, 1                   ; paso del puntero en x
+STPY:   .word -16, 16                 ; paso del puntero en y (16 celdas por fila)
+
+; estado del jugador (float32): posicion, direccion y plano de camara (FOV ~66 grados)
+PX:     .word 0x41066666              ; 8.4
+PY:     .word 0x41073333              ; 8.45
+DX:     .word 0xBF7E98FD              ; cos 186 grados = -0.994522 (mira al oeste, algo al norte)
+DY:     .word 0xBDD61305              ; sin 186 grados = -0.104528
+PLX:    .word 0x3D8D49FE              ; 0.068989  (plano = 0.66 * (-dirY, dirX))
+PLY:    .word 0xBF2808D0              ; -0.656384
+HITS:   .word 0
+NFR:    .word 0
+REST:   .word 0
+
+; variables de trabajo
+FXT:    .space 2                      ; fracciones en x: [posX - mapX, mapX + 1 - posX]
+FYT:    .space 2
+IDX0:   .word 0                       ; puntero a la celda del jugador
+INCX:   .word 0
+INCY:   .word 0
+INVDET: .word 0
+RS_K:   .word 0
+ORDER:  .word 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+KEYS:   .space 16
+ZBUF:   .space 160
+PROF:   .space 968                    ; 121 entradas x 8 palabras
+
+; ---- Mapa 16x16 (fila a fila, y hacia abajo): 0 vacio, 1..4 tipo de muro
+MAPA:
+        .word 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1       ; y=0
+        .word 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2       ; y=1
+        .word 4, 0, 3, 3, 3, 3, 0, 0, 0, 0, 2, 2, 2, 2, 0, 2       ; y=2
+        .word 4, 0, 3, 0, 0, 3, 0, 0, 0, 0, 2, 0, 0, 2, 0, 2       ; y=3
+        .word 4, 0, 3, 0, 0, 3, 0, 0, 2, 0, 2, 0, 0, 2, 0, 2       ; y=4
+        .word 4, 0, 3, 3, 0, 3, 0, 0, 0, 0, 2, 0, 2, 2, 0, 2       ; y=5
+        .word 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2       ; y=6
+        .word 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 2       ; y=7
+        .word 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2       ; y=8
+        .word 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2       ; y=9
+        .word 4, 0, 1, 1, 1, 1, 0, 0, 1, 0, 4, 4, 4, 4, 0, 2       ; y=10
+        .word 4, 0, 1, 0, 0, 1, 0, 3, 0, 0, 4, 0, 0, 4, 0, 2       ; y=11
+        .word 4, 0, 1, 0, 0, 1, 0, 0, 0, 0, 4, 0, 0, 4, 0, 2       ; y=12
+        .word 4, 0, 1, 1, 0, 1, 0, 0, 0, 0, 4, 4, 0, 4, 0, 2       ; y=13
+        .word 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2       ; y=14
+        .word 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3       ; y=15
+
+; ---- Textura de la bola 16x16 por columnas de 17 palabras: TEXC[tx*17+ty], 0 = transparente.
+;      La palabra 17 de cada columna es un texel centinela siempre transparente (ver RS_PIX).
+TEXC:
+        .word 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0       ; tx=0
+        .word 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0       ; tx=1
+        .word 0, 0, 0, 4, 4, 10, 10, 10, 10, 9, 9, 4, 4, 0, 0, 0, 0       ; tx=2
+        .word 0, 0, 4, 10, 7, 7, 7, 10, 10, 10, 9, 9, 9, 4, 0, 0, 0       ; tx=3
+        .word 0, 4, 4, 7, 7, 7, 7, 7, 10, 10, 9, 9, 9, 4, 4, 0, 0       ; tx=4
+        .word 0, 4, 10, 7, 7, 7, 7, 7, 10, 10, 9, 9, 9, 9, 4, 0, 0       ; tx=5
+        .word 0, 4, 10, 7, 7, 7, 7, 7, 10, 10, 9, 9, 9, 9, 4, 0, 0       ; tx=6
+        .word 4, 4, 10, 10, 7, 7, 7, 10, 10, 10, 9, 9, 9, 4, 4, 4, 0       ; tx=7
+        .word 4, 4, 10, 10, 10, 10, 10, 10, 10, 9, 9, 9, 4, 4, 4, 4, 0       ; tx=8
+        .word 0, 4, 9, 10, 10, 10, 10, 10, 9, 9, 9, 4, 4, 4, 4, 0, 0       ; tx=9
+        .word 0, 4, 9, 9, 9, 9, 9, 9, 9, 9, 4, 4, 4, 4, 4, 0, 0       ; tx=10
+        .word 0, 4, 4, 9, 9, 9, 9, 9, 9, 4, 4, 4, 4, 4, 4, 0, 0       ; tx=11
+        .word 0, 0, 4, 9, 9, 9, 9, 9, 4, 4, 4, 4, 4, 4, 0, 0, 0       ; tx=12
+        .word 0, 0, 0, 4, 4, 9, 9, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0       ; tx=13
+        .word 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0       ; tx=14
+        .word 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0       ; tx=15
+
+; ---- Entidades: x, y, vx, vy (float32); 16 entidades de 4 palabras
+ENT:
+        .word 0x40BCCCCD, 0x41000000, 0x3CF5C28F, 0x3CA3D70A       ;  0 (5.90, 8.00) v=(+0.03, +0.02)
+        .word 0x40733333, 0x4119999A, 0xBCA3D70A, 0x3D75C28F       ;  1 (3.80, 9.60) v=(-0.02, +0.06)
+        .word 0x40C00000, 0x40B9999A, 0xBCF5C28F, 0x3D4CCCCD       ;  2 (6.00, 5.80) v=(-0.03, +0.05)
+        .word 0x40E9999A, 0x40666666, 0x3D8F5C29, 0x3CF5C28F       ;  3 (7.30, 3.60) v=(+0.07, +0.03)
+        .word 0x40600000, 0x40600000, 0xBD75C28F, 0xBDA3D70A       ;  4 (3.50, 3.50) v=(-0.06, -0.08)
+        .word 0x4059999A, 0x40E9999A, 0x3D75C28F, 0x3CF5C28F       ;  5 (3.40, 7.30) v=(+0.06, +0.03)
+        .word 0x40D00000, 0x4019999A, 0xBD23D70A, 0x3CF5C28F       ;  6 (6.50, 2.40) v=(-0.04, +0.03)
+        .word 0x40200000, 0x40F33333, 0x3DA3D70A, 0xBD4CCCCD       ;  7 (2.50, 7.60) v=(+0.08, -0.05)
+        .word 0x416C1829, 0x40125AB8, 0x3DA3D70A, 0xBCA3D70A       ;  8 (14.76, 2.29) v=(+0.08, -0.02)
+        .word 0x4167F6CA, 0x40D43A87, 0xBD4CCCCD, 0xBD8F5C29       ;  9 (14.50, 6.63) v=(-0.05, -0.07)
+        .word 0x4106513C, 0x40597C2F, 0xBDA3D70A, 0x3CF5C28F       ; 10 (8.39, 3.40) v=(-0.08, +0.03)
+        .word 0x3FC1C041, 0x40311396, 0x3CA3D70A, 0x3CF5C28F       ; 11 (1.51, 2.77) v=(+0.02, +0.03)
+        .word 0x4106C2DF, 0x41433509, 0xBCA3D70A, 0xBD75C28F       ; 12 (8.42, 12.20) v=(-0.02, -0.06)
+        .word 0x40907936, 0x408FB894, 0xBD4CCCCD, 0x3D75C28F       ; 13 (4.51, 4.49) v=(-0.05, +0.06)
+        .word 0x41166666, 0x40E00000, 0xBCA3D70A, 0x3CA3D70A       ; 14 (9.40, 7.00) v=(-0.02, +0.02)
+        .word 0x412C961C, 0x3FA23225, 0x3D75C28F, 0xBD75C28F       ; 15 (10.79, 1.27) v=(+0.06, -0.06)

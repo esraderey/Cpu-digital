@@ -1,0 +1,11 @@
+# Texto normalizado a LF en el repositorio; cada checkout usa el fin de línea de su plataforma.
+* text=auto
+
+# Formatos binarios del proyecto: nunca se convierten ni se muestran como diff de texto.
+*.sqlite binary
+*.trom binary
+*.tvm binary
+*.bin binary
+*.png binary
+*.jpg binary
+*.ico binary

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,10 +7,36 @@ name = "cpu-digital-tramoya"
 version = "2.0.0"
 description = "Runtime VM32 seguro y CPU de 16 bits construidos sobre Tramoya"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "esraderey" }]
 requires-python = ">=3.10"
+keywords = ["virtual-machine", "cpu", "emulator", "assembler", "state-machine", "tramoya", "llama2", "education"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Natural Language :: Spanish",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Education",
+    "Topic :: Software Development :: Assemblers",
+    "Topic :: Software Development :: Interpreters",
+    "Topic :: System :: Emulators",
+]
 dependencies = [
     "tramoya==1.5.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/esraderey/Cpu-digital"
+Repository = "https://github.com/esraderey/Cpu-digital"
+Issues = "https://github.com/esraderey/Cpu-digital/issues"
+Documentation = "https://github.com/esraderey/Cpu-digital/blob/main/VM32.md"
+Changelog = "https://github.com/esraderey/Cpu-digital/blob/main/CHANGELOG.md"
 
 [project.scripts]
 cpu-digital = "cpu_simulator:main"

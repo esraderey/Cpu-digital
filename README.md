@@ -48,7 +48,8 @@ puedes iniciarla con el comando `tramoya-ui` después de instalar el proyecto. U
 - Hasta 16 777 216 palabras configurables (64 MiB).
 - Páginas físicas de 16 KiB asignadas bajo demanda.
 - Caché de instrucciones con invalidación para código automodificable.
-- Ejecución continua optimizada; `step()` conserva instrumentación completa.
+- Ejecución continua optimizada (~0,55 M instr/s) con acelerador de bucles
+  internos que conserva el estado exacto del intérprete (~5,5 M instr/s en bucles).
 - Snapshots v2 dispersos y compatibles con snapshots densos v1.
 - Ensamblador limitado antes de reservar `.space` para evitar agotamiento accidental.
 - **79 instrucciones** en formato fijo de 4 palabras.
@@ -301,6 +302,7 @@ cpu_digital/
   isa.py                  ISA de 16 bits
   assembler.py            ensamblador/desensamblador (16 bits)
   vm32.py                 VM de 32 bits con FPU, aritmética 64-bit y fibras
+  vm32_loops.py           acelerador de bucles (compila bucles calientes con semántica exacta)
   vm32_isa.py             ISA de 32 bits (79 instrucciones)
   tnu.py                  Chip Neuronal Tramoya: ROM de tensores y núcleos vectoriales
   tnu_models.py           ROM de llama2.c, BPE y referencia de host

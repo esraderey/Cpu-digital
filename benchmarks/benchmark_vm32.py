@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--instructions", type=int, default=200_000)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--trace", type=int, default=0, help="Tamaño del buffer de traza")
+    parser.add_argument("--no-loops", action="store_true", help="Desactiva el acelerador de bucles")
     args = parser.parse_args()
     if args.instructions < 1 or args.rounds < 1 or args.trace < 0:
         parser.error("Los parámetros deben ser positivos; trace puede ser cero")
@@ -40,6 +41,7 @@ def main() -> int:
             VMConfig(
                 gas_limit=max(1_000_000, args.instructions * 2),
                 trace_size=args.trace,
+                accelerate_loops=not args.no_loops,
             )
         )
         vm.load_program(program)
@@ -50,10 +52,12 @@ def main() -> int:
         rates.append(executed / elapsed)
         elapsed_values.append(elapsed)
         allocated_bytes = vm.allocated_memory_bytes
+        accelerated = vm.accelerated_instructions
 
     print(f"Rondas:             {args.rounds}")
     print(f"Instrucciones:      {args.instructions:,} por ronda")
     print(f"Traza:              {args.trace:,}")
+    print(f"Bucles acelerados:  {'no' if args.no_loops else f'sí ({accelerated:,} instrucciones)'}")
     print(f"Mediana:            {statistics.median(rates):,.0f} instrucciones/s")
     print(f"Mejor:              {max(rates):,.0f} instrucciones/s")
     print(f"Tiempo mediano:     {statistics.median(elapsed_values):.6f} s")

@@ -96,6 +96,10 @@ Ataca la frontera de §2.2: la cifra [L] de ~14 M instr/s existe, pero sin las g
 
 **Coste**: ~1500 líneas, 2–3 semanas, riesgo alto de divergencia mitigado por el oráculo (CONJETURA). **Ganancia**: 3–7 M instr/s en código de juego (8–20×), más cerca de 40× en bucles de relleno o raycasting (CONJETURA; la crítica cruzada estima más probable la mitad baja, 3–4 M).
 
+**P2-lite, implementada (2026-09-29, rama `acelerador-bucles`; HECHO [L3]).** Antes de compilar bloques arbitrarios se construyó la versión restringida: solo bucles internos con cuerpo lineal y un único salto de vuelta, compilados tras 32 pasadas. La deoptimización no es por repetición sino por **entrega**: el código generado comprueba el rango antes de cada acceso a memoria y, si algo pudiera fallar, devuelve el control al intérprete en esa instrucción con el estado parcial ya escrito; el intérprete la ejecuta con su validación y su rollback, así que ninguna instrucción se ejecuta dos veces ni a medias. Gas y presupuesto se comprueban por vuelta. Medido: `ADDI`+`JMP` de 557 000 a 5,5 M instr/s (10×); producto punto escalar de 55 000 a 345 000 MAC/s (6,3×; 9,4× frente a la línea base anterior a las micro-optimizaciones). Cobertura en los demos del repositorio: 0 %, porque son programas de 5–145 instrucciones o tienen `SYSCALL`/`CALL` dentro del bucle; `llama2.tasm`: 0 % (sus bucles contienen `CALL` y ops TNU, y su tiempo es del TNU). El experimento de cobertura sobre código de juego sigue pendiente: P2-lite vive o muere por él. Verificación: fuzzing diferencial de 400 bucles aleatorios frente al intérprete (estado, gas, fallos, memoria idénticos).
+
+Hallazgo colateral del fuzzing (HECHO [L3]): la FPU escalar no era determinista con NaN. Para `x * y` con dos NaN, CPython 3.13 devuelve la carga útil del segundo operando la primera vez y la del primero cuando la operación ya está especializada. Se corrigió guardando todo NaN como el canónico `0x7FC00000`, como hace RISC-V.
+
 ### P3. 3D por software: geometría en el invitado, filas en el host
 
 Ataca la frontera de §2.3: el 3D viable en máquinas lentas es el raycasting, y no se localizaron cifras de rasterizado de triángulos.
@@ -228,4 +232,5 @@ Todas consultadas el 2026-09-29. Las marcadas con † fueron confirmadas por el 
 - [R29] A. Karpathy, «llama2.c». https://github.com/karpathy/llama2.c
 - [R30] arXiv 2603.08721, KernelCraft, 2026-02-10. https://arxiv.org/abs/2603.08721
 - [L] Mediciones locales del director: `scratchpad/medir_vm.py` de la sesión de expedición, Python 3.13.2 sobre Windows x64, 2026-09-29.
+- [L3] Mediciones de P2-lite: `benchmarks/benchmark_vm32.py` (con y sin `--no-loops`) y el bucle MAC de `tests/test_vm32_loops.py`, Python 3.13.2 sobre Windows x64, 2026-09-29.
 - [L2] Mediciones de P5: `benchmarks/benchmark_tnu.py` (reproducible; `--json` guarda el informe completo), Python 3.13.2 sobre Windows x64, 2026-09-29. Modelos stories260K y stories15M de https://huggingface.co/karpathy/tinyllamas; tokenizers de https://github.com/karpathy/llama2.c.

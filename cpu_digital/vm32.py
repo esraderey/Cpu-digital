@@ -20,6 +20,7 @@ from .memory_chip import NonVolatileMemoryChip
 from .tnu import MAX_TNU_LENGTH, MAX_TNU_WORK, ROM_BASE, TramoyaNeuralUnit
 from .vm32_assembler import Program32, signed32
 from .vm32_isa import TNU_FIRST_OPCODE, VM32_ISA, VMInstruction, VMOpcode
+from .vm32_loops import CompiledLoop, compile_loop
 
 
 SNAPSHOT_MAGIC = b"TVMS32\x01"
@@ -29,6 +30,10 @@ MAX_MEMORY_WORDS = 16_777_216
 MAX_SNAPSHOT_RAW_BYTES = 256 * 1024 * 1024
 MAX_MEMORY_CHIP_TRANSFER_BYTES = 4_096
 MAX_ROPE_HEAD_SIZE = 256
+LOOP_WARMUP = 32  # saltos hacia atrás a una cabecera antes de compilar su bucle (~0,4 ms)
+_F32 = struct.Struct("f")
+CANONICAL_NAN = 0x7FC00000
+_U32 = struct.Struct("I")
 RUNNABLE_STATES = frozenset({"READY", "RUNNING", "PAUSED", "WAITING"})
 FINAL_STATES = frozenset({"HALTED", "FAULTED"})
 
@@ -84,6 +89,7 @@ class VMConfig:
     output_limit: int = 1_000_000
     fiber_limit: int = 64
     protect_code: bool = True
+    accelerate_loops: bool = True
     capabilities: frozenset[str] = frozenset({"io", "introspection", "random", "memory"})
 
     def __post_init__(self) -> None:
@@ -173,6 +179,7 @@ class TramoyaVM32:
         self._pending_event: tuple[str, str | int | None] | None = None
         self._journal: dict[int, int] | None = None
         self._undo: list[Callable[[], None]] | None = None
+        self._handlers = _handlers_for(type(self))
         self._initialize_core()
         self.machine = self._build_lifecycle()
         self._install_builtin_syscalls()
@@ -264,6 +271,13 @@ class TramoyaVM32:
         self._current_fiber: int = 0
         self._next_fiber_id: int = 1
         self._vl = self._vr = self._vs = 0
+        self._last_instruction: tuple[int, str, tuple[int, int, int], str] | None = None
+        # Acelerador de bucles: cabeceras vistas en saltos hacia atrás y sus
+        # cuerpos compilados (None = no acelerable). Son cachés: no entran en
+        # el snapshot ni en el checkpoint.
+        self._loop_candidates: dict[int, int] = {}
+        self._loops: dict[int, CompiledLoop | None] = {}
+        self._accelerated_instructions = 0
         self._sync_special_registers()
 
     def _fresh_lifecycle_context(self) -> dict[str, Any]:
@@ -365,6 +379,15 @@ class TramoyaVM32:
         target["instructions"] = self._instructions
         target["cycles"] = self._cycles
         target["gas_remaining"] = self._gas_remaining
+        last = self._last_instruction
+        if last is not None:
+            pc, opcode_name, operands, detail = last
+            target["last_instruction"] = {
+                "pc": pc,
+                "opcode": opcode_name,
+                "operands": list(operands),
+                "detail": detail,
+            }
 
     def load_program(self, program: Program32, inputs: Iterable[int] = ()) -> None:
         if len(program.words) > self.config.memory_words:
@@ -431,7 +454,7 @@ class TramoyaVM32:
                 raise _ExecutionFault(f"Gas agotado: {spec.mnemonic} requiere {cost}")
 
             self._pc += 4
-            self._dispatch(spec.opcode, a, b, c)
+            self._handlers[spec.opcode](self, a, b, c)
             self._instructions += 1
             self._cycles += cost
             self._gas_remaining -= cost
@@ -468,12 +491,9 @@ class TramoyaVM32:
         finally:
             self._journal = None
             self._undo = None
-            self.machine.ctx["last_instruction"] = {
-                "pc": pc_before,
-                "opcode": opcode_name,
-                "operands": list(operands),
-                "detail": detail,
-            }
+            # El diccionario para la consola se materializa en _sync_lifecycle,
+            # no en cada instrucción del camino caliente.
+            self._last_instruction = (pc_before, opcode_name, operands, detail)
             if self.config.trace_size:
                 self._trace_sequence += 1
                 self._trace.append(
@@ -572,187 +592,272 @@ class TramoyaVM32:
         return cached
 
     def _dispatch(self, opcode: VMOpcode, a: int, b: int, c: int) -> None:
-        if opcode == VMOpcode.NOP:
-            return
-        if opcode == VMOpcode.MOV:
-            self._write_result(a, self._read_register(b))
-        elif opcode == VMOpcode.MOVI:
-            self._write_result(a, b)
-        elif opcode == VMOpcode.LEA:
-            self._write_result(a, b)
-        elif opcode == VMOpcode.LOAD:
-            self._write_result(a, self.read_memory(self._effective_address(b, c)))
-        elif opcode == VMOpcode.STORE:
-            self.write_memory(self._effective_address(b, c), self._read_register(a))
-        elif opcode == VMOpcode.ADD:
-            self._add(a, self._read_register(b), self._read_register(c))
-        elif opcode == VMOpcode.ADDI:
-            self._add(a, self._read_register(b), c)
-        elif opcode == VMOpcode.SUB:
-            self._subtract(a, self._read_register(b), self._read_register(c))
-        elif opcode == VMOpcode.SUBI:
-            self._subtract(a, self._read_register(b), c)
-        elif opcode == VMOpcode.MUL:
-            self._write_result(a, self._read_register(b) * self._read_register(c), overflow_check=True)
-        elif opcode == VMOpcode.MULI:
-            self._write_result(a, self._read_register(b) * c, overflow_check=True)
-        elif opcode in {VMOpcode.DIV, VMOpcode.MOD}:
-            dividend, divisor = self._read_register(b), self._read_register(c)
-            if divisor == 0:
-                raise _ExecutionFault("División entre cero")
-            quotient = self._quotient(dividend, divisor)
-            value = quotient if opcode == VMOpcode.DIV else dividend - quotient * divisor
-            self._write_result(a, value, overflow_check=True)
-        elif opcode == VMOpcode.CMP:
-            self._set_sub_flags(self._read_register(a), self._read_register(b))
-        elif opcode == VMOpcode.CMPI:
-            self._set_sub_flags(self._read_register(a), b)
-        elif opcode == VMOpcode.TEST:
-            self._set_flags(self._read_register(a) & self._read_register(b))
-        elif opcode == VMOpcode.AND:
-            self._write_result(a, self._read_register(b) & self._read_register(c))
-        elif opcode == VMOpcode.OR:
-            self._write_result(a, self._read_register(b) | self._read_register(c))
-        elif opcode == VMOpcode.XOR:
-            self._write_result(a, self._read_register(b) ^ self._read_register(c))
-        elif opcode == VMOpcode.NOT:
-            self._write_result(a, ~self._read_register(b))
-        elif opcode in {VMOpcode.SHL, VMOpcode.SHR}:
-            if not 0 <= c <= 31:
-                raise _ExecutionFault(f"Desplazamiento inválido: {c}")
-            value = self._read_register(b)
-            if opcode == VMOpcode.SHL:
-                carry = bool(c and ((value & 0xFFFFFFFF) >> (32 - c)) & 1)
-                self._write_result(a, value << c, carry=carry, overflow_check=True)
-            else:
-                carry = bool(c and ((value & 0xFFFFFFFF) >> (c - 1)) & 1)
-                self._write_result(a, value >> c, carry=carry)
-        elif opcode == VMOpcode.JMP:
+        # Tabla de manejadores por clase: una búsqueda en lugar de una cadena de
+        # comparaciones. _execute_one la usa directamente; para extender la VM se
+        # sobrescriben los métodos _op_*, no _dispatch.
+        self._handlers[opcode](self, a, b, c)
+
+    # ── Manejadores por opcode (misma semántica que la cadena original) ──
+
+    def _op_nop(self, a: int, b: int, c: int) -> None:
+        return
+
+    def _op_mov(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self._read_register(b))
+
+    def _op_movi(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, b)
+
+    def _op_lea(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, b)
+
+    def _op_load(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self.read_memory(self._effective_address(b, c)))
+
+    def _op_store(self, a: int, b: int, c: int) -> None:
+        self.write_memory(self._effective_address(b, c), self._read_register(a))
+
+    def _op_add(self, a: int, b: int, c: int) -> None:
+        self._add(a, self._read_register(b), self._read_register(c))
+
+    def _op_addi(self, a: int, b: int, c: int) -> None:
+        self._add(a, self._read_register(b), c)
+
+    def _op_sub(self, a: int, b: int, c: int) -> None:
+        self._subtract(a, self._read_register(b), self._read_register(c))
+
+    def _op_subi(self, a: int, b: int, c: int) -> None:
+        self._subtract(a, self._read_register(b), c)
+
+    def _op_mul(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self._read_register(b) * self._read_register(c), overflow_check=True)
+
+    def _op_muli(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self._read_register(b) * c, overflow_check=True)
+
+    def _op_div(self, a: int, b: int, c: int) -> None:
+        dividend, divisor = self._read_register(b), self._read_register(c)
+        if divisor == 0:
+            raise _ExecutionFault("División entre cero")
+        self._write_result(a, self._quotient(dividend, divisor), overflow_check=True)
+
+    def _op_mod(self, a: int, b: int, c: int) -> None:
+        dividend, divisor = self._read_register(b), self._read_register(c)
+        if divisor == 0:
+            raise _ExecutionFault("División entre cero")
+        quotient = self._quotient(dividend, divisor)
+        self._write_result(a, dividend - quotient * divisor, overflow_check=True)
+
+    def _op_cmp(self, a: int, b: int, c: int) -> None:
+        self._set_sub_flags(self._read_register(a), self._read_register(b))
+
+    def _op_cmpi(self, a: int, b: int, c: int) -> None:
+        self._set_sub_flags(self._read_register(a), b)
+
+    def _op_test(self, a: int, b: int, c: int) -> None:
+        self._set_flags(self._read_register(a) & self._read_register(b))
+
+    def _op_and(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self._read_register(b) & self._read_register(c))
+
+    def _op_or(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self._read_register(b) | self._read_register(c))
+
+    def _op_xor(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self._read_register(b) ^ self._read_register(c))
+
+    def _op_not(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, ~self._read_register(b))
+
+    def _op_shl(self, a: int, b: int, c: int) -> None:
+        if not 0 <= c <= 31:
+            raise _ExecutionFault(f"Desplazamiento inválido: {c}")
+        value = self._read_register(b)
+        carry = bool(c and ((value & 0xFFFFFFFF) >> (32 - c)) & 1)
+        self._write_result(a, value << c, carry=carry, overflow_check=True)
+
+    def _op_shr(self, a: int, b: int, c: int) -> None:
+        if not 0 <= c <= 31:
+            raise _ExecutionFault(f"Desplazamiento inválido: {c}")
+        value = self._read_register(b)
+        carry = bool(c and ((value & 0xFFFFFFFF) >> (c - 1)) & 1)
+        self._write_result(a, value >> c, carry=carry)
+
+    def _op_jmp(self, a: int, b: int, c: int) -> None:
+        self._jump(a)
+
+    def _op_jz(self, a: int, b: int, c: int) -> None:
+        if self._flags["Z"]:
             self._jump(a)
-        elif opcode == VMOpcode.JZ and self._flags["Z"]:
+
+    def _op_jnz(self, a: int, b: int, c: int) -> None:
+        if not self._flags["Z"]:
             self._jump(a)
-        elif opcode == VMOpcode.JNZ and not self._flags["Z"]:
+
+    def _op_jneg(self, a: int, b: int, c: int) -> None:
+        if self._flags["N"]:
             self._jump(a)
-        elif opcode == VMOpcode.JNEG and self._flags["N"]:
+
+    def _op_jpos(self, a: int, b: int, c: int) -> None:
+        flags = self._flags
+        if not flags["Z"] and not flags["N"]:
             self._jump(a)
-        elif opcode == VMOpcode.JPOS and not self._flags["Z"] and not self._flags["N"]:
+
+    def _op_jc(self, a: int, b: int, c: int) -> None:
+        if self._flags["C"]:
             self._jump(a)
-        elif opcode == VMOpcode.JC and self._flags["C"]:
+
+    def _op_jnc(self, a: int, b: int, c: int) -> None:
+        if not self._flags["C"]:
             self._jump(a)
-        elif opcode == VMOpcode.JNC and not self._flags["C"]:
+
+    def _op_jlt(self, a: int, b: int, c: int) -> None:
+        flags = self._flags
+        if flags["N"] != flags["O"]:
             self._jump(a)
-        elif opcode == VMOpcode.JLT and self._flags["N"] != self._flags["O"]:
+
+    def _op_jgt(self, a: int, b: int, c: int) -> None:
+        flags = self._flags
+        if not flags["Z"] and flags["N"] == flags["O"]:
             self._jump(a)
-        elif opcode == VMOpcode.JGT and not self._flags["Z"] and self._flags["N"] == self._flags["O"]:
-            self._jump(a)
-        elif opcode == VMOpcode.PUSH:
-            self._push(self._read_register(a))
-        elif opcode == VMOpcode.POP:
-            self._write_result(a, self._pop())
-        elif opcode == VMOpcode.CALL:
-            self._push(self._pc)
-            self._jump(a)
-        elif opcode == VMOpcode.CALLR:
-            target = self._read_register(a)
-            self._push(self._pc)
-            self._jump(target)
-        elif opcode == VMOpcode.RET:
-            self._jump(self._pop())
-        elif opcode == VMOpcode.SYSCALL:
-            # En run() el contexto Tramoya se sincroniza por bloque. Dar a una
-            # syscall host el estado acumulado hasta la instrucción anterior.
-            self._sync_lifecycle()
-            self._invoke_syscall(a)
-        elif opcode == VMOpcode.INT:
-            self._enter_interrupt(a)
-        elif opcode == VMOpcode.IRET:
-            self._return_interrupt()
-        elif opcode == VMOpcode.EI:
-            self._interrupts_enabled = True
-        elif opcode == VMOpcode.DI:
-            self._interrupts_enabled = False
-        elif opcode == VMOpcode.SETIV:
-            if "interrupt_control" not in self.config.capabilities:
-                raise _ExecutionFault("Capacidad interrupt_control no autorizada")
-            try:
-                self.set_interrupt_vector(a, b)
-            except ValueError as exc:
-                raise _ExecutionFault(str(exc)) from exc
-        elif opcode == VMOpcode.YIELD:
-            raise _WaitSignal("YIELD cooperativo")
-        elif opcode == VMOpcode.BREAK:
-            raise _PauseSignal("Instrucción BREAK")
-        elif opcode == VMOpcode.HALT:
-            # HALT indica terminación correcta. Para devolver otro código se
-            # usa la syscall 0, que toma el valor explícito de R1.
-            raise _HaltSignal(0)
-        # ── FPU: punto flotante IEEE 754 single-precision ────────────
-        elif opcode == VMOpcode.FADD:
-            self._float_to_reg(a, self._float_from_reg(b) + self._float_from_reg(c))
-        elif opcode == VMOpcode.FSUB:
-            self._float_to_reg(a, self._float_from_reg(b) - self._float_from_reg(c))
-        elif opcode == VMOpcode.FMUL:
-            self._float_to_reg(a, self._float_from_reg(b) * self._float_from_reg(c))
-        elif opcode == VMOpcode.FDIV:
-            divisor = self._float_from_reg(c)
-            if divisor == 0.0:
-                raise _ExecutionFault("División flotante entre cero")
-            self._float_to_reg(a, self._float_from_reg(b) / divisor)
-        elif opcode == VMOpcode.FCMP:
-            left, right = self._float_from_reg(a), self._float_from_reg(b)
-            if math.isnan(left) or math.isnan(right):
-                self._flags.update(Z=False, N=False, C=True, O=False)
-            else:
-                self._flags.update(Z=left == right, N=left < right, C=False, O=False)
-        elif opcode == VMOpcode.FTOI:
-            fval = self._float_from_reg(b)
-            if math.isnan(fval) or math.isinf(fval):
-                raise _ExecutionFault("Conversión float→int de NaN o infinito")
-            ival = int(fval)
-            if not -(1 << 31) <= ival < (1 << 31):
-                raise _ExecutionFault("Desbordamiento en conversión float→int")
-            self._write_result(a, ival)
-        elif opcode == VMOpcode.ITOF:
-            self._float_to_reg(a, float(self._read_register(b)))
-        elif opcode == VMOpcode.FABS:
-            self._float_to_reg(a, abs(self._float_from_reg(b)))
-        elif opcode == VMOpcode.FSQRT:
-            fval = self._float_from_reg(b)
-            if fval < 0.0:
-                raise _ExecutionFault("Raíz cuadrada de número negativo")
-            self._float_to_reg(a, math.sqrt(fval))
-        # ── Aritmética extendida 64 bits ───────────────────────
-        elif opcode == VMOpcode.MULH:
-            full = self._read_register(b) * self._read_register(c)
-            high = signed32((full >> 32) & 0xFFFFFFFF)
-            self._write_result(a, high)
-        elif opcode == VMOpcode.ADDX:
-            left, right = self._read_register(b), self._read_register(c)
-            carry_in = 1 if self._flags["C"] else 0
-            raw = left + right + carry_in
-            unsigned = (left & 0xFFFFFFFF) + (right & 0xFFFFFFFF) + carry_in
-            result = signed32(raw)
-            overflow = (left >= 0) == (right >= 0) and (result >= 0) != (left >= 0)
-            self._write_register(a, result)
-            self._set_flags(result, carry=unsigned > 0xFFFFFFFF, overflow=overflow)
-        elif opcode == VMOpcode.SUBX:
-            left, right = self._read_register(b), self._read_register(c)
-            borrow_in = 0 if self._flags["C"] else 1
-            raw = left - right - borrow_in
-            result = signed32(raw)
-            overflow = (left >= 0) != (right >= 0) and (result >= 0) != (left >= 0)
-            borrow_unsigned = (left & 0xFFFFFFFF) >= ((right & 0xFFFFFFFF) + borrow_in)
-            self._write_register(a, result)
-            self._set_flags(result, carry=borrow_unsigned, overflow=overflow)
-        # ── Fibras cooperativas ────────────────────────────────
-        elif opcode == VMOpcode.SPAWN:
-            self._spawn_fiber(a)
-        elif opcode == VMOpcode.SWITCH:
-            self._switch_fiber(self._read_register(a))
-        elif opcode == VMOpcode.FRET:
-            self._finish_fiber()
-        elif opcode >= TNU_FIRST_OPCODE:
-            self._execute_tnu(opcode, a, b, c)
+
+    def _op_push(self, a: int, b: int, c: int) -> None:
+        self._push(self._read_register(a))
+
+    def _op_pop(self, a: int, b: int, c: int) -> None:
+        self._write_result(a, self._pop())
+
+    def _op_call(self, a: int, b: int, c: int) -> None:
+        self._push(self._pc)
+        self._jump(a)
+
+    def _op_callr(self, a: int, b: int, c: int) -> None:
+        target = self._read_register(a)
+        self._push(self._pc)
+        self._jump(target)
+
+    def _op_ret(self, a: int, b: int, c: int) -> None:
+        self._jump(self._pop())
+
+    def _op_syscall(self, a: int, b: int, c: int) -> None:
+        # En run() el contexto Tramoya se sincroniza por bloque. Dar a una
+        # syscall host el estado acumulado hasta la instrucción anterior.
+        self._sync_lifecycle()
+        self._invoke_syscall(a)
+
+    def _op_int(self, a: int, b: int, c: int) -> None:
+        self._enter_interrupt(a)
+
+    def _op_iret(self, a: int, b: int, c: int) -> None:
+        self._return_interrupt()
+
+    def _op_ei(self, a: int, b: int, c: int) -> None:
+        self._interrupts_enabled = True
+
+    def _op_di(self, a: int, b: int, c: int) -> None:
+        self._interrupts_enabled = False
+
+    def _op_setiv(self, a: int, b: int, c: int) -> None:
+        if "interrupt_control" not in self.config.capabilities:
+            raise _ExecutionFault("Capacidad interrupt_control no autorizada")
+        try:
+            self.set_interrupt_vector(a, b)
+        except ValueError as exc:
+            raise _ExecutionFault(str(exc)) from exc
+
+    def _op_yield(self, a: int, b: int, c: int) -> None:
+        raise _WaitSignal("YIELD cooperativo")
+
+    def _op_break(self, a: int, b: int, c: int) -> None:
+        raise _PauseSignal("Instrucción BREAK")
+
+    def _op_halt(self, a: int, b: int, c: int) -> None:
+        # HALT indica terminación correcta. Para devolver otro código se
+        # usa la syscall 0, que toma el valor explícito de R1.
+        raise _HaltSignal(0)
+
+    # ── FPU: punto flotante IEEE 754 single-precision ────────────
+
+    def _op_fadd(self, a: int, b: int, c: int) -> None:
+        self._float_to_reg(a, self._float_from_reg(b) + self._float_from_reg(c))
+
+    def _op_fsub(self, a: int, b: int, c: int) -> None:
+        self._float_to_reg(a, self._float_from_reg(b) - self._float_from_reg(c))
+
+    def _op_fmul(self, a: int, b: int, c: int) -> None:
+        self._float_to_reg(a, self._float_from_reg(b) * self._float_from_reg(c))
+
+    def _op_fdiv(self, a: int, b: int, c: int) -> None:
+        divisor = self._float_from_reg(c)
+        if divisor == 0.0:
+            raise _ExecutionFault("División flotante entre cero")
+        self._float_to_reg(a, self._float_from_reg(b) / divisor)
+
+    def _op_fcmp(self, a: int, b: int, c: int) -> None:
+        left, right = self._float_from_reg(a), self._float_from_reg(b)
+        if math.isnan(left) or math.isnan(right):
+            self._flags.update(Z=False, N=False, C=True, O=False)
+        else:
+            self._flags.update(Z=left == right, N=left < right, C=False, O=False)
+
+    def _op_ftoi(self, a: int, b: int, c: int) -> None:
+        fval = self._float_from_reg(b)
+        if math.isnan(fval) or math.isinf(fval):
+            raise _ExecutionFault("Conversión float→int de NaN o infinito")
+        ival = int(fval)
+        if not -(1 << 31) <= ival < (1 << 31):
+            raise _ExecutionFault("Desbordamiento en conversión float→int")
+        self._write_result(a, ival)
+
+    def _op_itof(self, a: int, b: int, c: int) -> None:
+        self._float_to_reg(a, float(self._read_register(b)))
+
+    def _op_fabs(self, a: int, b: int, c: int) -> None:
+        self._float_to_reg(a, abs(self._float_from_reg(b)))
+
+    def _op_fsqrt(self, a: int, b: int, c: int) -> None:
+        fval = self._float_from_reg(b)
+        if fval < 0.0:
+            raise _ExecutionFault("Raíz cuadrada de número negativo")
+        self._float_to_reg(a, math.sqrt(fval))
+
+    # ── Aritmética extendida 64 bits ───────────────────────
+
+    def _op_mulh(self, a: int, b: int, c: int) -> None:
+        full = self._read_register(b) * self._read_register(c)
+        self._write_result(a, signed32((full >> 32) & 0xFFFFFFFF))
+
+    def _op_addx(self, a: int, b: int, c: int) -> None:
+        left, right = self._read_register(b), self._read_register(c)
+        carry_in = 1 if self._flags["C"] else 0
+        raw = left + right + carry_in
+        unsigned = (left & 0xFFFFFFFF) + (right & 0xFFFFFFFF) + carry_in
+        result = signed32(raw)
+        overflow = (left >= 0) == (right >= 0) and (result >= 0) != (left >= 0)
+        self._write_register(a, result)
+        self._set_flags(result, carry=unsigned > 0xFFFFFFFF, overflow=overflow)
+
+    def _op_subx(self, a: int, b: int, c: int) -> None:
+        left, right = self._read_register(b), self._read_register(c)
+        borrow_in = 0 if self._flags["C"] else 1
+        raw = left - right - borrow_in
+        result = signed32(raw)
+        overflow = (left >= 0) != (right >= 0) and (result >= 0) != (left >= 0)
+        borrow_unsigned = (left & 0xFFFFFFFF) >= ((right & 0xFFFFFFFF) + borrow_in)
+        self._write_register(a, result)
+        self._set_flags(result, carry=borrow_unsigned, overflow=overflow)
+
+    # ── Fibras cooperativas ────────────────────────────────
+
+    def _op_spawn(self, a: int, b: int, c: int) -> None:
+        self._spawn_fiber(a)
+
+    def _op_switch(self, a: int, b: int, c: int) -> None:
+        self._switch_fiber(self._read_register(a))
+
+    def _op_fret(self, a: int, b: int, c: int) -> None:
+        self._finish_fiber()
+
 
     def _effective_address(self, base_register: int, offset: int) -> int:
         return self._read_register(base_register) + offset
@@ -791,7 +896,11 @@ class TramoyaVM32:
 
     def _set_flags(self, value: int, *, carry: bool = False, overflow: bool = False) -> None:
         normalized = signed32(value)
-        self._flags.update(Z=normalized == 0, N=normalized < 0, C=carry, O=overflow)
+        flags = self._flags
+        flags["Z"] = normalized == 0
+        flags["N"] = normalized < 0
+        flags["C"] = carry
+        flags["O"] = overflow
 
     def _add(self, destination: int, left: int, right: int) -> None:
         raw = left + right
@@ -821,25 +930,33 @@ class TramoyaVM32:
 
     def _float_from_reg(self, index: int) -> float:
         """Interpreta un registro como float IEEE 754 single-precision."""
-        bits = self._read_register(index) & 0xFFFFFFFF
-        return struct.unpack('f', struct.pack('I', bits))[0]
+        return _F32.unpack(_U32.pack(self._read_register(index) & 0xFFFFFFFF))[0]
 
     def _float_to_reg(self, dest: int, value: float) -> None:
-        """Empaqueta un float en un registro y actualiza banderas flotantes."""
-        bits = struct.unpack('I', struct.pack('f', value))[0]
-        self._write_register(dest, signed32(bits))
+        """Empaqueta un float en un registro y actualiza banderas flotantes.
+
+        Un NaN se guarda siempre como el NaN canónico (0x7FC00000, como en
+        RISC-V): la carga útil que propaga el host depende del orden de los
+        operandos en el código máquina, y CPython lo cambia al especializar la
+        operación, así que conservarla rompería el determinismo.
+        """
+        if value != value:
+            self._write_register(dest, CANONICAL_NAN)
+            self._set_float_flags(value)
+            return
+        packed = _F32.pack(value)
+        self._write_register(dest, signed32(_U32.unpack(packed)[0]))
         # Las banderas describen el float32 realmente almacenado, no el double previo.
-        self._set_float_flags(struct.unpack('f', struct.pack('I', bits))[0])
+        self._set_float_flags(_F32.unpack(packed)[0])
 
     def _set_float_flags(self, value: float) -> None:
         """Z=cero, N=negativo, C=NaN, O=infinito."""
         is_nan = math.isnan(value)
-        self._flags.update(
-            Z=value == 0.0 and not is_nan,
-            N=value < 0.0 and not is_nan,
-            C=is_nan,
-            O=math.isinf(value),
-        )
+        flags = self._flags
+        flags["Z"] = value == 0.0 and not is_nan
+        flags["N"] = value < 0.0 and not is_nan
+        flags["C"] = is_nan
+        flags["O"] = math.isinf(value)
 
     def _push(self, value: int) -> None:
         stack = self._stack
@@ -864,6 +981,9 @@ class TramoyaVM32:
 
     def _jump(self, address: int) -> None:
         self._validate_executable(address)
+        if address < self._pc:
+            candidates = self._loop_candidates
+            candidates[address] = candidates.get(address, 0) + 1
         self._pc = address
 
     def read_memory(self, address: int) -> int:
@@ -895,6 +1015,7 @@ class TramoyaVM32:
         self._memory[address] = signed32(value)
         if self._program is not None and address < self._program.code_size:
             self._decode_cache[address // 4] = None
+            self._loops.clear()
 
     def memory_slice(self, start: int, count: int) -> tuple[int, ...]:
         if start < 0 or count < 0 or start + count > len(self._memory):
@@ -1446,6 +1567,7 @@ class TramoyaVM32:
             last = min(address + count, program.code_size) - 1
             for index in range(address // 4, last // 4 + 1):
                 self._decode_cache[index] = None
+            self._loops.clear()
 
     def step(self) -> str:
         if self.state == "READY":
@@ -1495,6 +1617,11 @@ class TramoyaVM32:
             self.machine.trigger("start")
 
         executed_at_start = self._instructions
+        # El acelerador de bucles solo actúa sin traza, sin breakpoints y sin
+        # interrupciones pendientes: en esos casos cada instrucción debe pasar
+        # por el camino instrumentado.
+        accelerate = self.config.accelerate_loops and not self.config.trace_size and not breakpoint_set
+        candidates = self._loop_candidates
         while self.state == "RUNNING":
             if self._pc in breakpoint_set and self._pc != skip_breakpoint:
                 self.pause(f"Breakpoint en PC={self._pc}")
@@ -1503,6 +1630,20 @@ class TramoyaVM32:
             if max_instructions is not None and self._instructions - executed_at_start >= max_instructions:
                 self.pause(f"Límite local de {max_instructions} instrucciones")
                 break
+            if (
+                accelerate
+                and candidates.get(self._pc, 0) >= LOOP_WARMUP
+                and not (self._interrupts_enabled and self._pending_interrupts)
+            ):
+                loop = self._compiled_loop(self._pc)
+                if loop is not None:
+                    budget = (
+                        max_instructions - (self._instructions - executed_at_start)
+                        if max_instructions is not None
+                        else 1 << 62
+                    )
+                    if self._run_loop(loop, budget):
+                        continue
             # El modo continuo conserva Tramoya para las transiciones de ciclo
             # de vida, pero evita una transición self-loop por instrucción. La
             # traza VM32 sigue registrando cada operación; step() mantiene el
@@ -1514,6 +1655,37 @@ class TramoyaVM32:
             self._apply_pending_event()
         self._sync_lifecycle()
         return self.result()
+
+    def _compiled_loop(self, header: int) -> CompiledLoop | None:
+        try:
+            return self._loops[header]
+        except KeyError:
+            compiled = compile_loop(self, header)
+            self._loops[header] = compiled
+            return compiled
+
+    def _run_loop(self, loop: CompiledLoop, budget: int) -> bool:
+        """Ejecuta iteraciones completas del bucle; False si no avanzó ninguna instrucción."""
+        program = self._program
+        pc, steps, used = loop.run(
+            self, self._registers, self._flags, self._memory, len(self._memory),
+            program.code_size if program is not None else 0, self._gas_remaining, budget,
+        )
+        if not steps:
+            return False
+        self._pc = pc
+        self._instructions += steps
+        self._cycles += used
+        self._gas_remaining -= used
+        self._accelerated_instructions += steps
+        backedge_pc, mnemonic, operands = loop.backedge
+        self._last_instruction = (backedge_pc, mnemonic, operands, "OK")
+        return True
+
+    @property
+    def accelerated_instructions(self) -> int:
+        """Instrucciones ejecutadas por el acelerador de bucles (ya contadas en instructions)."""
+        return self._accelerated_instructions
 
     def pause(self, reason: str = "Pausa solicitada") -> str:
         if self.state == "RUNNING":
@@ -1641,6 +1813,7 @@ class TramoyaVM32:
         memory_chip: NonVolatileMemoryChip | None = None,
         limits: VMConfig | None = None,
         npu: TramoyaNeuralUnit | None = None,
+        accelerate_loops: bool = True,
     ) -> "TramoyaVM32":
         """Crea una VM con la RAM que requiere el snapshot.
 
@@ -1685,6 +1858,7 @@ class TramoyaVM32:
                 output_limit=config_integer("output_limit", defaults.output_limit),
                 fiber_limit=config_integer("fiber_limit", defaults.fiber_limit),
                 protect_code=protect_code,
+                accelerate_loops=accelerate_loops,
                 capabilities=frozenset(capabilities),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -1970,6 +2144,11 @@ class TramoyaVM32:
         self._vl, self._vr, self._vs = restored["tnu"]
         self._pending_event = None
         self._build_decode_cache()
+        # Las cachés del acelerador y la última instrucción describen el programa
+        # anterior: el snapshot trae su propio código y su propio last_instruction.
+        self._loops.clear()
+        self._loop_candidates.clear()
+        self._last_instruction = None
         self._sync_special_registers()
         self._trace.clear()
         self._trace_sequence = 0
@@ -1982,3 +2161,30 @@ class TramoyaVM32:
 
     def load_snapshot(self, path: str | Path) -> None:
         self.restore_bytes(Path(path).read_bytes())
+
+
+_HANDLER_TABLES: dict[type, dict[int, Callable[..., None]]] = {}
+
+
+def _handlers_for(cls: type) -> dict[int, Callable[..., None]]:
+    """Tabla opcode → manejador de ``cls`` (respeta los ``_op_*`` sobrescritos)."""
+    table = _HANDLER_TABLES.get(cls)
+    if table is None:
+        table = _HANDLER_TABLES[cls] = _build_handlers(cls)
+    return table
+
+
+def _build_handlers(cls: type) -> dict[int, Callable[..., None]]:
+    table: dict[int, Callable[..., None]] = {}
+    def tnu_handler(opcode: VMOpcode) -> Callable[..., None]:
+        def handler(vm: TramoyaVM32, a: int, b: int, c: int) -> None:
+            vm._execute_tnu(opcode, a, b, c)
+
+        return handler
+
+    for opcode in VMOpcode:
+        if int(opcode) >= TNU_FIRST_OPCODE:
+            table[opcode] = tnu_handler(opcode)
+        else:
+            table[opcode] = getattr(cls, f"_op_{opcode.name.lower()}")
+    return table

@@ -6,6 +6,15 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
+### 2026-10-01
+
+- **Corrección:** la FPU escalar redondea a ±infinito al desbordar float32 aunque
+  el Python anfitrión lance `OverflowError` al empaquetar el resultado. Así se
+  comporta CPython 3.13.15, mientras que 3.13.2 todavía devolvía infinito. Antes,
+  el intérprete fallaba con una excepción de host y el código compilado del
+  acelerador la dejaba escapar de `run()`. Lo destapó la primera ejecución de la
+  integración continua.
+
 ### 2026-09-30
 
 - **Acelerador de bucles ampliado:** el cuerpo compilado admite saltos hacia

@@ -13,11 +13,15 @@ observa el estado también en cada salida anticipada con una syscall espía.
 
 from __future__ import annotations
 
+import math
 import random
 import struct
 import unittest
 from typing import Callable
+from unittest import mock
 
+from cpu_digital import vm32 as vm32_module
+from cpu_digital import vm32_loops as loops_module
 from cpu_digital.vm32 import CANONICAL_NAN, LOOP_WARMUP, TramoyaVM32, VMConfig, VMRuntimeError
 from cpu_digital.vm32_assembler import VM32Assembler
 from cpu_digital.vm32_isa import VMOpcode
@@ -374,6 +378,85 @@ L:
         self.assertEqual(plain[0], "HALTED")
         self.assertEqual(set(plain[12][201:301]), {CANONICAL_NAN})
         self.assertEqual(plain[5][10:14], (CANONICAL_NAN,) * 4)
+
+
+class StrictFloat32:
+    """Empaqueta float32 como CPython 3.13 reciente: un desbordamiento lanza OverflowError.
+
+    Hasta 3.13.2, ``struct.Struct("f")`` devolvía infinito en ese caso; emularlo permite
+    comprobar los dos comportamientos del host con cualquier versión de Python."""
+
+    _native = struct.Struct("f")
+    unpack = _native.unpack
+
+    def pack(self, value: float) -> bytes:
+        packed = self._native.pack(value)
+        if math.isinf(self._native.unpack(packed)[0]) and not math.isinf(value):
+            raise OverflowError("float too large to pack with f format")
+        return packed
+
+
+class Float32OverflowAnchors(unittest.TestCase):
+    """Un desbordamiento de float32 da ±infinito con O = 1, lance o no el host al empaquetar.
+
+    Hallazgo de la CI con CPython 3.13.15: el intérprete fallaba con una excepción de host
+    y el código compilado la dejaba escapar de ``run()``."""
+
+    POSITIVE, NEGATIVE = 0x7F800000, -8388608  # +inf y -inf como palabras con signo
+    LOOP = """.code
+    MOVI R1, 0x3F800000     ; 1.0
+    MOVI R2, 0x41200000     ; 10.0
+    MOVI R4, 0xBF800000     ; -1.0
+    MOVI R9, 100
+L:
+    FMUL R1, R1, R2         ; 10^k: desborda a +inf en la vuelta 39, ya acelerada
+    FMUL R4, R4, R2         ; -10^k: desborda a -inf
+    FADD R5, R1, R1
+    FSUB R6, R4, R1
+    FDIV R7, R1, R2
+    SUBI R9, R9, 1
+    JNZ L
+    HALT
+"""
+
+    def on_both_hosts(self, check: Callable[[], None]) -> None:
+        for name, packer in (("nativo", struct.Struct("f")), ("estricto", StrictFloat32())):
+            with self.subTest(host=name), mock.patch.object(vm32_module, "_F32", packer), \
+                    mock.patch.object(loops_module, "_F32", packer):
+                check()
+
+    def test_overflow_inside_an_accelerated_loop_rounds_to_infinity(self) -> None:
+        results = []
+
+        def check() -> None:
+            plain, fast, accelerated = run_both(self.LOOP)
+            self.assertEqual(plain, fast)
+            self.assertEqual((plain[0], plain[1]), ("HALTED", None))
+            self.assertEqual((plain[5][1], plain[5][4], plain[5][5], plain[5][6], plain[5][7]),
+                             (self.POSITIVE, self.NEGATIVE, self.POSITIVE, self.NEGATIVE, self.POSITIVE))
+            self.assertGreater(accelerated, 0)
+            results.append(plain)
+
+        self.on_both_hosts(check)
+        self.assertEqual(results[0], results[1])  # el mismo estado con los dos comportamientos del host
+
+    def test_every_scalar_operation_overflows_to_signed_infinity(self) -> None:
+        big, minus_big, tiny = 0x7F7FFFFF, 0xFF7FFFFF - 2**32, 0x00800000  # ±FLT_MAX y el menor normal
+        cases = {
+            f"MOVI R2, {big}\nMOVI R3, {big}\nFADD R1, R2, R3": self.POSITIVE,
+            f"MOVI R2, {minus_big}\nMOVI R3, {big}\nFSUB R1, R2, R3": self.NEGATIVE,
+            f"MOVI R2, {big}\nMOVI R3, 0x41200000\nFMUL R1, R2, R3": self.POSITIVE,
+            f"MOVI R2, {minus_big}\nMOVI R3, {tiny}\nFDIV R1, R2, R3": self.NEGATIVE,
+        }
+
+        def check() -> None:
+            for body, expected in cases.items():
+                plain, fast, _ = run_both(f".code\n{body}\nHALT")
+                self.assertEqual(plain, fast, body)
+                self.assertEqual((plain[0], plain[5][1]), ("HALTED", expected), body)
+                self.assertEqual(plain[6], {"Z": False, "N": expected < 0, "C": False, "O": True}, body)
+
+        self.on_both_hosts(check)
 
 
 class DifferentialFuzz(unittest.TestCase):

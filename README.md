@@ -106,13 +106,14 @@ la syscall 11 consulta su capacidad. La consola web conecta por defecto
 Las escrituras de programas son persistentes y quedan fuera de los snapshots de
 RAM VM32.
 
-Benchmarks reproducibles: velocidad del intérprete y cobertura del acelerador de
+Benchmarks reproducibles: velocidad del intérprete, cobertura del acelerador de
 bucles en código de juego (`vm_programs/juego_raycaster.tasm`, con desglose por
-fase y por bucle):
+fase y por bucle) y coste del acelerador con código automodificable:
 
 ```powershell
 .\.venv\Scripts\python.exe benchmarks\benchmark_vm32.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_cobertura.py --frames 20
+.\.venv\Scripts\python.exe benchmarks\benchmark_automodificable.py
 ```
 
 ## Chip Neuronal Tramoya (TNU)

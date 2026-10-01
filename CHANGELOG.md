@@ -14,6 +14,20 @@ primer commit, así que los cambios se agrupan por fecha.
   el intérprete fallaba con una excepción de host y el código compilado del
   acelerador la dejaba escapar de `run()`. Lo destapó la primera ejecución de la
   integración continua.
+- **Corrección:** con `protect_code=False`, un bucle que escribía en su propio
+  código recompilaba en cada vuelta sin acelerar nada: 34 veces más CPU del host
+  con el mismo gas. Ahora una escritura en código reinicia también el
+  calentamiento de las cabeceras y, desde la primera, cada intento de compilación
+  aplaza el siguiente 1 024 instrucciones ejecutadas, más 256 por instrucción del
+  bucle compilado. Ese caso queda en 1,02× y el peor programa adversario medido,
+  en 1,4×. Los programas que no escriben en su código compilan igual que antes.
+  Los que parchean su código una vez por ronda y tienen varios bucles calientes
+  conservan menos aceleración que antes (0,76× del intérprete frente a 0,27×),
+  porque sus bucles ya no se recompilan todos de inmediato.
+- `benchmarks/benchmark_automodificable.py`: coste del acelerador con código
+  automodificable, con y sin él, contando los intentos de compilación.
+- Pruebas: anclas que cuentan las compilaciones y fuzzing diferencial de 210
+  bucles que parchean su propio código.
 
 ### 2026-09-30
 

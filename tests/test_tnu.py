@@ -13,11 +13,13 @@ from pathlib import Path
 from unittest import mock
 
 from cpu_digital import tnu
+from cpu_digital import vm32 as vm32_module
 from cpu_digital.memory import PAGE_WORDS, PagedMemory
 from cpu_digital.tnu import ROM_BASE, TensorROM, TramoyaNeuralUnit
-from cpu_digital.vm32 import SNAPSHOT_MAGIC, TramoyaVM32, VMConfig
+from cpu_digital.vm32 import LOOP_WARMUP, SNAPSHOT_MAGIC, TramoyaVM32, VMConfig
 from cpu_digital.vm32_assembler import VM32Assembler
 from cpu_digital.vm32_isa import VM32_ISA, VMOpcode
+from cpu_digital.vm32_loops import compile_loop
 
 if not hasattr(math, "sumprod"):  # el resto de VM32 soporta 3.10; el TNU exige 3.12
     raise unittest.SkipTest("El TNU requiere Python 3.12 o superior (math.sumprod)")
@@ -185,6 +187,68 @@ class AtomicityAnchors(unittest.TestCase):
         result = vm.run()
         self.assertEqual(result.state, "HALTED")
         self.assertEqual(result.output, ())
+
+    def test_unprotected_code_write_invalidates_compiled_loops(self) -> None:
+        # VCOPY cambia el inmediato de un bucle ya compilado: la segunda tanda suma 7, no 1.
+        source = vector_program(
+            f"    MOVI R1, {BUF}\n    LEA R2, L\n    ADDI R2, R2, 3\n    MOVI R8, 2\n"
+            "OUT:\n    MOVI R9, 100\nL:\n    ADDI R5, R5, 1\n    SUBI R9, R9, 1\n    JNZ L\n"
+            "    VCOPY R2, R1\n    SUBI R8, R8, 1\n    JNZ OUT",
+            1,
+        )
+        states = []
+        for accelerate in (False, True):
+            vm = make_vm(source, protect_code=False, accelerate_loops=accelerate)
+            vm.write_memory(BUF, 7)
+            result = vm.run()
+            self.assertEqual((result.state, vm.registers[5]), ("HALTED", 100 + 700))
+            states.append(state(vm))
+        self.assertEqual(states[0], states[1])
+        self.assertEqual(vm.accelerated_instructions, 2 * (100 - LOOP_WARMUP) * 3)
+
+    def test_unprotected_code_write_restarts_the_loop_warmup(self) -> None:
+        # Como con STORE: VCOPY reescribe un NOP del cuerpo en cada vuelta, así que la cabecera
+        # nunca junta el calentamiento. Antes se intentaba compilar el bucle en cada vuelta.
+        source = vector_program(
+            f"    MOVI R1, {BUF}\n    LEA R2, OBJ\n    MOVI R9, 200\n"
+            "L:\n    VCOPY R2, R1\n    ADDI R5, R5, 1\nOBJ:\n    NOP\n    SUBI R9, R9, 1\n    JNZ L",
+            1,
+        )
+        states = []
+        for accelerate in (False, True):
+            vm = make_vm(source, protect_code=False, accelerate_loops=accelerate)
+            with mock.patch("cpu_digital.vm32.compile_loop", wraps=compile_loop) as attempts:
+                result = vm.run()
+            self.assertEqual((result.state, vm.registers[5]), ("HALTED", 200))
+            self.assertEqual(attempts.call_count, 0)
+            states.append(state(vm))
+        self.assertEqual(states[0], states[1])
+
+    def test_unprotected_code_write_makes_later_compilations_wait(self) -> None:
+        # Como con STORE: tras una escritura del TNU en código, cada compilación aplaza la
+        # siguiente. Con 40 rondas de 40 vueltas el bucle se compila 4 veces, no una por ronda.
+        source = vector_program(
+            f"    MOVI R1, {BUF}\n    LEA R2, L\n    ADDI R2, R2, 3\n    MOVI R8, 40\n"
+            "OUT:\n    MOVI R9, 40\nL:\n    ADDI R5, R5, 1\n    SUBI R9, R9, 1\n    JNZ L\n"
+            "    VCOPY R2, R1\n    SUBI R8, R8, 1\n    JNZ OUT",
+            1,
+        )
+        attempts: list[int] = []
+
+        def noting(machine: TramoyaVM32, header: int):
+            attempts.append(machine.result().instructions)
+            return compile_loop(machine, header)
+
+        vm = make_vm(source, protect_code=False)
+        vm.write_memory(BUF, 7)
+        with mock.patch("cpu_digital.vm32.compile_loop", noting):
+            result = vm.run()
+        self.assertEqual((result.state, vm.registers[5]), ("HALTED", 40 + 39 * 40 * 7))
+        self.assertEqual(len(attempts), 4)
+        # La primera compilación es anterior a la escritura y no aplaza nada; el bucle tiene 3 instrucciones.
+        wait = vm32_module.LOOP_COOLDOWN + 3 * vm32_module.LOOP_COOLDOWN_PER_INSTRUCTION
+        for at, following in zip(attempts[1:], attempts[2:]):
+            self.assertGreaterEqual(following - at, wait)
 
 
 class GasAnchors(unittest.TestCase):

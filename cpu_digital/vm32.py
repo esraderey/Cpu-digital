@@ -31,6 +31,13 @@ MAX_SNAPSHOT_RAW_BYTES = 256 * 1024 * 1024
 MAX_MEMORY_CHIP_TRANSFER_BYTES = 4_096
 MAX_ROPE_HEAD_SIZE = 256
 LOOP_WARMUP = 32  # saltos hacia atrás a una cabecera antes de compilar su bucle (~0,4 ms)
+# Si el programa escribe en su código, lo compilado puede perderse en la siguiente escritura.
+# Desde la primera, cada intento de compilación aplaza el siguiente LOOP_COOLDOWN instrucciones
+# ejecutadas, más LOOP_COOLDOWN_PER_INSTRUCTION por instrucción del bucle compilado. Compilar
+# cuesta de 0,3 a 8 ms: así queda por debajo de la mitad de lo que tarda el intérprete en
+# ejecutar las instrucciones que lo pagan (benchmarks/benchmark_automodificable.py).
+LOOP_COOLDOWN = 1024
+LOOP_COOLDOWN_PER_INSTRUCTION = 256
 _F32 = struct.Struct("f")
 CANONICAL_NAN = 0x7FC00000
 _U32 = struct.Struct("I")
@@ -277,6 +284,10 @@ class TramoyaVM32:
         # el snapshot ni en el checkpoint.
         self._loop_candidates: dict[int, int] = {}
         self._loops: dict[int, CompiledLoop | None] = {}
+        # Si el programa ha escrito en su código y, en ese caso, cuántas instrucciones
+        # ejecutadas debe llevar la VM para intentar otra compilación.
+        self._code_written = False
+        self._loop_cooldown_until = 0
         self._accelerated_instructions = 0
         self._sync_special_registers()
 
@@ -1021,7 +1032,15 @@ class TramoyaVM32:
         self._memory[address] = signed32(value)
         if self._program is not None and address < self._program.code_size:
             self._decode_cache[address // 4] = None
-            self._loops.clear()
+            self._discard_loops()
+
+    def _discard_loops(self) -> None:
+        """Una escritura en código deja sin valor los bucles compilados y su calentamiento."""
+        self._loops.clear()
+        # Los saltos contados eran del código anterior: cada cabecera vuelve a necesitar
+        # LOOP_WARMUP. Si no, un bucle que escribe en su propio código compila en cada vuelta.
+        self._loop_candidates.clear()
+        self._code_written = True
 
     def memory_slice(self, start: int, count: int) -> tuple[int, ...]:
         if start < 0 or count < 0 or start + count > len(self._memory):
@@ -1573,7 +1592,7 @@ class TramoyaVM32:
             last = min(address + count, program.code_size) - 1
             for index in range(address // 4, last // 4 + 1):
                 self._decode_cache[index] = None
-            self._loops.clear()
+            self._discard_loops()
 
     def step(self) -> str:
         if self.state == "READY":
@@ -1670,8 +1689,16 @@ class TramoyaVM32:
         try:
             return self._loops[header]
         except KeyError:
+            if self._instructions < self._loop_cooldown_until:
+                return None  # el intento anterior aún no está pagado: sigue el intérprete
             compiled = compile_loop(self, header)
             self._loops[header] = compiled
+            if self._code_written:
+                # Un intento fallido también cuesta (hasta ~0,5 ms): paga la espera base.
+                length = compiled.length if compiled is not None else 0
+                self._loop_cooldown_until = (
+                    self._instructions + LOOP_COOLDOWN + LOOP_COOLDOWN_PER_INSTRUCTION * length
+                )
             return compiled
 
     def _run_loop(self, loop: CompiledLoop, budget: int) -> bool:
@@ -2161,6 +2188,8 @@ class TramoyaVM32:
         # anterior: el snapshot trae su propio código y su propio last_instruction.
         self._loops.clear()
         self._loop_candidates.clear()
+        self._code_written = False
+        self._loop_cooldown_until = 0
         self._last_instruction = None
         self._sync_special_registers()
         self._trace.clear()

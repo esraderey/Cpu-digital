@@ -8,7 +8,9 @@ fuera de rango, gas escaso y contadores que el propio cuerpo modifica; el fuzzin
 ampliado añade saltos hacia delante (dentro y fuera del cuerpo), saltos hacia
 atrás que el acelerador debe rechazar, DIV/MOD con divisores cero e
 ``INT32_MIN / -1``, PUSH/POP con pilas pequeñas y lecturas de R0 y R15, y
-observa el estado también en cada salida anticipada con una syscall espía.
+observa el estado también en cada salida anticipada con una syscall espía. El
+fuzzing de código automodificable parchea instrucciones del propio bucle y lo
+ejecuta además con una política que compila mucho más a menudo que la real.
 """
 
 from __future__ import annotations
@@ -74,6 +76,26 @@ def run_both(source: str, *, gas_limit: int = 50_000, inputs=(), max_instruction
         states.append((*observe(vm), tuple(log)))
         accelerated = vm.accelerated_instructions
     return states[0], states[1], accelerated
+
+
+def counting_compilations(attempts: list):
+    """Sustituye ``compile_loop`` por uno que anota cada intento: instrucciones ejecutadas hasta
+    entonces, cabecera y resultado (None si el bucle no se pudo compilar)."""
+    real = vm32_module.compile_loop
+
+    def compile_and_note(vm: TramoyaVM32, header: int):
+        loop = real(vm, header)
+        attempts.append((vm.result().instructions, header, loop))
+        return loop
+
+    return mock.patch.object(vm32_module, "compile_loop", compile_and_note)
+
+
+def run_counting(source: str, **options) -> tuple[tuple, tuple, int, list]:
+    attempts: list = []
+    with counting_compilations(attempts):
+        plain, fast, accelerated = run_both(source, **options)
+    return plain, fast, accelerated, attempts
 
 
 MAC_LOOP = """.code
@@ -353,6 +375,155 @@ class OverrideAnchors(unittest.TestCase):
         plain, fast, accelerated = self.both(TramoyaVM32, patch)
         self.assertEqual(plain, fast)
         self.assertEqual((fast[5][1], accelerated), (600, 0))
+
+
+class SelfModifyingCodeAnchors(unittest.TestCase):
+    """Con ``protect_code=False`` un programa puede escribir en su código; compilar sigue acotado.
+
+    Hallazgo de la revisión G4 de las extensiones: cada escritura en código vaciaba los bucles
+    compilados pero no su calentamiento, y un bucle que escribía en su propio cuerpo recompilaba
+    en cada vuelta: más de treinta veces la CPU del host con el mismo gas. Estas anclas cuentan
+    los intentos de compilación (``compile_loop``), no el tiempo."""
+
+    WRITES_ITSELF = """.code
+    MOVI R9, 3000
+    LEA R4, OBJ
+L:
+    STORE R0, [R4+2]        ; escribe en su propio cuerpo en cada vuelta, sin cambiar nada
+    ADDI R1, R1, 1
+OBJ:
+    NOP
+    SUBI R9, R9, 1
+    JNZ L
+    HALT
+"""
+    PATCHED = """.code
+    MOVI R8, 6
+    LEA R4, L
+OUT:
+    MOVI R9, 700
+L:
+    ADDI R1, R1, 1          ; el inmediato cambia en cada ronda: 1, 6, 5, 4, 3, 2
+    SUBI R9, R9, 1
+    JNZ L
+    STORE R8, [R4+3]
+    SUBI R8, R8, 1
+    JNZ OUT
+    HALT
+"""
+    TWO_LOOPS = """.code
+    MOVI R9, 40
+A:
+    ADDI R1, R1, 1
+    SUBI R9, R9, 1
+    JNZ A
+    MOVI R9, {second}
+B:
+    ADDI R2, R2, 2
+    SUBI R9, R9, 1
+    JNZ B
+    HALT
+"""
+    B_STARTS = 122  # instrucciones ejecutadas cuando B da su primera vuelta: MOVI, 40 vueltas de A y MOVI
+
+    @staticmethod
+    def adversary(headers: int, rounds: int, last: str = "FDIV R1, R2, R3") -> str:
+        """Escribe en su código cada 33 vueltas de unas cabeceras caras de compilar.
+
+        Cada cabecera sale del cuerpo nada más entrar (tres instrucciones por vuelta) y deja
+        detrás 63 instrucciones que nunca se ejecutan pero sí se compilan, y eso cuesta varios
+        milisegundos."""
+        lines = [".code", f"    MOVI R8, {rounds}", "    LEA R4, OBJ",
+                 "    STORE R0, [R4+2]        ; ya ha escrito en su código antes de compilar nada",
+                 "    MOVI R9, 33"]
+        for index in range(1, headers + 1):
+            lines += [f"H{index}:", f"    JMP T{index}", *["    FDIV R1, R2, R3"] * 62, f"    {last}",
+                      f"    JNZ H{index}", f"T{index}:", "    SUBI R9, R9, 1", f"    JNZ H{index}", "    MOVI R9, 33"]
+        lines += ["    STORE R0, [R4+2]", "OBJ:", "    NOP", "    SUBI R8, R8, 1", "    JNZ H1", "    HALT"]
+        return "\n".join(lines)
+
+    def test_loop_that_writes_its_own_code_on_every_iteration_never_compiles(self) -> None:
+        plain, fast, accelerated, attempts = run_counting(self.WRITES_ITSELF, protect_code=False)
+        self.assertEqual(plain, fast)
+        self.assertEqual((plain[0], plain[5][1]), ("HALTED", 3000))
+        # Cada escritura reinicia el calentamiento: la cabecera nunca junta 32 saltos. Antes
+        # compilaba 2 968 veces, una por vuelta, sin acelerar ninguna instrucción.
+        self.assertEqual((len(attempts), accelerated), (0, 0))
+
+    def test_patched_loop_warms_up_again_and_runs_the_new_code(self) -> None:
+        plain, fast, accelerated, attempts = run_counting(self.PATCHED, protect_code=False)
+        self.assertEqual(plain, fast)
+        self.assertEqual((plain[0], plain[5][1]), ("HALTED", 700 * (1 + 6 + 5 + 4 + 3 + 2)))
+        # Una compilación por ronda, y cada una tras 32 vueltas del código recién escrito: las
+        # rondas son largas y la compilación anterior ya está pagada cuando acaba el calentamiento.
+        self.assertEqual([loop is not None for _, _, loop in attempts], [True] * 6)
+        self.assertEqual(accelerated, 6 * (700 - LOOP_WARMUP) * 3)
+
+    def test_after_a_code_write_every_compilation_is_paid_with_executed_instructions(self) -> None:
+        base, step = vm32_module.LOOP_COOLDOWN, vm32_module.LOOP_COOLDOWN_PER_INSTRUCTION
+        cases = {
+            # nombre: (programa, intentos de compilación, ¿compilan?, cabeceras); antes, uno por ronda.
+            "cuerpo caro": (self.adversary(1, rounds=400), 3, True, 1),
+            "intento fallido": (self.adversary(1, rounds=400, last="SYSCALL 1"), 40, False, 1),
+            "tres cabeceras": (self.adversary(3, rounds=130), 3, True, 3),
+        }
+        for name, (source, expected, compiles, headers) in cases.items():
+            with self.subTest(case=name):
+                plain, fast, _, attempts = run_counting(source, protect_code=False)
+                self.assertEqual(plain, fast)
+                self.assertEqual(plain[0], "HALTED")
+                self.assertEqual([loop is not None for _, _, loop in attempts], [compiles] * expected)
+                self.assertEqual(len({header for _, header, _ in attempts}), headers)
+                # Entre un intento y el siguiente median las instrucciones que pagan el primero,
+                # sea cual sea la cabecera: la espera es de la VM, no de cada bucle.
+                for (at, _, loop), (following, _, _) in zip(attempts, attempts[1:]):
+                    self.assertGreaterEqual(following - at, base + step * (loop.length if loop else 0))
+
+    def test_program_that_never_writes_code_compiles_as_before(self) -> None:
+        # Sin escrituras en código no hay espera: cada bucle compila a sus 32 saltos.
+        source = self.TWO_LOOPS.format(second=40)
+        for protect in (True, False):
+            with self.subTest(protect_code=protect):
+                plain, fast, accelerated, attempts = run_counting(source, protect_code=protect)
+                self.assertEqual(plain, fast)
+                self.assertEqual([at for at, _, _ in attempts],
+                                 [1 + 3 * LOOP_WARMUP, self.B_STARTS + 3 * LOOP_WARMUP])
+                self.assertEqual(accelerated, 2 * (40 - LOOP_WARMUP) * 3)
+
+    def test_host_patch_before_running_counts_as_a_code_write(self) -> None:
+        # El host reescribe una palabra de código con su mismo valor. La primera compilación no
+        # espera; la segunda se aplaza hasta que la primera está pagada, y entonces se hace.
+        first = 1 + 3 * LOOP_WARMUP
+        paid = first + vm32_module.LOOP_COOLDOWN + 3 * vm32_module.LOOP_COOLDOWN_PER_INSTRUCTION
+        waited = -(-(paid - self.B_STARTS) // 3)  # vueltas que B da en el intérprete hasta que acaba la espera
+        for second, compiled in ((40, False), (waited + 100, True)):  # con 40 vueltas B termina antes
+            with self.subTest(second=second):
+                plain, fast, accelerated, attempts = run_counting(
+                    self.TWO_LOOPS.format(second=second), protect_code=False, seed_memory={2: 40})
+                self.assertEqual(plain, fast)
+                self.assertEqual([at for at, _, _ in attempts],
+                                 [first, self.B_STARTS + 3 * waited] if compiled else [first])
+                self.assertEqual(accelerated, (40 - LOOP_WARMUP) * 3 + (100 * 3 if compiled else 0))
+
+    def test_load_and_restore_forget_the_code_writes_of_the_previous_program(self) -> None:
+        two_loops = program(self.TWO_LOOPS.format(second=40))
+        for how in ("load_program", "restore_bytes"):
+            with self.subTest(how=how):
+                vm = TramoyaVM32(VMConfig(memory_words=MEMORY, trace_size=0, protect_code=False))
+                vm.load_program(program(self.PATCHED))
+                vm.run()  # deja código escrito y una espera fijada miles de instrucciones más allá
+                self.assertEqual(vm.result().state, "HALTED")
+                before = vm.accelerated_instructions
+                if how == "load_program":
+                    vm.load_program(two_loops)
+                    before = 0
+                else:
+                    fresh = TramoyaVM32(vm.config)
+                    fresh.load_program(two_loops)
+                    vm.restore_bytes(fresh.snapshot_bytes())
+                vm.run()
+                self.assertEqual((vm.registers[1], vm.registers[2]), (40, 80))
+                self.assertEqual(vm.accelerated_instructions - before, 2 * (40 - LOOP_WARMUP) * 3)
 
 
 class NanDeterminismAnchor(unittest.TestCase):
@@ -926,6 +1097,128 @@ class ExtendedDifferentialFuzz(unittest.TestCase):
         # El fuzz debe ejercitar de verdad cada extensión en bucles acelerados.
         for feature, count in exercised.items():
             self.assertGreaterEqual(count, 30, (feature, exercised))
+
+
+class SelfModifyingFuzz(unittest.TestCase):
+    """Fuzzing diferencial de bucles que escriben en su código (``protect_code=False``).
+
+    Cada programa repite un bucle interno y parchea una instrucción —un inmediato, el opcode
+    por otro de la misma forma, un registro, un operando inerte o basura— en cada vuelta, en
+    una vuelta concreta o entre rondas. Se ejecuta con la política real y con otra que compila
+    en cuanto puede (calentamiento mínimo y sin espera), que es la que más código compilado
+    ejecuta alrededor de cada escritura: el estado debe ser el del intérprete compile cuando
+    compile."""
+
+    DATA = 2000  # base de los datos, lejos del código
+    BODY = ["ADDI", "SUBI", "MULI", "ADD", "SUB", "XOR", "AND", "OR", "MOV", "CMPI", "LOAD", "STORE", "NOP"]
+    SAME_FORM = [VMOpcode.ADDI, VMOpcode.SUBI, VMOpcode.MULI]
+    GARBAGE = [0, 15, 16, 42, 54, 99, 200, -1]  # opcodes de otra forma, HALT, registros inválidos
+
+    def random_program(self, rng: random.Random, iterations: int) -> str:
+        def dest() -> str:
+            return f"R{rng.randint(1, 7)}"
+
+        def src() -> str:
+            return f"R{rng.randint(0, 7)}"
+
+        def imm() -> int:
+            return rng.choice([0, 1, -1, 3, 7, -5, 100, 2**31 - 1, rng.randint(-50, 50)])
+
+        def instruction() -> str:
+            op = rng.choice(self.BODY)
+            if op in {"ADDI", "SUBI", "MULI"}:
+                return f"{op} {dest()}, {src()}, {imm()}"
+            if op == "MOV":
+                return f"MOV {dest()}, {src()}"
+            if op == "CMPI":
+                return f"CMPI {src()}, {imm()}"
+            if op in {"LOAD", "STORE"}:
+                return f"{op} {dest() if op == 'LOAD' else src()}, [R10+{rng.randint(0, 3)}]"
+            if op == "NOP":
+                return "NOP"
+            return f"{op} {dest()}, {src()}, {src()}"
+
+        # Instrucción parcheada (P), palabra que se escribe, primer valor de R13 y cómo cambia.
+        target, toggle, update = f"ADDI {dest()}, {src()}, {rng.randint(1, 5)}", 0, "SUB R13, R14, R13"
+        kind = rng.choice(["inmediato", "inmediato", "opcode", "registro", "inerte", "basura"])
+        if kind == "inmediato":
+            word, first, update = 3, imm(), f"ADDI R13, R13, {rng.randint(1, 9)}"
+        elif kind == "opcode":
+            one, other = rng.sample(self.SAME_FORM, 2)
+            word, first, toggle = 0, int(one), int(one) + int(other)
+        elif kind == "registro":
+            one, other = rng.sample(range(1, 8), 2)
+            word, first, toggle = rng.choice([1, 2]), one, one + other
+        elif kind == "inerte":
+            target, word, first, update = "NOP", rng.randint(1, 3), imm(), f"ADDI R13, R13, {rng.randint(1, 9)}"
+        else:
+            word, first, update = rng.randint(0, 3), rng.choice(self.GARBAGE), "NOP"
+        write = [f"    {update}", f"    STORE R13, [R12+{word}]"]
+
+        body = [f"    {instruction()}" for _ in range(rng.randint(1, 6))]
+        inside = rng.random() < 0.7  # P está en el cuerpo del bucle o justo después de él
+        if inside:
+            body.insert(rng.randint(0, len(body)), f"P:\n    {target}")
+        where = rng.choice(["cada_vuelta", "una_vuelta", "una_vuelta", "entre_rondas", "entre_rondas"])
+        at = rng.randint(0, len(body))
+        if where == "cada_vuelta":
+            body[at:at] = write
+        elif where == "una_vuelta":
+            body[at:at] = [f"    CMPI R9, {rng.randint(1, iterations)}", "    JNZ SIGUE", *write, "SIGUE:"]
+
+        lines = [".code", *(f"    MOVI R{index}, {rng.choice([0, 1, 2, 5, 9, -3, 100, imm()])}" for index in range(1, 8)),
+                 f"    MOVI R8, {rng.randint(2, 6)}", f"    MOVI R10, {self.DATA}", "    LEA R12, P",
+                 f"    MOVI R13, {first}", f"    MOVI R14, {toggle}",
+                 "OUT:", f"    MOVI R9, {iterations}", "L:", *body, "    SUBI R9, R9, 1", "    JNZ L"]
+        if not inside:
+            lines += ["P:", f"    {target}"]
+        if where == "entre_rondas":
+            lines += write
+        lines += ["    SUBI R8, R8, 1", "    JNZ OUT", f"    SYSCALL {SPY}", "    MOV R1, R2", "    SYSCALL 1", "    HALT"]
+        return "\n".join(lines)
+
+    @staticmethod
+    def eager(warmup: int):
+        """Política que compila tras ``warmup`` saltos hacia atrás y nunca espera."""
+        return mock.patch.multiple(vm32_module, LOOP_WARMUP=warmup, LOOP_COOLDOWN=0, LOOP_COOLDOWN_PER_INSTRUCTION=0)
+
+    @staticmethod
+    def recompiled(attempts: list) -> bool:
+        """Alguna cabecera se compiló con éxito más de una vez: antes y después de una escritura."""
+        headers = [header for _, header, loop in attempts if loop is not None]
+        return len(headers) > len(set(headers))
+
+    def test_self_modifying_loops_match_the_interpreter(self) -> None:
+        rng = random.Random(2028)
+        recompiled = {"real": 0, "ansiosa": 0}
+        for case in range(150):
+            iterations = rng.choice([rng.randint(3, 31), rng.randint(33, 70), rng.randint(70, 200)])
+            source = self.random_program(rng, iterations)
+            limits = {"gas_limit": rng.choice([4_000, 30_000]), "max_instructions": rng.choice([None, None, None, 500])}
+            with self.subTest(case=case, source=source):
+                plain, fast, _, attempts = run_counting(source, protect_code=False, **limits)
+                self.assertEqual(plain, fast)
+                recompiled["real"] += self.recompiled(attempts)
+                with self.eager(2):
+                    _, eager, _, attempts = run_counting(source, protect_code=False, **limits)
+                self.assertEqual(plain, eager)
+                recompiled["ansiosa"] += self.recompiled(attempts)
+        # El fuzz debe recompilar de verdad bucles parcheados, también con la política real.
+        self.assertGreaterEqual(recompiled["real"], 30, recompiled)
+        self.assertGreaterEqual(recompiled["ansiosa"], 60, recompiled)
+
+    def test_recompiling_on_every_iteration_matches_the_interpreter(self) -> None:
+        # Con calentamiento de un salto y sin espera, un bucle que escribe en código en cada
+        # vuelta se compila en cada vuelta, como antes del arreglo: lento, pero el mismo estado.
+        rng = random.Random(2029)
+        compilations = 0
+        for case in range(60):
+            source = self.random_program(rng, rng.randint(2, 12))
+            with self.subTest(case=case, source=source), self.eager(1):
+                plain, fast, _, attempts = run_counting(source, gas_limit=30_000, protect_code=False)
+                self.assertEqual(plain, fast)
+                compilations += sum(loop is not None for _, _, loop in attempts)
+        self.assertGreaterEqual(compilations, 400)
 
 
 if __name__ == "__main__":

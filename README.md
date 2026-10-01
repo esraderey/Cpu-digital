@@ -1,10 +1,27 @@
 # CPU Digital con Tramoya
 
-Simulador educativo de una CPU acumuladora de **16 bits**, construido sobre
-[Tramoya 1.5.3](https://pypi.org/project/tramoya/). Ejecuta programas escritos en
-un pequeño lenguaje ensamblador y permite observar cada microestado del procesador.
+[![CI](https://github.com/esraderey/Cpu-digital/actions/workflows/ci.yml/badge.svg)](https://github.com/esraderey/Cpu-digital/actions/workflows/ci.yml)
+[![Licencia: MIT](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
-El repositorio ahora contiene dos arquitecturas:
+Máquinas virtuales deterministas escritas en Python puro sobre
+[Tramoya 1.5.3](https://pypi.org/project/tramoya/), una biblioteca de máquinas de
+estados: una CPU educativa de 16 bits para observar cada microestado del
+procesador y un runtime RISC de 32 bits embebible, con gas, capacidades del host y
+snapshots. Ambas ejecutan programas escritos en su propio lenguaje ensamblador.
+
+> **English summary.** CPU Digital is a pure-Python playground of deterministic
+> virtual machines built on the [Tramoya](https://pypi.org/project/tramoya/)
+> state-machine library. **Tramoya VM32** is an embeddable 32-bit RISC runtime
+> with gas metering, host capabilities, per-instruction rollback, paged memory,
+> snapshots, an IEEE 754 FPU, cooperative fibers, a loop accelerator that keeps
+> the interpreter's exact state (3.2× faster on a reference raycaster game) and
+> the Tramoya Neural Unit, a vector coprocessor that lets a `.tasm` program run
+> llama2.c models. It ships with a local web console. **CPU Digital 16** is a
+> small accumulator CPU for cycle-by-cycle inspection. The documentation is in
+> Spanish: start with [VM32.md](VM32.md). Released under the MIT license.
+
+El repositorio contiene dos arquitecturas:
 
 - **Tramoya VM32:** runtime RISC de 32 bits para scripts seguros, automatización,
   videojuegos, reglas de negocio y extensiones embebidas. Incluye FPU IEEE 754,
@@ -159,11 +176,20 @@ Una instrucción ordinaria consume tres ciclos: uno por cada etapa. `HALT` y
 
 ## Instalación
 
-Requiere Python 3.10 o posterior.
+Requiere Python 3.10 o posterior; el chip TNU necesita Python 3.12 o posterior.
 
 ```powershell
+git clone https://github.com/esraderey/Cpu-digital.git
+cd Cpu-digital
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
+```
+
+En Linux o macOS:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
 ```
 
 También se puede instalar únicamente la dependencia:
@@ -291,11 +317,17 @@ control es una `Machine` real creada con `MachineBuilder`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pip install ruff==0.8.6
+.\.venv\Scripts\python.exe -m ruff check cpu_digital tests benchmarks tramoya_vm.py
 ```
 
-Las pruebas cubren compatibilidad con el programa original, ensamblado,
-aritmética, ciclos, subrutinas, E/S, overflow, fallos, timeout, pausa/reanudación,
-undo, snapshots y diagramas.
+En la CPU de 16 bits, las pruebas cubren compatibilidad con el programa original,
+ensamblado, aritmética, ciclos, subrutinas, E/S, overflow, fallos, timeout,
+pausa/reanudación, undo, snapshots y diagramas. En VM32 cubren la ISA, la FPU, las
+fibras, las interrupciones, los snapshots, la consola, las anclas de auditoría, el
+chip TNU con llama2 y el fuzzing diferencial del acelerador de bucles frente al
+intérprete. La integración continua (`.github/workflows/ci.yml`) ejecuta el lint y
+las pruebas en cada push y pull request.
 
 ## Estructura
 
@@ -313,12 +345,37 @@ cpu_digital/
   tnu_models.py           ROM de llama2.c, BPE y referencia de host
   vm32_assembler.py       ensamblador/desensamblador (VM32)
   memory.py               memoria paginada de palabras int32
+  memory_chip.py          chip de memoria no volátil (SQLite)
   ui_server.py            consola web de instrumentación
 programs/                 ejemplos .asm (CPU 16)
 vm_programs/              ejemplos .tasm (VM32)
+chips/                    chip persistente que usa por defecto la consola
 tests/                    pruebas automáticas
 benchmarks/               benchmarks de rendimiento
+.github/                  integración continua y plantillas de issues y PR
 ```
 
 Es un simulador educativo: modela flujo de control, registros y memoria, no
 tiempos eléctricos, cachés, pipelines ni concurrencia de un procesador físico.
+
+## Documentación
+
+- [VM32.md](VM32.md): referencia de Tramoya VM32 (ensamblador, ISA, syscalls, FPU,
+  fibras, chip TNU, acelerador de bucles, memoria, seguridad y límites).
+- [RFC-EXP-00015.md](RFC-EXP-00015.md): especificación técnica de VM32.
+- [RFC-EXP-00016.md](RFC-EXP-00016.md): pantalla determinista, aceleración por
+  bloques y chip neuronal, con sus mediciones y decisiones.
+- [PLAN_VM32_RAM_EXTRA_100_MB.md](PLAN_VM32_RAM_EXTRA_100_MB.md): propuesta para
+  ampliar la RAM de VM32.
+- [CHANGELOG.md](CHANGELOG.md): historial de cambios.
+
+## Contribuir
+
+Las contribuciones son bienvenidas. Antes de abrir un pull request, lee
+[CONTRIBUTING.md](CONTRIBUTING.md) y el [código de conducta](CODE_OF_CONDUCT.md).
+Si encuentras una vulnerabilidad, no abras un issue público: sigue
+[SECURITY.md](SECURITY.md).
+
+## Licencia
+
+Distribuido bajo la licencia MIT. Consulta [LICENSE](LICENSE).

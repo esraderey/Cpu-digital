@@ -944,7 +944,13 @@ class TramoyaVM32:
             self._write_register(dest, CANONICAL_NAN)
             self._set_float_flags(value)
             return
-        packed = _F32.pack(value)
+        try:
+            packed = _F32.pack(value)
+        except OverflowError:
+            # Al desbordar float32, CPython 3.13 reciente lanza y los anteriores devuelven
+            # infinito. IEEE 754 redondea a infinito con el signo del valor: se fija aquí
+            # para que el resultado no dependa de la versión del host.
+            packed = _F32.pack(math.copysign(math.inf, value))
         self._write_register(dest, signed32(_U32.unpack(packed)[0]))
         # Las banderas describen el float32 realmente almacenado, no el double previo.
         self._set_float_flags(_F32.unpack(packed)[0])

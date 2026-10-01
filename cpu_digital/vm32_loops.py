@@ -258,7 +258,12 @@ class _Emitter:
             e(f"    {target} = {CANONICAL_NAN}")
         e("    Z = False; N = False; C = True; O = False")
         e("else:")
-        e("    packed = fpk(value); stored = fun(packed)[0]")
+        # Como _float_to_reg: si el host lanza al desbordar float32, se redondea a infinito.
+        e("    try:")
+        e("        packed = fpk(value)")
+        e("    except OverflowError:")
+        e("        packed = fpk(inf if value > 0.0 else -inf)")
+        e("    stored = fun(packed)[0]")
         if target is not None:
             e(f"    {target} = s32(uun(packed)[0])")
         e("    Z = stored == 0.0; N = stored < 0.0; C = False; O = stored in (inf, -inf)")

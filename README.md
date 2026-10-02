@@ -108,11 +108,13 @@ RAM VM32.
 
 Benchmarks reproducibles: velocidad del intérprete, cobertura del acelerador de
 bucles en código de juego (`vm_programs/juego_raycaster.tasm`, con desglose por
-fase y por bucle) y coste del acelerador con código automodificable:
+fase y por bucle) y coste de compilar del acelerador, sin y con código
+automodificable:
 
 ```powershell
 .\.venv\Scripts\python.exe benchmarks\benchmark_vm32.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_cobertura.py --frames 20
+.\.venv\Scripts\python.exe benchmarks\benchmark_compilacion.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_automodificable.py
 ```
 

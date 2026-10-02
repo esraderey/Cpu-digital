@@ -18,8 +18,12 @@ para que el trabajo de compilar se pierda:
 Las otras dos son el uso legítimo, un parche por ronda:
 
 * ``parche por ronda``: 2 000 vueltas del bucle parcheado;
-* ``parche, 8 bucles``: ocho bucles de 400 vueltas en cada ronda. Sus compilaciones se
-  hacen de una en una, y mientras una espera, su bucle se ejecuta en el intérprete.
+* ``parche, 8 bucles``: ocho bucles de 400 vueltas en cada ronda. Lo que cada uno
+  ejecuta compilado paga su compilación antes de que el siguiente se caliente, así que
+  los ocho vuelven a compilar en cada ronda sin esperar.
+
+El coste de compilar en programas que no escriben en su código lo mide
+``benchmarks/benchmark_compilacion.py``.
 
 Uso (desde la raíz del repositorio):
     python benchmarks/benchmark_automodificable.py [--rondas 5] [--escala 1]

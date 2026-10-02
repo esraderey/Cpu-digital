@@ -30,14 +30,18 @@ MAX_MEMORY_WORDS = 16_777_216
 MAX_SNAPSHOT_RAW_BYTES = 256 * 1024 * 1024
 MAX_MEMORY_CHIP_TRANSFER_BYTES = 4_096
 MAX_ROPE_HEAD_SIZE = 256
-LOOP_WARMUP = 32  # saltos hacia atrás a una cabecera antes de compilar su bucle (~0,4 ms)
-# Si el programa escribe en su código, lo compilado puede perderse en la siguiente escritura.
-# Desde la primera, cada intento de compilación aplaza el siguiente LOOP_COOLDOWN instrucciones
-# ejecutadas, más LOOP_COOLDOWN_PER_INSTRUCTION por instrucción del bucle compilado. Compilar
-# cuesta de 0,3 a 8 ms: así queda por debajo de la mitad de lo que tarda el intérprete en
-# ejecutar las instrucciones que lo pagan (benchmarks/benchmark_automodificable.py).
+LOOP_WARMUP = 32  # saltos hacia atrás a una cabecera antes de compilar su bucle
+# Compilar cuesta de 0,3 a 8 ms y el gas no lo cobra, y es el programa quien decide cuántos
+# bucles tiene, si los usa y si los pierde escribiendo en su código. Por eso lo paga con
+# instrucciones ejecutadas: cada intento de compilación aplaza el siguiente LOOP_COOLDOWN
+# instrucciones, más LOOP_COOLDOWN_PER_INSTRUCTION por instrucción del bucle compilado. Las de
+# una entrada al código compilado que ejecuta al menos tantas como tiene el bucle cuentan
+# doble: un bucle que se usa se paga antes. Solo la primera compilación no espera; aparte de
+# ella, los programas adversarios medidos gastan hasta 1,3 veces la CPU del host que gastarían
+# sin acelerador (benchmarks/benchmark_compilacion.py y benchmarks/benchmark_automodificable.py).
 LOOP_COOLDOWN = 1024
 LOOP_COOLDOWN_PER_INSTRUCTION = 256
+_UNTRIED = object()  # en _loops.get: cabecera que aún no se ha intentado compilar (None: no acelerable)
 _F32 = struct.Struct("f")
 CANONICAL_NAN = 0x7FC00000
 _U32 = struct.Struct("I")
@@ -284,10 +288,10 @@ class TramoyaVM32:
         # el snapshot ni en el checkpoint.
         self._loop_candidates: dict[int, int] = {}
         self._loops: dict[int, CompiledLoop | None] = {}
-        # Si el programa ha escrito en su código y, en ese caso, cuántas instrucciones
-        # ejecutadas debe llevar la VM para intentar otra compilación.
-        self._code_written = False
+        # Espera entre compilaciones: lo que debe marcar el reloj de pago (instrucciones
+        # ejecutadas más las aceleradas que cuentan doble) para intentar otra.
         self._loop_cooldown_until = 0
+        self._loop_bonus = 0
         self._accelerated_instructions = 0
         self._sync_special_registers()
 
@@ -1040,7 +1044,6 @@ class TramoyaVM32:
         # Los saltos contados eran del código anterior: cada cabecera vuelve a necesitar
         # LOOP_WARMUP. Si no, un bucle que escribe en su propio código compila en cada vuelta.
         self._loop_candidates.clear()
-        self._code_written = True
 
     def memory_slice(self, start: int, count: int) -> tuple[int, ...]:
         if start < 0 or count < 0 or start + count > len(self._memory):
@@ -1686,20 +1689,20 @@ class TramoyaVM32:
         return self.result()
 
     def _compiled_loop(self, header: int) -> CompiledLoop | None:
-        try:
-            return self._loops[header]
-        except KeyError:
-            if self._instructions < self._loop_cooldown_until:
-                return None  # el intento anterior aún no está pagado: sigue el intérprete
-            compiled = compile_loop(self, header)
-            self._loops[header] = compiled
-            if self._code_written:
-                # Un intento fallido también cuesta (hasta ~0,5 ms): paga la espera base.
-                length = compiled.length if compiled is not None else 0
-                self._loop_cooldown_until = (
-                    self._instructions + LOOP_COOLDOWN + LOOP_COOLDOWN_PER_INSTRUCTION * length
-                )
+        # Con get y no con una excepción: un bucle caliente que espera su turno pasa por aquí
+        # en cada vuelta.
+        compiled = self._loops.get(header, _UNTRIED)
+        if compiled is not _UNTRIED:
             return compiled
+        paid = self._instructions + self._loop_bonus
+        if paid < self._loop_cooldown_until:
+            return None  # el intento anterior aún no está pagado: sigue el intérprete
+        compiled = compile_loop(self, header)
+        self._loops[header] = compiled
+        # Un intento fallido también cuesta (hasta ~0,5 ms): paga la espera base.
+        length = compiled.length if compiled is not None else 0
+        self._loop_cooldown_until = paid + LOOP_COOLDOWN + LOOP_COOLDOWN_PER_INSTRUCTION * length
+        return compiled
 
     def _run_loop(self, loop: CompiledLoop, budget: int) -> bool:
         """Ejecuta iteraciones del bucle; False si no avanzó ninguna instrucción."""
@@ -1715,6 +1718,11 @@ class TramoyaVM32:
         self._cycles += used
         self._gas_remaining -= used
         self._accelerated_instructions += steps
+        if steps >= loop.length:
+            # Al menos tantas instrucciones como tiene el bucle: el código compilado se está
+            # usando y todas las de esta entrada pagan la espera por partida doble. Una entrada
+            # que sale antes le cuesta al host como interpretarla.
+            self._loop_bonus += steps
         # Última instrucción: el salto de vuelta, o el de salida si el bucle salió por él. Si
         # devolvió el control a mitad del cuerpo, el intérprete ejecuta ya esa instrucción y
         # la sobrescribe.
@@ -2188,8 +2196,8 @@ class TramoyaVM32:
         # anterior: el snapshot trae su propio código y su propio last_instruction.
         self._loops.clear()
         self._loop_candidates.clear()
-        self._code_written = False
         self._loop_cooldown_until = 0
+        self._loop_bonus = 0
         self._last_instruction = None
         self._sync_special_registers()
         self._trace.clear()

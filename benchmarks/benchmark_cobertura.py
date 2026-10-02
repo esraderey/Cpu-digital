@@ -11,9 +11,10 @@ Para el juego (``vm_programs/juego_raycaster.tasm``) añade:
 * desglose por bucle: instrucciones del bucle más interno que las contiene y
   motivos por los que el acelerador no lo compila;
 * estimación de cobertura con extensiones del acelerador, simulando sus reglas
-  (calentamiento, entrada por la cabecera, vueltas completas) sobre la traza de
-  PCs del intérprete. La simulación del acelerador actual debe reproducir
-  exactamente la cobertura real; si no, el informe lo marca.
+  (calentamiento, espera entre compilaciones, entrada por la cabecera, vueltas
+  completas) sobre la traza de PCs del intérprete. La simulación del acelerador
+  actual debe reproducir exactamente la cobertura real; si no, el informe lo
+  marca.
 
 Uso (desde la raíz del repositorio):
     python benchmarks/benchmark_cobertura.py [--frames 20] [--rondas 3] [--json informe.json]
@@ -35,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from cpu_digital.vm32 import LOOP_WARMUP, TramoyaVM32, VMConfig
+from cpu_digital.vm32 import LOOP_COOLDOWN, LOOP_COOLDOWN_PER_INSTRUCTION, LOOP_WARMUP, TramoyaVM32, VMConfig
 from cpu_digital.vm32_assembler import Program32, VM32Assembler
 from cpu_digital.vm32_isa import VM32_ISA
 from cpu_digital.vm32_isa import VMOpcode as Op
@@ -436,19 +437,26 @@ class LoopAnalysis:
         marks = array("b", bytes(size))
         candidates: Counter[int] = Counter()
         regions: dict[int, set[int] | None] = {}
+        # Espera entre compilaciones, como TramoyaVM32._compiled_loop: el reloj de pago son las
+        # instrucciones ejecutadas (la posición en la traza) más las aceleradas que cuentan doble.
+        cooldown_until = bonus = 0
         index = 0
         while index < size:
             pc = trace[index]
             if candidates[pc] >= LOOP_WARMUP:
-                if pc not in regions:
-                    regions[pc] = self.region(pc, allowed)
-                region = regions[pc]
+                if pc not in regions and index + bonus >= cooldown_until:
+                    region = regions[pc] = self.region(pc, allowed)
+                    cooldown_until = (index + bonus + LOOP_COOLDOWN
+                                      + LOOP_COOLDOWN_PER_INSTRUCTION * (len(region) if region is not None else 0))
+                region = regions.get(pc)
                 if region is not None:
                     end = index
                     while end < size and trace[end] in region:
                         end += 1
                     for position in range(index, end):
                         marks[position] = 1
+                    if end - index >= len(region):  # tantas como tiene el bucle: cuentan doble
+                        bonus += end - index
                     index = end
                     continue
             # Instrucción interpretada: un salto hacia atrás cuenta para su destino.
@@ -669,7 +677,8 @@ def main() -> int:
         if llama is not None:
             loads.append(llama)
     print(f"Python {sys.version.split()[0]} · {platform.system()} {platform.machine()} · "
-          f"LOOP_WARMUP={LOOP_WARMUP} · rondas={args.rondas}\n")
+          f"LOOP_WARMUP={LOOP_WARMUP} · espera={LOOP_COOLDOWN}+{LOOP_COOLDOWN_PER_INSTRUCTION}·L · "
+          f"rondas={args.rondas}\n")
     rows = [measure(load, args.rondas) for load in loads]
     print_measures(rows)
     report = analyze_game(game, rows[0], args.programa.read_text(encoding="utf-8"))
@@ -679,6 +688,8 @@ def main() -> int:
             "python": sys.version.split()[0],
             "plataforma": f"{platform.system()} {platform.machine()}",
             "loop_warmup": LOOP_WARMUP,
+            "loop_cooldown": LOOP_COOLDOWN,
+            "loop_cooldown_per_instruction": LOOP_COOLDOWN_PER_INSTRUCTION,
             "programa": args.programa.name,
             "frames": args.frames,
             "cargas": [{**row.__dict__, "cobertura": row.coverage, "aceleracion": row.speedup} for row in rows],

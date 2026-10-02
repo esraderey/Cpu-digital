@@ -190,9 +190,11 @@ class AtomicityAnchors(unittest.TestCase):
 
     def test_unprotected_code_write_invalidates_compiled_loops(self) -> None:
         # VCOPY cambia el inmediato de un bucle ya compilado: la segunda tanda suma 7, no 1.
+        # Con 400 vueltas, lo que la primera tanda ejecuta compilada paga su compilación y la
+        # segunda vuelve a compilar en cuanto se calienta.
         source = vector_program(
             f"    MOVI R1, {BUF}\n    LEA R2, L\n    ADDI R2, R2, 3\n    MOVI R8, 2\n"
-            "OUT:\n    MOVI R9, 100\nL:\n    ADDI R5, R5, 1\n    SUBI R9, R9, 1\n    JNZ L\n"
+            "OUT:\n    MOVI R9, 400\nL:\n    ADDI R5, R5, 1\n    SUBI R9, R9, 1\n    JNZ L\n"
             "    VCOPY R2, R1\n    SUBI R8, R8, 1\n    JNZ OUT",
             1,
         )
@@ -201,10 +203,10 @@ class AtomicityAnchors(unittest.TestCase):
             vm = make_vm(source, protect_code=False, accelerate_loops=accelerate)
             vm.write_memory(BUF, 7)
             result = vm.run()
-            self.assertEqual((result.state, vm.registers[5]), ("HALTED", 100 + 700))
+            self.assertEqual((result.state, vm.registers[5]), ("HALTED", 400 + 2800))
             states.append(state(vm))
         self.assertEqual(states[0], states[1])
-        self.assertEqual(vm.accelerated_instructions, 2 * (100 - LOOP_WARMUP) * 3)
+        self.assertEqual(vm.accelerated_instructions, 2 * (400 - LOOP_WARMUP) * 3)
 
     def test_unprotected_code_write_restarts_the_loop_warmup(self) -> None:
         # Como con STORE: VCOPY reescribe un NOP del cuerpo en cada vuelta, así que la cabecera
@@ -225,8 +227,9 @@ class AtomicityAnchors(unittest.TestCase):
         self.assertEqual(states[0], states[1])
 
     def test_unprotected_code_write_makes_later_compilations_wait(self) -> None:
-        # Como con STORE: tras una escritura del TNU en código, cada compilación aplaza la
-        # siguiente. Con 40 rondas de 40 vueltas el bucle se compila 4 veces, no una por ronda.
+        # Como con STORE: una escritura del TNU en código obliga a compilar otra vez, y cada
+        # compilación aplaza la siguiente. Con 40 rondas de 40 vueltas el bucle se compila 3
+        # veces, no una por ronda.
         source = vector_program(
             f"    MOVI R1, {BUF}\n    LEA R2, L\n    ADDI R2, R2, 3\n    MOVI R8, 40\n"
             "OUT:\n    MOVI R9, 40\nL:\n    ADDI R5, R5, 1\n    SUBI R9, R9, 1\n    JNZ L\n"
@@ -244,11 +247,12 @@ class AtomicityAnchors(unittest.TestCase):
         with mock.patch("cpu_digital.vm32.compile_loop", noting):
             result = vm.run()
         self.assertEqual((result.state, vm.registers[5]), ("HALTED", 40 + 39 * 40 * 7))
-        self.assertEqual(len(attempts), 4)
-        # La primera compilación es anterior a la escritura y no aplaza nada; el bucle tiene 3 instrucciones.
+        self.assertEqual(len(attempts), 3)
+        # El bucle tiene 3 instrucciones. Tras compilar da 8 vueltas más en esa ronda, que el
+        # acelerador ejecuta y cuentan doble al pagar la espera.
         wait = vm32_module.LOOP_COOLDOWN + 3 * vm32_module.LOOP_COOLDOWN_PER_INSTRUCTION
-        for at, following in zip(attempts[1:], attempts[2:]):
-            self.assertGreaterEqual(following - at, wait)
+        for at, following in zip(attempts, attempts[1:]):
+            self.assertGreaterEqual(following - at + (40 - LOOP_WARMUP) * 3, wait)
 
 
 class GasAnchors(unittest.TestCase):

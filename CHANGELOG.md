@@ -6,6 +6,36 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
+### 2026-10-02
+
+- **Corrección:** el coste de compilar del acelerador de bucles queda acotado
+  también en los programas que no escriben en su código. Antes compilaban cada
+  bucle a sus 32 saltos y sin espera, así que el coste lo acotaba el tamaño del
+  programa y no el gas: con muchos bucles caros de 33 vueltas, unas 40 veces más
+  CPU del host con el mismo gas. Ahora cada intento de compilación aplaza
+  siempre el siguiente (1 024 instrucciones ejecutadas, más 256 por instrucción
+  del bucle). Al pagar esa espera cuentan doble las instrucciones de cada
+  entrada al código compilado que ejecuta al menos tantas como tiene el bucle:
+  un bucle que se usa se paga antes. Con programas adversarios que ejecutan
+  justo lo que paga cada espera, el peor medido queda en 1,3×. La primera
+  compilación tras cargar un programa sigue sin esperar, así que uno muy corto
+  aún puede costar una compilación de más (~8 ms).
+- La regla es la misma si el programa escribe en su código: desaparece la
+  distinción que se introdujo el día anterior. Los que parchean su código una
+  vez por ronda y tienen varios bucles calientes recuperan la aceleración
+  (0,35× del intérprete frente a 0,76×).
+- Precio: si un programa compila un bucle y apenas lo usa, los que se calientan
+  después esperan en el intérprete hasta que esa compilación está pagada. En el
+  raycaster de referencia, la cobertura con 20 frames pasa del 85,9 % al
+  85,7 %, sin cambio medible en el tiempo.
+- `benchmarks/benchmark_compilacion.py`: coste de compilar en programas que no
+  escriben en su código, con y sin acelerador, contando los intentos de
+  compilación. `benchmarks/benchmark_cobertura.py` simula también la espera.
+- Pruebas: anclas que cuentan las compilaciones sin escrituras en código, otra
+  de la simulación de cobertura y fuzzing diferencial de 80 programas con
+  varios bucles; los fuzz comprueban además cada decisión de compilar contra la
+  regla.
+
 ### 2026-10-01
 
 - **Corrección:** la FPU escalar redondea a ±infinito al desbordar float32 aunque

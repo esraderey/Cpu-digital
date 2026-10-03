@@ -108,14 +108,16 @@ RAM VM32.
 
 Benchmarks reproducibles: velocidad del intérprete, cobertura del acelerador de
 bucles en código de juego (`vm_programs/juego_raycaster.tasm`, con desglose por
-fase y por bucle) y coste de compilar del acelerador, sin y con código
-automodificable:
+fase y por bucle), coste de compilar del acelerador, sin y con código
+automodificable, y reparto del tiempo del raycaster con las estimaciones de
+[RFC-EXP-00017](RFC-EXP-00017.md):
 
 ```powershell
 .\.venv\Scripts\python.exe benchmarks\benchmark_vm32.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_cobertura.py --frames 20
 .\.venv\Scripts\python.exe benchmarks\benchmark_compilacion.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_automodificable.py
+.\.venv\Scripts\python.exe benchmarks\benchmark_dibujo.py
 ```
 
 ## Chip Neuronal Tramoya (TNU)
@@ -368,6 +370,8 @@ tiempos eléctricos, cachés, pipelines ni concurrencia de un procesador físico
 - [RFC-EXP-00015.md](RFC-EXP-00015.md): especificación técnica de VM32.
 - [RFC-EXP-00016.md](RFC-EXP-00016.md): pantalla determinista, aceleración por
   bloques y chip neuronal, con sus mediciones y decisiones.
+- [RFC-EXP-00017.md](RFC-EXP-00017.md): propuesta de regiones con bucles anidados
+  en el acelerador y de una unidad de dibujo, con sus mediciones.
 - [PLAN_VM32_RAM_EXTRA_100_MB.md](PLAN_VM32_RAM_EXTRA_100_MB.md): propuesta para
   ampliar la RAM de VM32.
 - [CHANGELOG.md](CHANGELOG.md): historial de cambios.

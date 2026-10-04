@@ -12,7 +12,9 @@ observa el estado también en cada salida anticipada con una syscall espía. El
 fuzzing de código automodificable parchea instrucciones del propio bucle y lo
 ejecuta además con una política que compila mucho más a menudo que la real. El
 de varios bucles encadena bucles que esperan su turno para compilar, y comprueba
-con y sin espera el mismo estado.
+con y sin espera el mismo estado. El de la ROM lee la ROM del TNU desde el código
+compilado, en sus bordes, sin capacidad, sin TNU o sin ROM, y con el TNU cambiado
+entre ejecuciones (exige Python 3.12, como el TNU).
 """
 
 from __future__ import annotations
@@ -23,18 +25,23 @@ import random
 import struct
 import sys
 import unittest
+from collections import Counter
 from pathlib import Path
 from typing import Callable
 from unittest import mock
 
 from cpu_digital import vm32 as vm32_module
 from cpu_digital import vm32_loops as loops_module
+from cpu_digital.tnu import ROM_BASE, TensorROM, TramoyaNeuralUnit
 from cpu_digital.vm32 import CANONICAL_NAN, LOOP_WARMUP, TramoyaVM32, VMConfig, VMRuntimeError
 from cpu_digital.vm32_assembler import VM32Assembler
 from cpu_digital.vm32_isa import VMOpcode
 from cpu_digital.vm32_loops import compile_loop
 
 MEMORY = 4096
+NPU_CAPS = frozenset({"io", "introspection", "random", "memory", "npu"})
+# Como tests/test_tnu.py: el resto de VM32 soporta 3.10, pero conectar un TNU exige 3.12.
+NEEDS_TNU = unittest.skipUnless(hasattr(math, "sumprod"), "El TNU requiere Python 3.12 o superior (math.sumprod)")
 
 
 def program(source: str):
@@ -65,13 +72,14 @@ def spy(log: list) -> Callable[[TramoyaVM32], None]:
 
 
 def run_both(source: str, *, gas_limit: int = 50_000, inputs=(), max_instructions=None,
-             seed_memory: dict[int, int] | None = None, **config) -> tuple[tuple, tuple, int]:
+             seed_memory: dict[int, int] | None = None, npu: Callable[[], TramoyaNeuralUnit] | None = None,
+             **config) -> tuple[tuple, tuple, int]:
     prog = program(source)
     states = []
     accelerated = 0
     for accelerate in (False, True):
         vm = TramoyaVM32(VMConfig(memory_words=MEMORY, gas_limit=gas_limit, trace_size=0,
-                                  accelerate_loops=accelerate, **config))
+                                  accelerate_loops=accelerate, **config), npu=npu() if npu else None)
         log: list = []
         vm.register_syscall(SPY, spy(log), name="espia")
         vm.load_program(prog, inputs=inputs)
@@ -139,6 +147,38 @@ def run_counting(source: str, deviations: list | None = None, **options) -> tupl
     with counting_compilations(attempts), watching_policy(attempts, [] if deviations is None else deviations):
         plain, fast, accelerated = run_both(source, **options)
     return plain, fast, accelerated, attempts
+
+
+def counting_entries(entries: list):
+    """Anota cuántas instrucciones avanza cada entrada al código compilado (0: devolvió el
+    control sin ejecutar ninguna)."""
+    real = TramoyaVM32._run_loop
+
+    def run_and_note(vm: TramoyaVM32, loop, budget: int) -> bool:
+        before = vm.accelerated_instructions
+        advanced = real(vm, loop, budget)
+        entries.append(vm.accelerated_instructions - before)
+        return advanced
+
+    return mock.patch.object(TramoyaVM32, "_run_loop", run_and_note)
+
+
+def counting_rom_reads(reads: Counter):
+    """Cuenta, por modo (``accelerate_loops``), las lecturas de la ROM que termina el intérprete.
+
+    Sin acelerador son todas las del programa; con él, las que no hizo el código compilado."""
+    real = TramoyaVM32._read_rom_word
+
+    def read_and_note(vm: TramoyaVM32, address: object) -> int:
+        value = real(vm, address)
+        reads[vm.config.accelerate_loops] += 1
+        return value
+
+    return mock.patch.object(TramoyaVM32, "_read_rom_word", read_and_note)
+
+
+def rom_of(words: list[int], name: str = "rom-bucles") -> TensorROM:
+    return TensorROM(struct.pack(f"<{len(words)}i", *words), name=name)
 
 
 def expensive_headers(headers: int, rounds: int, last: str = "FDIV R1, R2, R3", writes: bool = False) -> str:
@@ -782,6 +822,23 @@ class CoverageSimulationAnchors(unittest.TestCase):
                 simulated = sum(cobertura.LoopAnalysis(prog, traced.pcs).simulate(None))
                 self.assertEqual(simulated, fast.accelerated_instructions)
 
+    @NEEDS_TNU
+    def test_the_simulation_matches_the_accelerator_when_the_loop_reads_the_rom(self) -> None:
+        # La simulación no conoce las guardas: antes del arreglo daba por aceleradas las vueltas
+        # que el código compilado devolvía al intérprete en la lectura de la ROM (1 072 frente a 0).
+        cobertura = self.benchmark()
+        prog, rom = program(RomLoadAnchors.SUM), rom_of(RomLoadAnchors.WORDS)
+        vms = []
+        for vm_class, accelerate in ((cobertura.TracingVM, False), (TramoyaVM32, True)):
+            vm = vm_class(VMConfig(memory_words=MEMORY, gas_limit=50_000, trace_size=0, accelerate_loops=accelerate,
+                                   capabilities=NPU_CAPS), npu=TramoyaNeuralUnit(rom))
+            vm.load_program(prog)
+            self.assertEqual(vm.run().state, "HALTED")
+            vms.append(vm)
+        traced, fast = vms
+        simulated = sum(cobertura.LoopAnalysis(prog, traced.pcs).simulate(None))
+        self.assertEqual((simulated, fast.accelerated_instructions), ((300 - LOOP_WARMUP) * 4,) * 2)
+
 
 class NanDeterminismAnchor(unittest.TestCase):
     def test_fpu_nan_results_are_canonical_however_often_they_run(self) -> None:
@@ -1239,6 +1296,319 @@ MAL:
         self.assertGreater(accelerated, 0)
 
 
+@NEEDS_TNU
+class RomLoadAnchors(unittest.TestCase):
+    """Un LOAD de la ROM del TNU se ejecuta en el código compilado, con la regla del intérprete.
+
+    Hallazgo de una revisión del 2026-10-02: la guarda de cada LOAD devolvía el control al
+    intérprete en cualquier dirección fuera de la RAM, también en las lecturas legales de la ROM.
+    El bucle se compilaba, pero cada entrada se detenía en esa lectura (sin avanzar ninguna
+    instrucción si era la primera) y, con la lectura al principio del cuerpo, iba más lento que
+    sin acelerador. Estas anclas cuentan instrucciones aceleradas, entradas al código compilado y
+    lecturas de la ROM que hace el intérprete, no tiempos."""
+
+    WORDS = [3, -7, 11, 2**31 - 1, -(2**31), 0, 5, 9]
+    SUM = f""".code
+    MOVI R2, {ROM_BASE}
+    MOVI R9, 300
+L:
+    LOAD R1, [R2]
+    ADD R3, R3, R1
+    SUBI R9, R9, 1
+    JNZ L
+    HALT
+"""
+    DOT = f""".code
+    MOVI R1, 1000           ; x en la RAM
+    MOVI R2, {ROM_BASE}     ; w en la ROM
+    MOVI R9, 300
+L:
+    LOAD R3, [R1]
+    LOAD R4, [R2]           ; la lectura de la ROM, a mitad del cuerpo
+    FMUL R5, R3, R4
+    FADD R6, R6, R5
+    ADDI R1, R1, 1
+    ADDI R2, R2, 1
+    SUBI R9, R9, 1
+    JNZ L
+    HALT
+"""
+    WALK = f""".code
+    MOVI R2, {ROM_BASE}
+    MOVI R9, 300
+L:
+    LOAD R1, [R2]
+    ADD R3, R3, R1
+    ADDI R2, R2, 1
+    SUBI R9, R9, 1
+    JNZ L
+    HALT
+"""
+    SWITCH = """.code
+    MOVI R2, 1000           ; empieza leyendo la RAM
+    MOVI R9, 120
+L:
+    CMPI R9, 60
+    JNZ SIGUE
+    MOVI R2, {address}      ; a mitad de recorrido, ya compilado, salta a la dirección que se prueba
+SIGUE:
+    LOAD R1, [R2]
+    ADD R3, R3, R1
+    ADDI R2, R2, 1
+    SUBI R9, R9, 1
+    JNZ L
+    HALT
+"""
+
+    def test_a_loop_that_starts_reading_the_rom_runs_compiled(self) -> None:
+        # El programa del hallazgo: antes, 0 aceleradas y 268 entradas que no avanzaban.
+        entries: list = []
+        reads: Counter = Counter()
+        with counting_entries(entries), counting_rom_reads(reads):
+            plain, fast, accelerated = run_both(self.SUM, npu=lambda: TramoyaNeuralUnit(rom_of(self.WORDS)),
+                                                capabilities=NPU_CAPS)
+        self.assertEqual(plain, fast)
+        self.assertEqual((plain[0], plain[5][3]), ("HALTED", 300 * self.WORDS[0]))
+        self.assertEqual(accelerated, (300 - LOOP_WARMUP) * 4)
+        self.assertEqual(entries, [(300 - LOOP_WARMUP) * 4])
+        # El intérprete solo lee la ROM durante el calentamiento.
+        self.assertEqual((reads[False], reads[True]), (300, LOOP_WARMUP))
+
+    def test_a_rom_read_in_the_middle_of_the_body_runs_compiled(self) -> None:
+        # Antes, cada entrada avanzaba una instrucción y devolvía el control en la lectura.
+        rng = random.Random(9)
+        weights = [struct.unpack("<i", struct.pack("<f", rng.uniform(-4, 4)))[0] for _ in range(300)]
+        entries: list = []
+        reads: Counter = Counter()
+        with counting_entries(entries), counting_rom_reads(reads):
+            plain, fast, accelerated = run_both(self.DOT, seed_memory=float_words(3, 300),
+                                                npu=lambda: TramoyaNeuralUnit(rom_of(weights)), capabilities=NPU_CAPS)
+        self.assertEqual(plain, fast)
+        self.assertEqual(plain[0], "HALTED")
+        self.assertEqual(accelerated, (300 - LOOP_WARMUP) * 8)
+        self.assertEqual(entries, [(300 - LOOP_WARMUP) * 8])
+        self.assertEqual((reads[False], reads[True]), (300, LOOP_WARMUP))
+
+    def test_the_rom_is_looked_up_again_on_every_entry(self) -> None:
+        # El bucle compilado sobrevive entre ejecuciones y el host puede cambiar el TNU entre una y
+        # otra: cada entrada lee la ROM que esté conectada entonces, como el intérprete.
+        first = rom_of(list(range(300)))
+        other, short = rom_of([7 * k for k in range(300)]), rom_of(list(range(120)))
+        changes = {  # cambio: (TNU nuevo, estado final, instrucciones aceleradas después)
+            "otra ROM": (lambda: TramoyaNeuralUnit(other), "HALTED", 200 * 5),
+            "ROM más corta": (lambda: TramoyaNeuralUnit(short), "FAULTED", 20 * 5),
+            "TNU sin ROM": (lambda: TramoyaNeuralUnit(), "FAULTED", 0),
+            "sin TNU": (lambda: None, "FAULTED", 0),
+        }
+        for name, (replacement, final, after) in changes.items():
+            with self.subTest(change=name):
+                states, accelerated = [], []
+                for accelerate in (False, True):
+                    vm = TramoyaVM32(VMConfig(memory_words=MEMORY, gas_limit=50_000, trace_size=0,
+                                              accelerate_loops=accelerate, capabilities=NPU_CAPS),
+                                     npu=TramoyaNeuralUnit(first))
+                    vm.load_program(program(self.WALK))
+                    vm.run(max_instructions=2 + 100 * 5)  # pausa en la cabecera tras 100 vueltas
+                    before = vm.accelerated_instructions
+                    vm.attach_npu(replacement())
+                    vm.run()
+                    states.append(observe(vm))
+                    accelerated.append((before, vm.accelerated_instructions - before))
+                self.assertEqual(states[0], states[1])
+                self.assertEqual(states[0][0], final)
+                if final == "FAULTED":
+                    self.assertIn("Lectura fuera de memoria", states[0][1])
+                # Antes del arreglo, ni una instrucción acelerada antes del cambio ni después.
+                self.assertEqual(accelerated[1], ((100 - LOOP_WARMUP) * 5, after))
+
+    def test_where_the_rom_cannot_be_read_the_interpreter_faults_as_always(self) -> None:
+        rom = rom_of(list(range(1, 81)))
+
+        def legible() -> TramoyaNeuralUnit:
+            return TramoyaNeuralUnit(rom)
+
+        cases = {  # caso: (dirección a la que salta el puntero, TNU, capacidades, estado final)
+            "ROM legible": (ROM_BASE, legible, NPU_CAPS, "HALTED"),
+            "final de la ROM": (ROM_BASE + 80 - 20, legible, NPU_CAPS, "FAULTED"),
+            "hueco bajo la ROM": (ROM_BASE - 1, legible, NPU_CAPS, "FAULTED"),
+            "final de la RAM": (MEMORY - 3, legible, NPU_CAPS, "FAULTED"),
+            "dirección negativa": (-2, legible, NPU_CAPS, "FAULTED"),
+            "sin la capacidad npu": (ROM_BASE, legible, frozenset({"io", "memory"}), "FAULTED"),
+            "TNU sin ROM": (ROM_BASE, TramoyaNeuralUnit, NPU_CAPS, "FAULTED"),
+        }
+        for name, (address, npu, capabilities, final) in cases.items():
+            with self.subTest(case=name):
+                entries: list = []
+                reads: Counter = Counter()
+                with counting_entries(entries), counting_rom_reads(reads):
+                    plain, fast, accelerated = run_both(self.SWITCH.format(address=address), npu=npu,
+                                                        capabilities=capabilities)
+                self.assertEqual(plain, fast)
+                self.assertEqual(plain[0], final)
+                self.assertGreater(accelerated, 0)  # el salto llega con el bucle ya compilado
+                if final == "FAULTED":
+                    self.assertIn("Lectura fuera de memoria", plain[1])
+                else:
+                    # Las 60 lecturas de la ROM, todas en una sola entrada al código compilado.
+                    self.assertEqual((reads[False], reads[True], len(entries)), (60, 0, 1))
+
+    def test_subclasses_of_the_tnu_or_the_rom_are_read_by_the_interpreter(self) -> None:
+        # El código compilado consulta la ROM una vez por entrada; el intérprete, en cada lectura.
+        # Solo coinciden si nadie redefine esa consulta.
+        class Alternating(TramoyaNeuralUnit):
+            """Cada consulta de la ROM devuelve la otra imagen."""
+
+            __slots__ = ("_other", "_flip")
+
+            def __init__(self, rom: TensorROM, other: TensorROM) -> None:
+                super().__init__(rom)
+                self._other, self._flip = other, False
+
+            @property
+            def rom(self) -> TensorROM | None:
+                self._flip = not self._flip
+                return self._other if self._flip else super().rom
+
+        class Shrinking(TensorROM):
+            """La ventana encoge una palabra cada vez que se consulta su tamaño."""
+
+            __slots__ = ("_left",)
+
+            def __init__(self, data: bytes) -> None:
+                super().__init__(data)
+                self._left = len(data) // 4
+
+            @property
+            def words(self) -> int:
+                self._left -= 1
+                return self._left
+
+        cases = {  # caso: (programa, TNU, estado final)
+            "TNU que alterna dos ROM": (self.SUM, lambda: Alternating(rom_of(self.WORDS), rom_of([w ^ 1 for w in self.WORDS])),
+                                        "HALTED"),
+            "ROM que encoge al consultarla": (self.WALK, lambda: TramoyaNeuralUnit(Shrinking(bytes(4 * 400))), "FAULTED"),
+        }
+        for name, (source, npu, final) in cases.items():
+            with self.subTest(case=name):
+                plain, fast, _ = run_both(source, npu=npu, capabilities=NPU_CAPS)
+                self.assertEqual(plain, fast)
+                self.assertEqual(plain[0], final)
+
+    def test_overriding_how_the_rom_is_read_turns_the_accelerator_off(self) -> None:
+        class Flipped(TramoyaVM32):
+            def _read_rom_word(self, address: object) -> int:
+                return super()._read_rom_word(address) ^ 1
+
+        def doubled(vm: TramoyaVM32) -> None:
+            rom = rom_of([2 * self.WORDS[0]])
+            vm._rom_if_enabled = lambda: rom
+
+        overrides = {"subclase": (Flipped, None, self.WORDS[0] ^ 1), "instancia": (TramoyaVM32, doubled, 2 * self.WORDS[0])}
+        for name, (cls, patch, word) in overrides.items():
+            with self.subTest(override=name):
+                states, accelerated = [], 0
+                for accelerate in (False, True):
+                    vm = cls(VMConfig(memory_words=MEMORY, trace_size=0, accelerate_loops=accelerate,
+                                      capabilities=NPU_CAPS), npu=TramoyaNeuralUnit(rom_of(self.WORDS)))
+                    if patch:
+                        patch(vm)
+                    vm.load_program(program(self.SUM))
+                    vm.run()
+                    states.append(observe(vm))
+                    accelerated = vm.accelerated_instructions
+                self.assertEqual(states[0], states[1])
+                self.assertEqual((states[1][5][3], accelerated), (300 * word, 0))
+
+    def test_capabilities_that_are_not_a_frozenset_are_checked_by_the_interpreter(self) -> None:
+        # Hallazgo de la revisión G4: el código compilado consultaba unas capacidades de otra clase
+        # fuera del intérprete, que convierte en fallo lo que lance esa consulta, y una vez por
+        # entrada en lugar de en cada lectura.
+        class Raising(frozenset):
+            def __contains__(self, item: object) -> bool:
+                if item == "npu":
+                    raise RuntimeError("capacidad ilegible")
+                return super().__contains__(item)
+
+        class Flickering(frozenset):
+            """La capacidad npu aparece y desaparece en cada consulta."""
+
+            present = False
+
+            def __contains__(self, item: object) -> bool:
+                if item == "npu":
+                    self.present = not self.present
+                    return self.present
+                return super().__contains__(item)
+
+        rom = rom_of(list(range(1, 81)))
+        cases = {"consulta que lanza": (Raising, "Excepción de host RuntimeError: capacidad ilegible"),
+                 "npu intermitente": (Flickering, "Lectura fuera de memoria")}
+        for name, (capabilities, fault) in cases.items():
+            with self.subTest(case=name):
+                states = []
+                for accelerate in (False, True):
+                    vm = TramoyaVM32(VMConfig(memory_words=MEMORY, trace_size=0, accelerate_loops=accelerate,
+                                              capabilities=capabilities(NPU_CAPS)), npu=TramoyaNeuralUnit(rom))
+                    vm.load_program(program(self.SWITCH.format(address=ROM_BASE)))
+                    vm.run()  # sin el arreglo, con acelerador la excepción salía de run()
+                    states.append(observe(vm))
+                self.assertEqual(states[0], states[1])
+                self.assertEqual(states[0][0], "FAULTED")
+                self.assertIn(fault, states[0][1])
+
+    def test_a_rom_read_sets_the_flags_like_the_interpreter(self) -> None:
+        # Hallazgo de la revisión G4: nada observaba las banderas justo después de leer la ROM. ADD
+        # deja C = 1 y O = 1; el LOAD debe dejar C = O = 0 y Z y N de la palabra leída.
+        source = f""".code
+    MOVI R2, {ROM_BASE}
+    MOVI R10, -2147483648
+    MOVI R11, -1
+    MOVI R9, 120
+L:
+    ADD R7, R10, R11        ; desborda: C = 1, O = 1, Z = 0, N = 0
+    LOAD R1, [R2]
+    JC MAL                  ; nunca: el LOAD deja C = 0
+    JGT POSITIVA            ; Z = 0 y N = O
+    JZ CERO
+    ADDI R5, R5, 1
+    JMP SIGUE
+POSITIVA:
+    ADDI R3, R3, 1
+    JMP SIGUE
+CERO:
+    ADDI R4, R4, 1
+SIGUE:
+    ADDI R2, R2, 1
+    SUBI R9, R9, 1
+    JNZ L
+    HALT
+MAL:
+    MOVI R6, 1
+    HALT
+"""
+        words = [5, 0, -3, 7, -(2**31), 2**31 - 1] * 20
+        reads: Counter = Counter()
+        with counting_rom_reads(reads):
+            plain, fast, _ = run_both(source, npu=lambda: TramoyaNeuralUnit(rom_of(words)), capabilities=NPU_CAPS)
+        self.assertEqual(plain, fast)
+        self.assertEqual((plain[0], plain[5][3:7]), ("HALTED", (60, 20, 40, 0)))
+        self.assertEqual((reads[False], reads[True]), (120, LOOP_WARMUP))  # leídas desde el código compilado
+
+
+class ReadsOutsideTheRamAnchors(unittest.TestCase):
+    """Sin TNU (y por tanto también en Python 3.10 y 3.11), una lectura fuera de la RAM que llega
+    con el bucle ya compilado devuelve el control y el intérprete falla en ella, como siempre."""
+
+    def test_without_a_tnu_reads_outside_the_ram_fault_in_the_interpreter(self) -> None:
+        for name, address in {"ROM sin TNU": ROM_BASE, "final de la RAM": MEMORY - 3, "dirección negativa": -2}.items():
+            with self.subTest(case=name):
+                plain, fast, accelerated = run_both(RomLoadAnchors.SWITCH.format(address=address), capabilities=NPU_CAPS)
+                self.assertEqual(plain, fast)
+                self.assertEqual(plain[0], "FAULTED")
+                self.assertIn("Lectura fuera de memoria", plain[1])
+                self.assertGreater(accelerated, 0)  # el salto llega con el bucle ya compilado
+
+
 class ExtendedDifferentialFuzz(unittest.TestCase):
     """Fuzzing diferencial de las extensiones, con la syscall espía en cada salida del bucle."""
 
@@ -1564,6 +1934,135 @@ class MultiLoopFuzz(unittest.TestCase):
         # El fuzz debe ejercitar de verdad la espera: bucles que compilan tarde y bucles que no llegan.
         for effect, count in exercised.items():
             self.assertGreaterEqual(count, 15, (effect, exercised))
+
+
+@NEEDS_TNU
+class RomDifferentialFuzz(unittest.TestCase):
+    """Fuzzing diferencial de bucles que leen la ROM del TNU.
+
+    Tres punteros (R11–R13) arrancan casi siempre en una zona legible (en la RAM si la VM no
+    puede leer la ROM) y llegan a los bordes al avanzar o al saltar de zona a mitad de
+    recorrido, ya con el bucle compilado: el final de la ROM, justo pasado él, el hueco que la
+    separa de la RAM, el final de la RAM o una dirección negativa. El cuerpo mezcla esas
+    lecturas, y alguna escritura, con el resto de instrucciones acelerables. A la VM le puede
+    faltar la capacidad npu, el TNU o la ROM, y a veces el host cambia el TNU con el bucle ya
+    compilado. El estado debe ser el del intérprete, y el fuzz debe leer de verdad la ROM desde
+    el código compilado, devolver el control en sus bordes y sobrevivir a los cambios de TNU."""
+
+    WORDS = 256
+    POINTERS = ("R11", "R12", "R13")
+    ENVIRONMENTS = ("legible", "legible", "legible", "sin_capacidad", "sin_tnu", "tnu_sin_rom")
+    CHANGES = (None, None, None, "otra", "corta", "sin_rom", "sin_tnu")
+    # Fallan con facilidad en la primera vuelta y el bucle ya no compila: se usan menos.
+    RISKY = frozenset({"DIV", "MOD", "PUSH", "POP", "FDIV", "FSQRT", "FTOI"})
+
+    def start(self, rng: random.Random, environment: str) -> int:
+        # Casi siempre un arranque válido, para que el bucle llegue a compilarse (sin ROM legible,
+        # en la RAM): los bordes los alcanza al avanzar o al saltar de zona.
+        if rng.random() < 0.1:
+            return self.target(rng)
+        if environment != "legible" or rng.random() < 0.3:
+            return 1000 + rng.randrange(200)
+        return ROM_BASE + rng.choice([rng.randrange(8), rng.randrange(self.WORDS)])
+
+    def target(self, rng: random.Random) -> int:
+        words = self.WORDS
+        return rng.choice([ROM_BASE, ROM_BASE + rng.randrange(words), ROM_BASE + words - rng.randint(1, 6),
+                           ROM_BASE + words, ROM_BASE - rng.randint(1, 3), 1000 + rng.randrange(200),
+                           MEMORY - rng.randint(1, 4), -rng.randint(1, 3)])
+
+    def random_loop(self, rng: random.Random, environment: str) -> str:
+        generic = ExtendedDifferentialFuzz()
+        dest = lambda: f"R{rng.choice([0, *range(1, 9)])}"  # noqa: E731 - generador compacto
+        src = lambda: f"R{rng.choice([0, 15, *range(1, 9), *range(1, 9)])}"  # noqa: E731
+        imm = lambda: rng.choice([0, 1, -1, 2, 7, 1000, -1000, 2**31 - 1, -(2**31), rng.randint(-5000, 5000)])  # noqa: E731
+        lines = [".code", *(f"    MOVI R{index}, {rng.choice([0, 1, 5, 100, -3, imm(), *ExtendedDifferentialFuzz.FLOATS])}"
+                            for index in range(1, 9)),
+                 *(f"    PUSH R{rng.randint(1, 8)}" for _ in range(rng.randint(0, 6))),
+                 *(f"    MOVI {pointer}, {self.start(rng, environment)}" for pointer in self.POINTERS),
+                 f"    MOVI R9, {rng.choice([rng.randint(1, 40), rng.randint(40, 120), rng.randint(40, 120)])}"]
+        body = []
+        for _ in range(rng.randint(1, 8)):
+            pointer, roll = rng.choice(self.POINTERS), rng.random()
+            if roll < 0.45:
+                body.append(f"LOAD {dest()}, [{pointer}{rng.choice(['', '', '+1', '+3', '-1'])}]")
+            elif roll < 0.6:
+                body.append(f"ADDI {pointer}, {pointer}, {rng.choice([1, 1, 1, 2, -1])}")
+            elif roll < 0.64:
+                body.append(f"STORE {src()}, [{pointer}]")
+            else:  # el resto de instrucciones acelerables; la memoria, solo a través de los punteros
+                instruction = generic.random_instruction(rng, dest, src, imm)
+                while instruction.startswith(("LOAD", "STORE")) or (
+                        instruction.split()[0] in self.RISKY and rng.random() < 0.7):
+                    instruction = generic.random_instruction(rng, dest, src, imm)
+                body.append(instruction)
+        if rng.random() < 0.4:  # a mitad de recorrido, con el bucle ya compilado, un puntero cambia de zona
+            at = rng.randint(0, len(body))
+            body[at:at] = [f"CMPI R9, {rng.randint(1, 60)}", "JNZ S", f"MOVI {rng.choice(self.POINTERS)}, {self.target(rng)}",
+                           "S:"]
+        if rng.random() < 0.2:  # salida anticipada
+            at = rng.randint(0, len(body))
+            body[at:at] = [f"CMPI R9, {rng.randint(1, 10)}", f"{rng.choice(['JZ', 'JLT'])} X"]
+        lines += ["L:", *(line if line.endswith(":") else f"    {line}" for line in body), "    SUBI R9, R9, 1",
+                  "    JNZ L", "X:", f"    SYSCALL {SPY}", "    MOV R1, R2", "    SYSCALL 1", "    HALT"]
+        return "\n".join(lines)
+
+    def run_case(self, rng: random.Random, source: str, environment: str) -> tuple[tuple, tuple, dict[str, object]]:
+        words = [rng.choice([0, 1, -1, 7, 2**31 - 1, -(2**31), rng.randint(-10**6, 10**6), *ExtendedDifferentialFuzz.FLOATS])
+                 for _ in range(self.WORDS)]
+        rom, other, short = rom_of(words), rom_of(words[::-1]), rom_of(words[:rng.randint(1, self.WORDS - 1)])
+        change = rng.choice(self.CHANGES)
+        replacements = {"otra": lambda: TramoyaNeuralUnit(other), "corta": lambda: TramoyaNeuralUnit(short),
+                        "sin_rom": TramoyaNeuralUnit, "sin_tnu": lambda: None}
+        capabilities = frozenset({"io", "memory"}) if environment == "sin_capacidad" else NPU_CAPS
+        gas = rng.choice([3_000, 20_000])
+        budget = rng.choice([None, None, 333]) if change is None else rng.randint(150, 900)
+        prog = program(source)
+        reads: Counter = Counter()
+        states, facts = [], {"environment": environment, "change": change}
+        with counting_rom_reads(reads):
+            for accelerate in (False, True):
+                npu = None if environment == "sin_tnu" else TramoyaNeuralUnit(None if environment == "tnu_sin_rom" else rom)
+                vm = TramoyaVM32(VMConfig(memory_words=MEMORY, gas_limit=gas, trace_size=0,
+                                          accelerate_loops=accelerate, capabilities=capabilities), npu=npu)
+                log: list = []
+                vm.register_syscall(SPY, spy(log), name="espia")
+                vm.load_program(prog)
+                vm.run(max_instructions=budget)
+                facts["before_change"] = vm.accelerated_instructions
+                if change is not None:
+                    vm.attach_npu(replacements[change]())
+                    vm.run()
+                states.append((*observe(vm), tuple(log)))
+                facts["accelerated"] = vm.accelerated_instructions
+        # Las lecturas de la ROM que no hizo el intérprete con acelerador las hizo el código compilado.
+        facts["compiled_rom_reads"] = reads[False] - reads[True]
+        return states[0], states[1], facts
+
+    def test_random_loops_that_read_the_rom_match_the_interpreter(self) -> None:
+        rng = random.Random(2031)
+        exercised = {"lectura de la ROM compilada": 0, "fallo de lectura tras compilar": 0,
+                     "sin ROM legible tras compilar": 0, "cambio de TNU con el bucle compilado": 0}
+        for case in range(600):
+            environment = rng.choice(self.ENVIRONMENTS)
+            source = self.random_loop(rng, environment)
+            with self.subTest(case=case, environment=environment, source=source):
+                plain, fast, facts = self.run_case(rng, source, environment)
+                self.assertEqual(plain, fast)
+                exercised["lectura de la ROM compilada"] += facts["compiled_rom_reads"] > 0
+                faulted_after_compiling = (fast[0] == "FAULTED" and facts["accelerated"] > 0
+                                           and "Lectura fuera de memoria" in fast[1])
+                exercised["fallo de lectura tras compilar"] += faulted_after_compiling
+                exercised["sin ROM legible tras compilar"] += faulted_after_compiling and (
+                    facts["environment"] != "legible" or facts["change"] in {"sin_rom", "sin_tnu"})
+                exercised["cambio de TNU con el bucle compilado"] += (
+                    facts["change"] is not None and facts["before_change"] > 0)
+        # El fuzz debe ejercitar de verdad la ROM desde el código compilado (con esta semilla, 96, 38,
+        # 30 y 164 casos); antes del arreglo ningún caso la leía desde él.
+        minimums = {"lectura de la ROM compilada": 60, "fallo de lectura tras compilar": 25,
+                    "sin ROM legible tras compilar": 20, "cambio de TNU con el bucle compilado": 100}
+        for effect, count in exercised.items():
+            self.assertGreaterEqual(count, minimums[effect], (effect, exercised))
 
 
 if __name__ == "__main__":

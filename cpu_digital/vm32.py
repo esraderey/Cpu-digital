@@ -2223,7 +2223,7 @@ _LOOP_SEMANTICS = frozenset(
     + ["_execute_one", "_fetch_decoded", "_read_register", "_write_register", "_write_result",
        "_set_flags", "_sync_special_registers", "_add", "_subtract", "_set_sub_flags", "_quotient",
        "_float_from_reg", "_float_to_reg", "_set_float_flags", "_effective_address", "read_memory",
-       "write_memory", "_push", "_pop", "_jump", "_validate_executable"]
+       "_read_rom_word", "_rom_if_enabled", "write_memory", "_push", "_pop", "_jump", "_validate_executable"]
 )
 _LOOPS_ALLOWED: dict[type, bool] = {}
 

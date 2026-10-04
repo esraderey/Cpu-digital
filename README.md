@@ -109,14 +109,15 @@ RAM VM32.
 Benchmarks reproducibles: velocidad del intérprete, cobertura del acelerador de
 bucles en código de juego (`vm_programs/juego_raycaster.tasm`, con desglose por
 fase y por bucle), coste de compilar del acelerador, sin y con código
-automodificable, y reparto del tiempo del raycaster con las estimaciones de
-[RFC-EXP-00017](RFC-EXP-00017.md):
+automodificable, bucles que leen la ROM del TNU, y reparto del tiempo del
+raycaster con las estimaciones de [RFC-EXP-00017](RFC-EXP-00017.md):
 
 ```powershell
 .\.venv\Scripts\python.exe benchmarks\benchmark_vm32.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_cobertura.py --frames 20
 .\.venv\Scripts\python.exe benchmarks\benchmark_compilacion.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_automodificable.py
+.\.venv\Scripts\python.exe benchmarks\benchmark_rom.py
 .\.venv\Scripts\python.exe benchmarks\benchmark_dibujo.py
 ```
 

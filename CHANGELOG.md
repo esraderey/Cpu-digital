@@ -34,6 +34,15 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ### 2026-10-02
 
+- `RFC-EXP-00017.md` (propuesto): qué le falta al raycaster de referencia para
+  ir más rápido. El 59,6 % del tiempo se va en las instrucciones que siguen en
+  el intérprete y el 33,0 % en cuatro bucles de dibujo; un núcleo matemático
+  daría como mucho 1,19×. Propone extender el compilador de bucles a varios
+  saltos de vuelta y a regiones con bucles anidados y cuerpos largos, y una
+  unidad de dibujo con un relleno con paso y una columna de textura escalada,
+  y cinco experimentos que pueden descartarlas antes de construirlas; el
+  primero, ya hecho en Python 3.12 y 3.10, no las descarta.
+  `benchmarks/benchmark_dibujo.py` reproduce sus cifras.
 - **Corrección:** el coste de compilar del acelerador de bucles queda acotado
   también en los programas que no escriben en su código. Antes compilaban cada
   bucle a sus 32 saltos y sin espera, así que el coste lo acotaba el tamaño del

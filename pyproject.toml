@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cpu-digital-tramoya"
 version = "2.0.0"
-description = "Runtime VM32 seguro y CPU de 16 bits construidos sobre Tramoya"
+description = "VM RISC de 32 bits embebible y CPU educativa de 16 bits en Python puro sobre Tramoya: gas, snapshots, FPU, fibras, acelerador de bucles y llama2.c."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

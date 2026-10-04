@@ -23,6 +23,11 @@ instrucción a instrucción:
   pudiera, la función devuelve el control en esa instrucción con el estado
   parcial ya escrito, y el intérprete la ejecuta con su validación, su mensaje y
   su rollback. Ninguna instrucción se ejecuta dos veces y ninguna a medias.
+* ``LOAD`` lee la RAM o, como ``_read_rom_word``, la ROM del TNU si la VM tiene la
+  capacidad ``npu`` y un ``TramoyaNeuralUnit`` con ROM. La ROM se consulta en cada
+  entrada, porque el host puede cambiar el TNU entre ejecuciones, y solo con las
+  clases exactas (las capacidades, un ``frozenset``): con subclases, que podrían
+  responder distinto a cada consulta, la lectura la hace el intérprete.
 * Un salto hacia delante tomado dentro del cuerpo fija la posición desde la que
   se sigue ejecutando (``skip``) y descuenta de la vuelta las instrucciones y el
   gas que salta; los bloques anteriores a ``skip`` no se ejecutan.
@@ -39,6 +44,7 @@ import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
+from .tnu import ROM_BASE, TensorROM, TramoyaNeuralUnit
 from .vm32_isa import VM32_ISA, VMOpcode
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -101,6 +107,7 @@ class _Emitter:
         # Con saltos internos, sn/sc acumulan las instrucciones y el gas saltados en la vuelta.
         self.branches = branches
         self.uses_stack = False
+        self.loads = False
 
     def emit(self, line: str) -> None:
         self.lines.append(self.indent + line)
@@ -118,6 +125,9 @@ class _Emitter:
     def write_int(self, dest: int, expr: str, carry: str = "False", overflow: str = "False") -> None:
         # Equivale a _write_result: normaliza a int32 y fija Z/N (C y O según la operación).
         self.emit(f"v = {expr}")
+        self._store_int(dest, carry, overflow)
+
+    def _store_int(self, dest: int, carry: str = "False", overflow: str = "False") -> None:
         target = _dest(dest)
         if target is not None:
             self.emit(f"{target} = v")
@@ -133,10 +143,22 @@ class _Emitter:
         elif opcode in {VMOpcode.MOVI, VMOpcode.LEA}:
             self.write_int(a, f"s32({b})")
         elif opcode == VMOpcode.LOAD:
+            # Equivale a read_memory: la RAM y, fuera de ella, la ROM del TNU como _read_rom_word.
+            # La ventana de la ROM se calcula con la primera lectura fuera de la RAM de cada entrada,
+            # porque el host puede cambiar el TNU entre una ejecución y otra.
             _dest(a)
+            self.loads = True
             e(f"addr = {_reg(b)} + ({c})")
-            self.guard("not (0 <= addr < mem_len)", pc, done, used)
-            self.write_int(a, "mem[addr]")
+            e("if 0 <= addr < mem_len:")
+            e("    v = mem[addr]")
+            e("else:")
+            e("    if rom_end < 0:")
+            e("        rom_end, rom_word = rom_window(vm)")
+            self.indent += "    "
+            self.guard("not ROM_BASE <= addr < rom_end", pc, done, used)
+            e("v = rom_word(addr - ROM_BASE)")
+            self.indent = self.indent[:-4]
+            self._store_int(a)
         elif opcode == VMOpcode.STORE:
             e(f"addr = {_reg(b)} + ({c})")
             # Código (protegido o no) y fuera de RAM: lo resuelve el intérprete.
@@ -348,6 +370,8 @@ def compile_loop(vm: "TramoyaVM32", header: int) -> CompiledLoop | None:
     if emitter.uses_stack:
         prologue.append("    stack = vm._stack; limit = vm.config.stack_limit")
         epilogue.append("    r[15] = r15")
+    if emitter.loads:
+        prologue.append("    rom_end = -1")  # ventana de la ROM aún sin calcular en esta entrada
     source = "\n".join([
         "def run(vm, r, f, mem, mem_len, code_size, gas, budget):",
         "    " + "; ".join(f"r{i} = r[{i}]" for i in range(1, 16)),
@@ -375,10 +399,28 @@ def compile_loop(vm: "TramoyaVM32", header: int) -> CompiledLoop | None:
         "uun": _U32.unpack,
         "inf": float("inf"),
         "sqrt": math.sqrt,
+        "ROM_BASE": ROM_BASE,
+        "rom_window": _rom_window,
     }
     # El código generado sale del bytecode ya decodificado, no de texto externo.
     exec(compile(source, f"<bucle {header}>", "exec"), namespace)
     return CompiledLoop(header, exit_pc, length, cost, backedge, namespace["run"], tuple(exits))
+
+
+def _rom_window(vm: "TramoyaVM32") -> tuple[int, Callable[[int], int] | None]:
+    """Fin de la ventana de la ROM que lee ``_read_rom_word`` y su lector de palabras.
+
+    ``(0, None)``, y la lectura la hace el intérprete, si no hay ROM legible o si el TNU, la ROM o
+    las capacidades no son de su clase exacta (``frozenset`` para las capacidades): el intérprete
+    los consulta en cada lectura y el código compilado solo una vez por entrada, así que una
+    subclase podría distinguirlo, y si la consulta lanzara, el intérprete lo convierte en un
+    fallo de la VM. Por eso los tipos se miran antes de consultar nada."""
+    if type(vm.npu) is not TramoyaNeuralUnit or type(vm.config.capabilities) is not frozenset:
+        return 0, None
+    rom = vm._rom_if_enabled()
+    if type(rom) is not TensorROM:
+        return 0, None
+    return ROM_BASE + rom.words, rom.word
 
 
 def _signed32(value: int) -> int:

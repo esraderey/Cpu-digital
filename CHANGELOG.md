@@ -6,6 +6,32 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
+### 2026-10-03
+
+- **Corrección:** los bucles que leen la ROM del TNU con `LOAD` se aceleran. La
+  guarda de cada `LOAD` del código compilado devolvía el control al intérprete
+  en cualquier dirección fuera de la RAM, también en las lecturas legales de la
+  ROM: el bucle se compilaba, pero cada entrada se detenía en esa lectura (sin
+  avanzar ninguna instrucción si era la primera del cuerpo) y, con la lectura al
+  principio del cuerpo, el bucle tardaba de 1,16 a 1,27 veces lo que sin
+  acelerador. Ahora el código compilado lee la ROM con la regla del intérprete
+  (capacidad `npu` y un TNU con ROM), consultada en cada entrada: un producto
+  escalar con los pesos en la ROM pasa a 0,14–0,15 veces el tiempo del
+  intérprete, como con los pesos en la RAM. Con subclases del TNU o de la ROM, o
+  con capacidades que no sean un `frozenset`, esa lectura la sigue haciendo el
+  intérprete, y sustituir `_read_rom_word` o `_rom_if_enabled` desactiva el
+  acelerador. `vm_programs/llama2.tasm` no cambia: no compila ningún bucle.
+- `benchmarks/benchmark_rom.py`: bucles que leen la ROM, con y sin acelerador,
+  frente a los mismos bucles sobre la RAM, y `llama2.tasm` con stories260K si
+  están los modelos.
+- Pruebas: anclas que cuentan instrucciones aceleradas, entradas al código
+  compilado y lecturas de la ROM del intérprete, y otras de las banderas tras
+  leer la ROM, de subclases y de capacidades que no son un `frozenset`; otra de
+  la simulación de cobertura, que daba por aceleradas esas vueltas; y fuzzing
+  diferencial de 600 bucles que leen la ROM en sus bordes, sin capacidad, sin
+  TNU o sin ROM, y con el TNU cambiado entre ejecuciones. Las que conectan un
+  TNU exigen Python 3.12, como el TNU.
+
 ### 2026-10-02
 
 - **Corrección:** el coste de compilar del acelerador de bucles queda acotado

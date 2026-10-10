@@ -6,6 +6,36 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
+### 2026-10-10
+
+- `RFC-EXP-00018.md` (propuesto, firmado OMRI) y `RFC-EXP-00018-mapa.md`: un hart
+  RV32IMA_Zicsr con modos M/U como clase nueva junto a VM32, que no cambia, con
+  comprobar-y-confirmar en vez de checkpoint por instrucción, dos contadores (gas
+  del host; `instret`/`mcycle` del invitado), horizonte de eventos por bloque
+  compilado, invariante S (`run; snapshot; restore; run ≡ run`), arnés de
+  conformidad bajo corte y modelo de tiempo de cinco etapas; el mapa recoge 99
+  referencias verificadas por un revisor ciego.
+- **Hito H0 del RFC-EXP-00018** (experimentos E1 y E2, sin tocar el núcleo):
+  - E1 (`benchmarks/benchmark_rv32_arranque.py`, `benchmarks/rv32_arranque/`):
+    mini-rv32ima instrumentado arranca Linux 6.1.14 nommu hasta el prompt del
+    shell en 64 929 979 instrucciones (46,6–50,2 M con bases de tiempo más
+    rápidas), de forma determinista; bloque dinámico medio de 6,4 instrucciones,
+    24 % de escrituras, mediana de 292 páginas de 4 KiB escritas por ventana de
+    2²² instrucciones (1,8 % de la RAM). CoreMark compilado con clang cuesta
+    333 625 instrucciones por iteración en rv32im y 845 940 en rv32i, con sus CRC
+    validados. P5 (núcleo nativo) y la meta de H3 (Linux nommu) sobreviven.
+  - E2 (`benchmarks/benchmark_rv32_memoria.py`): los carriles de bytes tal como
+    los describe P1.1 (lectura-modificación-escritura de la palabra) quedan en el
+    umbral de 1,5× del acceso por palabra (1,50–1,56× con máscaras precalculadas,
+    1,69–1,79× recalculándolas); con una vista de bytes por página sobre el mismo
+    `array('i')` cuestan 0,63–0,86× y P1.1 sobrevive con esa redacción. El anillo
+    que deshace instrucciones encarece memcpy/strcpy un 24–32 % según la versión
+    de Python, en el umbral del 25 % o por encima: se retira y queda snapshot más
+    reejecución (P1.10).
+- Pruebas: `tests/test_benchmark_rv32_memoria.py` (la capa de bytes frente a un
+  modelo `bytearray`, cruces de página, extensión de signo, fallos de rango,
+  anillo y umbrales exactos de los veredictos).
+
 ### 2026-10-03
 
 - **Corrección:** los bucles que leen la ROM del TNU con `LOAD` se aceleran. La

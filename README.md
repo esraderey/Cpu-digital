@@ -373,6 +373,10 @@ tiempos eléctricos, cachés, pipelines ni concurrencia de un procesador físico
   bloques y chip neuronal, con sus mediciones y decisiones.
 - [RFC-EXP-00017.md](RFC-EXP-00017.md): propuesta de regiones con bucles anidados
   en el acelerador y de una unidad de dibujo, con sus mediciones.
+- [RFC-EXP-00018.md](RFC-EXP-00018.md): propuesta de un hart RV32 (RISC-V) como
+  clase nueva junto a VM32, con el estado del arte verificado en
+  [RFC-EXP-00018-mapa.md](RFC-EXP-00018-mapa.md) y las mediciones de su hito H0 en
+  [VM32.md](VM32.md).
 - [PLAN_VM32_RAM_EXTRA_100_MB.md](PLAN_VM32_RAM_EXTRA_100_MB.md): propuesta para
   ampliar la RAM de VM32.
 - [CHANGELOG.md](CHANGELOG.md): historial de cambios.

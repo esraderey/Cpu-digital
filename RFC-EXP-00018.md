@@ -1,0 +1,311 @@
+# RFC-EXP-00018 — Un hart RV32 para Tramoya: acercarse a un procesador real de la banda 1988–1999
+
+| Campo | Valor |
+|---|---|
+| Identificador | RFC-EXP-00018 |
+| Estado | PROPUESTO |
+| Fecha | 2026-10-10 |
+| Firmado | OMRI |
+| Relacionado | RFC EXP 00015 (Tramoya VM32: §30 limitaciones, §31 evolución, §32 criterios para abandonar el estado experimental), RFC-EXP-00016 (§P2-lite, §P5 TNU), RFC-EXP-00017 (bucles anidados, unidad de dibujo) |
+| Expedición | ¿Cómo acercar Tramoya VM32 lo más posible a un procesador real, aceptando como objetivo un procesador de hace unas cinco generaciones? |
+
+**Regla de tinta.** En este documento, **HECHO** marca afirmaciones con fuente [R#] (abierta por un explorador y confirmada por un verificador ciego) o con lectura del repositorio [L#]; **PROPUESTA** marca diseño nuestro; **CONJETURA** marca estimaciones sin medir, incluidas las de coste y rendimiento. Nunca se mezclan sin marca. Los huecos del mapa se redactan como «no localizado en el barrido», nunca como inexistencia.
+
+## 1. Resumen
+
+Tramoya VM32 es hoy un simulador de ISA propia: 79 instrucciones de 16 bytes que ningún compilador genera, memoria por palabras, pila fuera de la memoria y un checkpoint por instrucción que limita el intérprete a ~0,55 M instr/s (HECHO [L1][L2]). Un procesador de la banda 1988–1999 (R3000, 486, Pentium P5, ARM7TDMI, ARM920T) es otra cosa: ISA con compilador, modos de privilegio, traps, temporizador, pipeline de cinco etapas y, en casi todos, MMU y cachés (HECHO §2.4). La expedición barrió seis sectores con 99 referencias externas verificadas y 7 lecturas del repositorio, y concluye que la única ISA de esa clase con especificación abierta, compiladores (GCC 7, LLVM 9, rustc Tier 2), bibliotecas C, suite de conformidad con modelo de referencia ejecutable y sistemas operativos que arrancan en una plataforma mínima es RISC-V RV32 (HECHO §2.2, §2.5). Proponemos **P1**, un hart RV32IMA_Zicsr en modos M/U cuyo rollback atómico no necesita checkpoint, porque cada instrucción comprueba antes de confirmar, y cuyo gas, temporizador e interrupciones se resuelven con una sola comparación por bloque compilado; **P2**, un arnés que verifica la conformidad con riscv-tests y ACT4 también bajo corte, snapshot y restauración; y **P3**, un modelo de tiempo del pipeline de cinco etapas plegado en el coste de cada bloque. **P4** (el TNU, el coprocesador vectorial de Tramoya, sobre RV32) queda condicionada al experimento E7, y **P5** (un núcleo nativo certificado desde Python) a E1 y E8. El objetivo medible es arrancar Linux sin MMU, Zephyr y FreeRTOS, y ejecutar CoreMark, Embench y Doom compilados con clang (PROPUESTA §3).
+
+## 2. Estado del arte (del Mapa del Territorio)
+
+Toda afirmación de esta sección es HECHO con fuente [R#] (fuente abierta y leída por un explorador y confirmada por un verificador ciego que buscó la cita literal) o lectura del repositorio [L#]. Las afirmaciones que sostienen el RFC están contrastadas en dos fuentes, una primaria. El método de verificación, la frontera y lo no cubierto están en el Anexo A; el mapa completo se entrega aparte en `RFC-EXP-00018-mapa.md`.
+
+### 2.1 Punto de partida: Tramoya VM32 (HECHO, repositorio)
+
+VM32 ejecuta una ISA propia de 79 instrucciones de 16 bytes, con 16 registros, memoria direccionada por palabra, pila fuera de la memoria, heap que solo crece y gas plano por instrucción; el intérprete rinde ~0,55 M instr/s y los bucles compilados ~5,5 M instr/s [L1][L2]. Cada instrucción copia un checkpoint de 19 campos para poder deshacerla, y el journal de escrituras vive solo durante esa instrucción [L2]. La memoria es paginada sobre `array('i')` con 4 096 palabras por página [L3]. La equivalencia entre intérprete y acelerador se verifica con fuzzing diferencial; el acelerador comprueba el gas por vuelta y devuelve el control en la cabecera cuando no alcanza [L4]. Hay 220 pruebas en CI [L5]. Los saltos son absolutos, las cadenas ocupan una palabra por carácter y el `.tvm` no tiene reubicaciones [L6]. En esta máquina hay clang 21.1 con objetivo `riscv32`, pero no GCC RISC-V, QEMU, Spike ni PyPy [L7]. Ningún compilador existente genera código para la ISA de VM32.
+
+### 2.2 Las ISA reales de la banda y la única con ecosistema abierto completo
+
+RV32I tiene 40 instrucciones de 32 bits fijos con formatos R/I/S/U (más B/J) [R1]; los opcodes custom-0..3 están reservados para extensiones propias y las extensiones estándar futuras no los usarán [R2]. La especificación privilegiada define los modos U/S/M, de los que solo M es obligatorio, con combinaciones M, M+U y M+S+U [R3]; los traps usan `mtvec`, `mepc`, `mcause` y `MRET` [R4]; Sv32 da páginas de 4 KiB con `satp` y `SFENCE.VMA` [R5]. GCC incorporó RISC-V en la serie 7 y acepta `-march=rv32…` con `-mabi=ilp32` [R91][R92]; LLVM lo declaró no experimental en la 9.0 [R93]; rustc da Tier 2 a `riscv32imac-unknown-none-elf` [R6]; picolibc y musl tienen RV32 [R9][R10]. La conformidad se mide con riscv-tests [R7] y con riscv-arch-test, cuyo framework ACT4 sustituye a RISCOF y calcula los resultados esperados con el modelo de referencia Sail; la propia página aclara que no son pruebas de verificación completas [R8].
+
+Las otras cuatro ISA de la banda tienen compilador (GCC acepta `-march=armv4t`, `-march=mips1`, `-march=i486` y `-m68020` [R95][R98][R100][R102]) y documentación descargable (TRM del ARM7TDMI con reproducción sujeta a permiso escrito [R96]; Intel SDM sin licencia declarada en la página [R99]; M68000PRM de 1992 [R101]), pero MIPS Open se cerró en 2019 y MIPS declaró en 2021 el fin del desarrollo de la arquitectura [R97], y para MIPS, IA-32 y m68k no se localizó ninguna suite pública de conformidad pese a consultas dirigidas (cota del barrido). ARM admite hasta 16 coprocesadores con CDP/LDC/STC/MRC/MCR [R96]; MIPS, hasta cuatro coprocesadores con CP0 de sistema y COP2/COP3 definidos por la implementación [R11][R97]; m68k, la línea F [R101]; x86, los opcodes ESC del 80x87 [R12].
+
+### 2.3 Cuánto rinde cada técnica de emulación
+
+| Técnica | Ejemplo | Cifra | Fuente |
+|---|---|---|---|
+| Simulador de conjunto de instrucciones (ISS) en Python, alojado en un intérprete Python | Pydgin RISC-V | ~100 mil instr/s | [R17] |
+| Python puro, CPU de 8 bits | 6502 | ≈0,5–0,85 MHz (CPython), ≈2 MHz (PyPy) | [R25] |
+| RPython traducido a C sin JIT | Pydgin RISC-V | 10 MIPS | [R17] |
+| Intérprete C optimizado (predecodificación, TLB software) | Spike | 40–200 MIPS | [R17][R23] |
+| Intérprete C con caché de bloques | ISS JKU 2025 | 406,97 MIPS | [R22] |
+| RPython con JIT de metatrazas | Pydgin | 90–750 MIPS | [R17][R16] |
+| Traducción dinámica | QEMU TCG | 240–1 220 MIPS (ARMv5) | [R15][R16] |
+| Simulador detallado | gem5 atómico | 2–3 MIPS | [R18] |
+
+mini-rv32ima arranca Linux nommu con ~400 líneas de C y ~450 CoreMark (≈½ de QEMU) [R13]; rv32emu combina intérprete y JIT por niveles y arranca Linux RV32 [R20]. QEMU, según los autores de Pydgin, solo mantiene fiel el estado arquitectónico por bloque, no por instrucción [R16]. No se localizó ningún emulador de ISA real de 32 bits en Python puro con cifras publicadas (cota del barrido): VM32, a 0,55 M instr/s, ya supera al único ISS Python alojado del mapa [L1][R17].
+
+### 2.4 Qué era microarquitectónicamente un procesador de la banda
+
+El R3000 (1988) tiene pipeline de 5 etapas, TLB en el coprocesador de control y cachés externas [R29]; el 486 (1989), 5 etapas de un ciclo, 8 KiB de L1 unificada y FPU integrada, con ~1,8 ciclos por instrucción medidos frente a 1 ideal [R27]; el Pentium P5 (1993), dos pipelines en orden U y V, BTB y cachés de 8 KiB + 8 KiB [R28]; el ARM920T, 5 etapas Harvard con 16 KiB + 16 KiB y MMU [R30]. El pipeline RISC clásico IF/ID/EX/MEM/WB con bypass y ranura de retardo es el modelo canónico [R32]. En simulación, el modelo one-IPC cuenta instrucciones y simula cachés con predicción perfecta; el modelo de intervalos queda dentro del 25 % de error y es 2–3× más lento que one-IPC; activar la I-cache añade ~50 % de tiempo; los simuladores cycle-accurate industriales van a 1–10 kHz [R39]. ZSim alcanza 90 MIPS con IPC=1 más cachés y 20 MIPS con OOO detallado [R38]; SMARTS muestrea con 0,64 % de error en CPI y 35–60× de aceleración [R40]. Sodor ofrece núcleos RV32I de 1, 2, 3 y 5 etapas con memoria de un ciclo, y su núcleo de una etapa «es en esencia un simulador de ISA» [R36].
+
+### 2.5 Qué software real arranca sobre un RV32 mínimo
+
+Linux mainline compila para RV32 sin MMU con el kernel en modo M (`RISCV_M_MODE` depende de `!MMU` y selecciona `CLINT_TIMER`) [R42][R43][R44]; mini-rv32ima lo arranca con CLINT (el temporizador e interruptor local del núcleo), MMIO, UART y DTB (árbol de dispositivos) [R13], con ≈15,75 MiB de RAM en un registro de arranque [R45] y ≈17,9 s de reset a shell en un ESP32-P4 [R46]. Con MMU, Buildroot ofrece `qemu_riscv32_virt` desde 2019 [R44] y VexRiscv «linux balanced» (RV32IMA + MMU, 2,27 CoreMark/MHz) es compatible con Linux [R47]. xv6-riscv upstream exige riscv64 [R48] y mapea UART0, VIRTIO0, CLINT y PLIC en direcciones fijas con 128 MiB de RAM [R49]; existe una adaptación comunitaria a rv32ia [R50]. Zephyr elige RV32I como base y las extensiones por devicetree [R51]; FreeRTOS exige `mtime`/`mtimecmp` [R52]. CoreMark hace toda su E/S y su tiempo por la capa de portado y no exige libc [R55]; Embench cabe en 64 kB [R56]; doomgeneric pide cinco funciones de plataforma [R57]. El número de instrucciones hasta el prompt de Linux no se localizó en el barrido.
+
+### 2.6 Cómo consiguen otros determinismo, gas, snapshots y verificación
+
+QEMU exige icount para record/replay, registra solo los eventos no deterministas y hace la depuración inversa cargando el snapshot más cercano y reejecutando [R59]; rr ancla al contador de ramas retiradas con <2× de sobrecoste [R60]. wasmtime separa fuel (determinista, más caro) de epochs (~10 %, por reloj de pared) [R62]; la EVM fija coste por opcode [R63]; eBPF acota por análisis estático con límite de un millón de instrucciones [R64][R65]. savevm/loadvm comparten la infraestructura de migración con VMState versionado [R66]; CRIU usa soft-dirty [R67]; gem5 guarda `cpt.<tick>` [R68]. La verificación contra referencia por prueba diferencial es el método común: riscv-dv cosimula con Spike [R70]; TheHuzz halló 11 bugs [R72]; QEMU frente a 4 dispositivos ARM dio 155 642 flujos inconsistentes y 4 bugs [R73]; Cascade halló 37 bugs (28 CVE) en 5 CPU [R71]. Ningún sistema del mapa junta gas determinista por instrucción, rollback atómico, snapshots y capacidades sobre una ISA real (cota del barrido).
+
+### 2.7 Coprocesadores vectoriales y neuronales
+
+RVV define 32 registros v0–v31 con `vl`/`vtype`; Zve32x y Zve32f incluyen todo el conjunto vectorial de enteros [R74]; QEMU y LLVM los implementan, LLVM solo con VLEN≥64 [R76][R77]. QEMU ejecuta RVV con helpers que recorren elemento a elemento [R89]. El KPU del K210 se programa por registros MMIO y DMA [R83]; T-Head MME es una unidad matricial independiente con ocho registros 2D [R84]; SiFive VCIX es un coprocesador por interfaz de instrucciones [R77]. Chipyard documenta la disyuntiva: RoCC (instrucciones custom) exige toolchain propia; MMIO usa la toolchain estándar con un driver [R88]. Nadie del mapa fija la semántica numérica bit a bit de un coprocesador ni evalúa ISA frente a MMIO por grano de rollback, tamaño de snapshot o validez del oráculo de cosimulación (cota del barrido).
+
+### 2.8 Frontera (cotas del barrido con consulta asesina ejecutada)
+
+- F1. Emulador de ISA real de 32 bits en Python puro con cifras publicadas: no localizado.
+- F2. ISA real bajo gas determinista, rollback atómico por instrucción, snapshots y capacidades en un solo sistema: no localizado; las piezas existen por separado [R59][R62][R63].
+- F3. Modelo de tiempo (one-IPC más cachés) dentro de un emulador en Python: no localizado; los costes medidos son de C++ [R39].
+- F4. Coprocesador vectorial determinista bit a bit sobre una ISA real: no localizado.
+- F5. Emulador en Python que pase riscv-arch-test: no localizado.
+- F6. Linux nommu RV32 arrancado por un emulador en Python, y número de instrucciones hasta el prompt: no localizados.
+- F7. Sobrecoste numérico de icount/record-replay de QEMU y del fuel de wasmtime: no localizados.
+
+## 3. Propuestas
+
+Las propuestas salen de nueve candidatas de tres innovadores independientes, cada una criticada por dos revisores ciegos al autor, y todas fusionadas por causa raíz (§4 recoge lo derribado y su residuo).
+
+### P0. Decisiones previas (PROPUESTA sobre HECHOS de §2)
+
+1. **ISA objetivo: RV32IMA_Zicsr con modos M y U; la extensión F queda para después.** De las cinco ISA de la banda, solo RISC-V reúne especificación abierta, tres compiladores, dos bibliotecas C, una suite de conformidad con modelo de referencia ejecutable y sistemas operativos que arrancan en una plataforma de tres dispositivos (HECHO §2.2, §2.5). ARM y x86 tienen compilador, pero su documentación lleva condiciones; para x86, MIPS y m68k no se localizó suite pública de conformidad y para ARM no se buscó; MIPS está discontinuada; m68k no figura entre los objetivos oficiales de LLVM (HECHO §2.2).
+2. **Qué significa «cinco generaciones atrás» aquí.** No es emular un 486 ni un Pentium: su ISA es otra y su CPI medido (~1,8) nace de la memoria y las cachés, que no vamos a modelar con exactitud (HECHO [R27][R39]). Es alcanzar la clase arquitectónica de la banda (modos de privilegio, traps, temporizador, UART, software real compilado) y la clase microarquitectónica de su núcleo, un pipeline escalar en orden de cinco etapas como el R3000 y el ARM920T (HECHO [R29][R30][R32]). Hoy VM32 está en la clase de Sodor de una etapa, «en esencia un simulador de ISA» (HECHO [R36]).
+3. **VM32 se conserva como clase heredada**, con su ISA, su gas y sus programas; el hart RV32 es una clase nueva que reutiliza la memoria paginada, el journal, los snapshots, las capacidades y el arnés diferencial (HECHO [L3][L4]). No se tira código: se deja de ampliar la ISA propia.
+4. **Toolchain.** clang 21.1 con `--target=riscv32-unknown-elf -march=rv32im -mabi=ilp32` está disponible en la máquina del proyecto (HECHO [L7]); GCC RISC-V, QEMU y Spike no. Los experimentos se diseñan para compilar con clang y ejecutar sobre el propio prototipo; los binarios y firmas de ACT4 se versionan para no depender de una toolchain GNU en la CI (CONJETURA: ACT4 puede exigir `riscv-gcc`; véase R-5 en §5).
+
+### P1. Hart RV32 con atomicidad estructural y horizonte de eventos (PROPUESTA)
+
+**Mecanismo.**
+
+1. *Memoria por bytes sobre el almacén paginado.* Se conserva `PagedMemory` [L3] y se añade una capa de direcciones con carriles little-endian: `lb`/`lh`/`lw` extraen de la palabra; `sb`/`sh` leen, modifican y reescriben una palabra; un acceso desalineado toca como mucho dos palabras y se resuelve «en hardware» (la especificación lo deja a la implementación, CONJETURA). El journal, las páginas materializadas bajo demanda y los snapshots v2 no cambian. La pila (`sp`), el heap (el `malloc` de picolibc [R9]) y el código comparten memoria; desaparecen la pila como lista de Python y `_sys_alloc` [L2].
+2. *Comprobar y confirmar.* Cada manejador calcula, valida (alineación, permiso, capacidad, gas) y solo entonces escribe. En RV32IMA_Zicsr una instrucción confirma como mucho un registro y una dirección o un CSR, salvo `CSRRW` (registro y CSR) y la entrada en trap (`pc`, `mepc`, `mcause`, `mtval`, `mstatus`), que se tratan como escrituras múltiples con orden fijo (CONJETURA sobre la ISA; se verifica con P2). Una excepción nunca deja estado parcial. El `_core_checkpoint` de 19 campos por instrucción [L2] desaparece: la atomicidad es estructural, no por copia.
+3. *Dos contadores, no uno.* `gas` mide el coste del host y lo fija la tarifa de Tramoya; `instret`/`mcycle` miden el tiempo del invitado y alimentan `mtime` del CLINT, que Linux en modo M selecciona [R42] y FreeRTOS exige [R52]. `WFI` adelanta el tiempo del invitado hasta el siguiente evento sin consumir gas: un bucle ocioso del sistema operativo no quema CPU del host. Un único contador para ambas cosas se descartó (§4).
+4. *Horizonte de eventos.* H = mín(presupuesto de gas, `mtimecmp` si su interrupción está habilitada, próxima entrada programada del log de reproducción). Los bloques básicos se compilan a funciones Python con la técnica de `vm32_loops` [L4]: registros en variables locales que se vuelcan al salir, corte en salto, CSR, `ECALL`, `MRET`, `WFI` y `FENCE.I`, longitud máxima 32. Un bloque entra solo si su coste cabe en H menos lo consumido; si no, su cola se ejecuta instrucción a instrucción. Así el agotamiento de gas, la interrupción del temporizador y la entrada del host caen en la frontera exacta de una instrucción, lo que QEMU no garantiza (HECHO [R16]).
+5. *Una sola salida lenta.* Dentro del bloque, cualquier instrucción que pueda fallar o tocar un dispositivo (dirección fuera de RAM, desalineada, sin permiso, ventana MMIO; nada de esto se conoce al compilar, porque la dirección vive en un registro) provoca una salida lateral *antes* de ejecutarse: se vuelcan los registros modificados hasta ese punto (lista estática por punto de salida), se devuelve el gas del sufijo y el intérprete ejecuta esa instrucción con comprobar-y-confirmar. Los efectos de dispositivo y los traps solo los produce el intérprete, una vez.
+6. *Invalidación por generación de página.* Cada store incrementa la generación de su página; la caché de predecodificación y de bloques compara la generación al entrar. No basta invalidar en `FENCE.I`: con código automodificable sin `FENCE.I`, el intérprete relee la memoria y el bloque compilado ejecutaría la traducción vieja, y la caché, que no entra en el snapshot, haría que restaurar cambiara el comportamiento (§4). Con generación por página las cachés son invisibles para el invitado y `FENCE.I` es coherente sin coste extra.
+7. *Invariante S.* `run(B1); snapshot; restore; run(B2)` es idéntico bit a bit a `run(B1+B2)` en registros, CSR, memoria, gas, `instret` y salida, para cualquier corte B1. Es la propiedad que define el diseño y lo que P2 verifica. Para que se cumpla, todo estado del hart (incluida la reserva LR/SC y el privilegio) entra en el snapshot y toda caché derivada se declara.
+8. *Libertades fijadas.* `SC` nunca falla de forma espuria; la legalización WARL es fija; los campos no implementados leen cero (`mvendorid`/`marchid` pueden devolver 0 [R4]). Son elecciones permitidas (CONJETURA sobre la especificación; se contrastan con Sail en P2).
+9. *Capacidades como ventanas MMIO.* Cada capacidad de Tramoya (`io`, `random`, `memory_chip`, `npu`) es un dispositivo mapeado que solo existe si la capacidad está concedida; tocarlo sin ella es un access fault preciso, que el invitado puede manejar. Las entradas no deterministas (UART, aleatorio) se registran con su `instret` y se reproducen alimentando el log (el patrón de QEMU y rr, HECHO [R59][R60]). La alternativa SBI queda para una fase 2 con modo S (§4).
+10. *Rollback.* El de la instrucción en curso sale gratis por el punto 2. Retroceder N instrucciones es snapshot más reejecución determinista, como la depuración inversa de QEMU (HECHO [R59]). Un anillo de deshacer de tamaño variable queda como opción medible, no como requisito.
+11. *Plataforma mínima.* CLINT (`mtime`, `mtimecmp`), UART de un carácter, DTB generado desde la configuración, RAM desde 0x80000000. Es lo que arranca Linux nommu en mini-rv32ima (HECHO [R13][R42]) y lo que piden FreeRTOS y Zephyr [R51][R52].
+
+**Qué se conserva y qué se tira.** Se conservan `memory.py`, el journal, los snapshots, las capacidades y el arnés diferencial [L3][L4][L5]. Para invitados RV32 se tiran el formato de 16 bytes, la pila como lista, el heap de puntero, la tabla de gas de la ISA propia y las fibras del host: los hilos son cosa del sistema operativo invitado.
+
+**Novedad frente al mapa.** F2 registra las piezas por separado: icount, fuel, gas de la EVM, savevm [R59][R62][R63][R66]. Esta propuesta rechaza dos supuestos que el mapa transmite: que medir de forma determinista salga caro (en wasmtime el fuel cuesta más que las epochs, que no son deterministas [R62]) y que la fidelidad por instrucción exija checkpoints ([L2]; QEMU solo es fiel por bloque [R16]). Si todo evento asíncrono está programado en tiempo de instrucciones, la exactitud por instrucción cuesta una comparación por bloque, y la atomicidad estructural sustituye al checkpoint. Ningún sistema del mapa enuncia el invariante S como propiedad comprobable.
+
+**Coste (CONJETURA).** 6–9 semanas-persona y 3 000–4 500 líneas: ~65 instrucciones (RV32I aporta 40 [R1]; M, A y Zicsr el resto), CSR de M/U, traps, CLINT, UART, capa de bytes, compilador de bloques y pruebas. Fases: H1 RV32I con bloques y horizonte, CoreMark por UART (E3); H2 riscv-tests e invariante S (E4, E5); H3 M, A, Zicsr, CLINT, DTB y arranque de FreeRTOS, Zephyr y Linux nommu (E1 fija la expectativa).
+
+**Riesgos.** R-1: RV32 necesita más instrucciones que la ISA de 16 bytes para el mismo trabajo, y el intérprete puede quedar por debajo de los 0,55 M instr/s actuales (CONJETURA; E3 lo mide). R-2: los bloques cortos diluyen la ganancia (E1 mide la longitud dinámica de bloque en un arranque real). R-3: la capa de bytes encarece `lb`/`sb` frente al acceso por palabra (E2). R-4: dos semánticas, intérprete y bloques, pueden divergir; la mitigación es P2.
+
+### P2. Arnés de equivalencia bajo corte: conformidad fragmentada, inventario de estado y oráculo de recursos (PROPUESTA)
+
+**Mecanismo.**
+
+1. *Pase base.* rv32ui, rv32um, rv32ua y rv32mi de riscv-tests [R7] y ACT4 con las firmas esperadas calculadas por Sail [R8], con binarios y firmas versionados en el repositorio.
+2. *Pase fragmentado.* Cada prueba se repite con K cortes. En cada corte: parada exacta por gas, snapshot, serialización, restauración en una VM nueva y continuación; variante: retroceso de r instrucciones por snapshot y reejecución. La firma final debe coincidir con la del pase base. Los cortes se sesgan hacia el estado que suele perderse: reserva LR/SC, AMO, escrituras de CSR, entrada y salida de trap, `MRET`, `WFI`, interrupciones pendientes e interior de los bloques compilados; se compara su sensibilidad con cortes uniformes.
+3. *Hash incremental.* h(estado) = hash de registros, `pc`, CSR, privilegio y reserva, más un XOR de h(dirección, valor) por palabra de memoria, actualizado en cada store (calcular el hash solo del valor cancelaría un intercambio entre dos direcciones). Emitido por instrucción en modo diagnóstico, localiza la primera divergencia sin bisección.
+4. *Oráculo de recursos.* Un recalculador independiente (~100 líneas) suma sobre la bitácora la tarifa de gas y la de ciclos de P3; lo que declara la VM debe coincidir. Sail juzga la proyección arquitectónica; el recalculador, la de recursos.
+5. *Puerta estática de inventario.* Por introspección, cada campo de la CPU, de los dispositivos y de los bloques compilados figura en el esquema del snapshot o en una lista blanca de cachés derivadas con su regla de invalidación (predecodificación, bloques, generaciones de página). Un campo nuevo sin clasificar pone la CI en rojo. Esta puerta cierra el agujero de inducción de P5.
+6. *Fuzz diferencial bajo corte.* El fuzzing intérprete frente a bloques de [L4] se extiende a RV32 con gas y plazos de temporizador aleatorios: es el invariante S de P1 convertido en prueba.
+
+**Novedad frente al mapa.** El mapa recoge conformidad de ejecuciones enteras [R7][R8], cosimulación [R70], fuzzing [R71][R72] y reproducción [R59][R60]. Nadie mide la conformidad de la ejecución interrumpida y restaurada, que es justo lo que promete F2. Ejemplo: si la restauración pierde la reserva LR/SC, el `SC` siguiente falla y la traza diverge aunque todo pase ACT. La afirmación queda acotada: ACT aporta evidencia sobre su conjunto de pruebas, no verificación completa (HECHO [R8]).
+
+**Coste (CONJETURA).** 2–4 semanas-persona y 800–1 300 líneas. No se tira nada; las 220 pruebas [L5] siguen. Al ritmo actual (0,55 M instr/s [L1]): K=8 en cada PR y K=64 en la ejecución nocturna.
+
+**Riesgos.** ACT4 puede exigir una toolchain GNU para generar las pruebas (R-5; mitigación: versionar ELF y firmas). Las trazas múltiples que admite la especificación (valores no especificados) obligan a fijar y documentar una elección determinista (P1.8).
+
+### P3. Tiempo compilado de la banda: pipeline de cinco etapas plegado en el coste del bloque (PROPUESTA)
+
+**Mecanismo.**
+
+1. *Descriptor paramétrico* de un pipeline escalar en orden de cinco etapas con bypass: penalización carga-uso, etapa de resolución de saltos, latencias de MUL y DIV, memoria de un ciclo. Es el modelo canónico [R32] y la clase del R3000 y del ARM920T [R29][R30]. Se retira toda pretensión sobre el 486 o el P5: su pipeline y su emparejamiento U/V están definidos sobre x86 y no tienen verdad de referencia para un flujo RV32 [R27][R28].
+2. *Planificación en la traducción.* Cada bloque se planifica simbólicamente con un marcador de disponibilidad de registros; sale un coste en ciclos para la salida secuencial y otro para la tomada. Lo que cruza un borde de bloque (el `rd` de una carga final, el «ocupado hasta» del divisor) se lleva como estado dinámico explícito, que entra en el snapshot: así el coste no depende de cómo se partió el código en bloques ni de dónde cayó un corte por gas, y el invariante S se mantiene también en `mcycle` (§4 explica por qué una tarifa puramente estática lo rompía).
+3. *El intérprete lleva el mismo marcador de forma dinámica*, de modo que la igualdad de ciclos entre bloques e intérprete se verifica con el fuzzing de P2.6.
+4. *Cachés y predicción como perfilador opcional*, fuera del gas: I-cache por bloque (un bloque de 32 instrucciones ocupa 4–5 líneas de 32 B [R30]), D-cache por acceso con ventanas de muestreo deterministas (hash de `instret` y semilla) a la manera de SMARTS [R40]. `mcycle` con cachés es aproximado pero determinista.
+5. *`mtime` del CLINT* puede derivarse de `mcycle` dividido por un factor configurable, para un temporizador verosímil a la frecuencia elegida. La configuración del descriptor va en la cabecera del snapshot.
+
+**Novedad frente al mapa.** Los costes del mapa son de modelos dinámicos en C++: intervalos 2–3× más lentos que one-IPC, I-cache +50 %, Sniper a 2 MIPS [R39]. Al mapa se le escapa que la banda elegida es lo que abarata el tiempo: un pipeline escalar en orden se planifica estáticamente salvo por las cachés, y el coste pasa de cada instrucción a la traducción. Con un modelo fuera de orden como O3CPU [R34] esto no sería posible.
+
+**Coste (CONJETURA).** 2–4 semanas-persona y ~800 líneas sobre P1. No se tira nada.
+
+**Riesgos.** Sin tablas de latencias históricas (Anexo A, no cubierto), el modelo se calibra contra una implementación moderna de la misma clase (VexRiscv, 2,27 CoreMark/MHz [R47]) y no contra silicio de la época; comparar con Sodor sería circular (dos modelos idealizados con memoria de un ciclo [R36]).
+
+### P4. El TNU sobre RV32: semántica numérica fijada, reanudación y vía decidida por experimento (PROPUESTA condicionada a E7)
+
+Dos innovadores propusieron vías opuestas (instrucción `custom-0` síncrona y reanudable; dispositivo MMIO con «lectura en el plazo») y la crítica cruzada refutó los argumentos de asimetría de ambas: tanto una instrucción custom como un dispositivo escriben el destino fuera del modelo Sail y pasan por el journal. Lo que sobrevive es común a cualquier vía:
+
+1. *Semántica numérica fijada.* El producto escalar se define como `f32(fsum(f64(wᵢ)·f64(xᵢ)))`: productos exactos en doble precisión, suma correctamente redondeada, un solo redondeo final. `exp` para softmax y SiLU usa un polinomio propio en lugar de `math.exp`, que depende de la libm del host (HECHO [L1]: VM32.md ya declara que la igualdad bit a bit entre sistemas operativos no está garantizada). El oráculo del fuzzing es un modelo con `Fraction`.
+2. *Gas analítico declarado.* Cada fila cuesta ⌈n/P⌉ + c, con P un ancho MAC virtual declarado; la velocidad del host nunca entra en el gas. Sustituye a la calibración empírica, que ya no cumple su objetivo (HECHO: nota del repositorio sobre la recalibración pendiente, RFC-EXP-00016 §P5).
+3. *Reanudación por fila.* Un CSR `tstart`, análogo a `vstart` de RVV [R89], guarda la siguiente fila; entre filas se consulta el horizonte de P1. Un snapshot a mitad de una matriz es válido y guarda solo el descriptor (operación, regiones, fila), no datos.
+4. *Tres criterios de evaluación* que el mapa no usa: grano del rollback, tamaño del snapshot y validez del oráculo de cosimulación.
+5. *Vía abierta, decidida por E7* entre (a) Zve32f estándar con orden de reducción fijado por la implementación, que da intrínsecos y compilador gratis [R74][R77][R78]; (b) `custom-0` con descriptor en memoria y `.insn` [R2]; (c) MMIO con lectura en el plazo, que solo compensa si el invitado puede solapar trabajo entre la emisión y el primer uso del resultado. La especulación nativa sobre el journal se retira (§4).
+
+**Coste (CONJETURA).** 3–5 semanas-persona y 600–1 000 líneas, más ~300 de driver en C para llama2.c compilado con clang. Se tiran las 18 codificaciones del TNU en la ISA propia; se conservan sus núcleos.
+
+### P5. Núcleo nativo opcional certificado por ventanas (PROPUESTA condicionada a E1 y E8)
+
+1. Un núcleo en C de la clase de mini-rv32ima [R13] con la semántica de P1 y su tarifa, compilado opcionalmente. Los intérpretes C rinden 40–407 MIPS [R17][R22][R23], frente a 0,55 M instr/s de Python [L1] (CONJETURA: un núcleo con rastreo de páginas sucias por store no heredará esa cifra entera).
+2. Cada W instrucciones (p. ej. 2²²) y en cada entrada del host, el núcleo emite un fotograma: inventario completo de estado según la puerta de P2.5, páginas de 4 KiB escritas en la ventana con su imagen posterior, y entradas no deterministas consumidas. Cada 64 fotogramas, la RAM completa.
+3. El hart Python de P1 reconstruye el estado de cada ventana y la reejecuta; si todas coinciden, por inducción la ejecución nativa es la de la especificación Python. Las ventanas son independientes y se certifican en P procesos.
+4. El núcleo nativo es un ejecutor rápido verificado a posteriori, no una vía de ejecución con garantía propia; el muestreo de ventanas se declara prueba de humo, no garantía (SMARTS estima medias, no universales [R40]).
+
+**Novedad frente al mapa.** La cosimulación del mapa es serial y en lockstep [R70]; nadie usa los fotogramas de un motor rápido para que uno lento y normativo certifique la ejecución entera en paralelo. «Python puro» pasa de significar «ejecutar en Python» a «la especificación ejecutable que certifica».
+
+**Coste (CONJETURA).** ~1 900 líneas de C y ~700 de Python, 6–7 semanas-persona. Añade compilación C opcional a la CI [L5].
+
+### Orden de construcción (PROPUESTA)
+
+| Hito | Contenido | Experimentos previos | Sale de |
+|---|---|---|---|
+| H0 | E1 y E2 sin tocar el núcleo | — | §5 |
+| H1 | RV32I, bloques, horizonte, UART; CoreMark y Embench con clang | E3 | P1 |
+| H2 | riscv-tests, ACT4 versionado, invariante S, inventario | E4, E5 | P2 |
+| H3 | M, A, Zicsr, traps M/U, CLINT, DTB; FreeRTOS, Zephyr, Linux nommu | E1 | P1 |
+| H4 | Tiempo compilado y validación contra VexRiscv | E6 | P3 |
+| H5 | TNU sobre RV32; llama2.c compilado | E7 | P4 |
+| H6 | Núcleo nativo certificado | E8 | P5 |
+| H7 (fase 2) | Modo S, Sv32, SBI como capacidades; Linux con MMU, xv6-rv32 | conteo de E1 para la imagen MMU | §4 residuo de A2 |
+
+## 4. Alternativas consideradas
+
+Cada línea: qué se propuso, por qué cayó en la crítica cruzada y qué residuo útil dejó.
+
+- **Modo S + Sv32 + SBI como primera fase (A2).** Cayó: casi todo está en el mapa (Linux en modo S sobre SBI [R42][R44], TLB software en Spike [R17][R23]); su «plataforma sin UART ni PLIC» contradice los objetivos xv6 y virt [R44][R49]; arrastra todo el modo S con el número de instrucciones hasta el shell desconocido (F6). Residuo: SBI como mecanismo de capacidades con log de reproducción, alternativa a las ventanas MMIO en H7; el conteo de instrucciones se fusionó en E1.
+- **TNU como «tercera vía» custom-0 (A3).** Cayó como novedad: una instrucción síncrona reanudable es `vstart` de RVV con otro opcode [R89], y Zve32f ya está en QEMU y LLVM [R76][R77]. Residuo: semántica numérica fijada, gas analítico y reanudación, en P4.
+- **TNU asíncrono con especulación validada por el journal (C3).** Cayó en su forma asíncrona: en Python puro la operación se calcula de una vez con la misma latencia que una instrucción monolítica; la especulación exige un núcleo nativo y un journal que hoy vive solo una instrucción [L2]. Residuo: lectura en el plazo como vía (c) de P4, snapshot por descriptor y los tres criterios de evaluación.
+- **Un solo contador para gas, `mcycle` y `mtime` (A1, C1).** Cayó: el tiempo ocioso de `WFI` y los pesos por clase de instrucción lo rompen; una cantidad no puede ser a la vez reloj fiel del invitado y medida del coste del host. Residuo: dos contadores (P1.3).
+- **Tarifa de pipeline puramente estática por bloque (C1).** Cayó: el coste dependía de la partición en bloques, y el presupuesto del host mueve los cortes, con lo que `run(B1); restore; run(B2)` ≠ `run(B1+B2)`. Residuo: estado de riesgo entre bloques dinámico y en el snapshot (P3.2).
+- **Memoria plana en `bytearray` (B1).** Cayó: pierde la materialización bajo demanda, los snapshots paginados y el journal [L1][L3]. Residuo: carriles de bytes sobre el almacén paginado (P1.1).
+- **Invalidar la caché de traducción solo en `FENCE.I` (B1).** Cayó: con código automodificable sin `FENCE.I` el intérprete y los bloques divergen, y la caché, fuera del snapshot, hace que restaurar cambie el comportamiento. Residuo: generación por página (P1.6).
+- **Validar el modelo de tiempo contra Sodor (B3, C1).** Cayó por circular: dos modelos con memoria de un ciclo [R36]. Residuo: igualdad exacta con el marcador dinámico del intérprete y contraste con VexRiscv (E6).
+- **Muestreo de ventanas como garantía (B2).** Cayó: SMARTS estima una media [R40]; un fallo de una sola ventana se detecta con probabilidad igual a la fracción muestreada. Residuo: prueba de humo (P5.4).
+- **Otras ISA de la banda como objetivo.** No se derribaron en F5 sino en el mapa: sin suite pública de conformidad localizada (MIPS, IA-32, m68k), documentación con condiciones (ARM, Intel), arquitectura discontinuada (MIPS) o fuera de los objetivos oficiales de LLVM (m68k) (HECHO §2.2).
+
+## 5. Riesgos, costes y experimentos asesinos
+
+Ordenados por coste ascendente dentro de sus dependencias: cada experimento solo necesita lo que producen los anteriores. Cada uno nombra la cifra que mata la propuesta. Todos pueden ejecutarse en la máquina del proyecto con clang y Python (HECHO [L7]); E1 necesita compilar un programa en C.
+
+- **E1 — Contar el arranque (horas; sin tocar el núcleo).** Instrumentar mini-rv32ima [R13] (~60 líneas de C) para contar, en el arranque de Linux nommu hasta el shell y en CoreMark: instrucciones totales, longitud dinámica media de bloque básico, fracción de stores y de bloques que terminan en store, y páginas de 4 KiB escritas por ventana de 2²² instrucciones. Da la cifra que falta en F6. **Mata**: P5 en modo completo si el arranque supera 2,6·10⁹ instrucciones (4 procesos a 0,55 M instr/s en 20 minutos de CI) o si la mediana de páginas sucias por ventana pasa del 10 % de la RAM; rebaja la meta de H3 a Zephyr y FreeRTOS si el arranque de Linux supera 10⁹ instrucciones (≈30 min a 0,55 M; CONJETURA el orden de magnitud).
+- **E2 — Microbanco de memoria y anillo (1–2 días).** Sobre el intérprete actual: `memcpy`/`strcpy` con carriles de bytes sobre `array('i')` frente a acceso por palabra, y anillo de deshacer encendido frente a apagado. **Mata** P1.1 si el acceso por byte cuesta más de 1,5× el acceso por palabra; retira el anillo si cuesta más del 25 %.
+- **E3 — Prototipo RV32I con bloques y horizonte (1 semana, ~600–800 líneas).** CoreMark compilado con `clang --target=riscv32-unknown-elf -march=rv32i`, E/S por UART MMIO, en tres modos: intérprete comprobar-y-confirmar, bloques sin horizonte, bloques con horizonte. **Mata** P1 si los bloques con horizonte no duplican al intérprete, o si el intérprete queda por debajo de 0,4 M instr/s (regresión del 25 % frente a VM32 [L1]); el horizonte se retira si cuesta más del 10 % frente a bloques sin horizonte. Meta informativa: 5,5 M instr/s en bucles internos [L1].
+- **E4 — Invariante S bajo cortes (días, sobre E3).** 1 000 cortes por programa, sesgados a LR/SC, entrada en trap, escritura de `mtimecmp` y `WFI`, con snapshot, restauración y comparación del hash de P2.3 y de `mcycle`. **Mata** P1 (y P3) si aparece una divergencia que solo se cure reintroduciendo el checkpoint por instrucción o un coste que dependa de la partición.
+- **E5 — riscv-tests y ACT4 (1–2 semanas).** rv32ui/um/ua/mi [R7] y ACT4 con firmas Sail [R8], enteros y fragmentados con K=64. Mutantes de restauración errónea (campo presente pero mal restaurado; bloque compilado no invalidado) filtrados por vivacidad. **Mata** P2 si el fragmentador detecta menos del 90 % de los mutantes vivos o si los cortes sesgados no superan a los uniformes.
+- **E6 — Fidelidad del tiempo (días, sobre H4).** Igualdad exacta de `mcycle` entre bloques e intérprete bajo los cortes de E4; CoreMark/MHz del descriptor ajustado a VexRiscv RV32IMA frente a sus 2,27 publicados [R47]. **Mata** P3 si el error supera el 25 % (el margen del modelo de intervalos [R39]) o si los contadores frenan los bloques más de un 10 %.
+- **E7 — Vía del TNU (días, sobre H3).** Con stories15M: tokens/s del TNU de semántica fijada frente al actual [L1]; la misma matmul por fila con `fsum` frente a un bucle vectorial Zve32f en el mismo motor; mediana del gas entre la emisión de una operación y el primer uso de su resultado. **Mata** la semántica fijada si va más de 1,15× más lenta que el TNU actual; mata `custom-0` si no supera a Zve32f al menos 2×; mata la vía MMIO con plazo si la separación emisión-uso es menor que el 10 % del coste de la operación.
+- **E8 — Coste de los fotogramas (1 semana, sobre H6).** Volumen de fotogramas y tiempo de certificación con 4 procesos en el arranque medido en E1. **Mata** P5 si la certificación completa no cabe en el presupuesto de CI o si los fotogramas degeneran en snapshots completos.
+
+**Riesgos transversales.** R-5: ACT4 puede exigir `riscv-gcc` (mitigación: ELF y firmas versionados). R-6: el techo de CPython (CONJETURA: 5–15 M instr/s para RV32 traducido) deja el arranque de Linux en minutos; P5 es la salida. R-7: dos implementaciones del hart (Python y C) que mantener; la propia certificación lo mitiga. R-8: los programas `.tasm` actuales no cambian, pero la ISA propia deja de crecer; el TNU y la unidad de dibujo de RFC-EXP-00017 se replantean sobre RV32. R-9: la elección de libertades (SC sin fallo espurio, WARL fija) debe documentarse como perfil de la plataforma.
+
+**Preguntas abiertas.** ¿Qué parte de Zve32f basta para el TNU sin extensión propia? ¿Cuánto cuesta el modo S cuando llegue H7? ¿Qué frecuencia nominal declarar para `mtime` derivado de `mcycle`?
+
+## 6. Referencias
+
+Fecha de consulta de todas las fuentes: 2026-10-10. [L#] son lecturas del repositorio en `main` (0473189) y de la máquina del proyecto.
+
+[L1] `VM32.md`, `README.md`: ISA, memoria, gas, snapshots, TNU, cifras de rendimiento.
+[L2] `cpu_digital/vm32.py`: `_core_checkpoint`, `_execute_one` (journal por instrucción), `_push`/`_pop`, `_sys_alloc`, despacho de interrupciones.
+[L3] `cpu_digital/memory.py`: `PagedMemory`.
+[L4] `cpu_digital/vm32_loops.py` y `tests/test_vm32_loops.py`: compilador de bucles, comprobación de gas por vuelta, fuzzing diferencial.
+[L5] `tests/`, `.github/workflows/ci.yml`.
+[L6] `cpu_digital/vm32_assembler.py`, `VM32.md` (syscalls 9–10).
+[L7] Máquina del proyecto, 2026-10-10: `clang --version` 21.1.0 con objetivos `riscv32`, `riscv64`, `arm`, `x86`; sin `riscv32-unknown-elf-gcc`, `qemu-system-riscv32`, `spike`, `pypy`.
+
+[R1] RISC-V ISA Manual v20260120, Unprivileged, «RV32I». https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html
+[R2] Ídem, «RV32/64G Instruction Set Listings». https://docs.riscv.org/reference/isa/v20260120/unpriv/rv-32-64g.html
+[R3] RISC-V Privileged, «Introduction». https://docs.riscv.org/reference/isa/v20260120/priv/priv-intro.html
+[R4] Ídem, «Machine-Level ISA». https://docs.riscv.org/reference/isa/v20260120/priv/machine.html
+[R5] Ídem, «Supervisor-Level ISA». https://docs.riscv.org/reference/isa/v20260120/priv/supervisor.html
+[R6] Rust, «Platform Support». https://doc.rust-lang.org/rustc/platform-support.html
+[R7] riscv-software-src/riscv-tests. https://github.com/riscv-software-src/riscv-tests
+[R8] riscv-non-isa/riscv-arch-test (ACT4). https://github.com/riscv-non-isa/riscv-arch-test
+[R9] picolibc/picolibc. https://github.com/picolibc/picolibc
+[R10] musl, árbol `arch/`. https://git.musl-libc.org/cgit/musl/tree/arch
+[R11] UNSW CS3231, «MIPS R2000/R3000». https://cgi.cse.unsw.edu.au/~cs3231/doc/mips.php
+[R12] Intel 80386 Programmer's Reference Manual, §11.1 (copia Yale). https://flint.cs.yale.edu/cs422/readings/i386/s11_01.htm
+[R13] cnlohr/mini-rv32ima. https://github.com/cnlohr/mini-rv32ima
+[R15] QEMU, «Translator Internals» (TCG). https://www.qemu.org/docs/master/devel/tcg.html
+[R16] D. Lockhart, B. Ilbeyi, C. Batten, «Pydgin: Generating Fast Instruction Set Simulators from Simple Architecture Descriptions with Meta-Tracing JIT Compilers», ISPASS 2015. https://www.csl.cornell.edu/~cbatten/pdfs/lockhart-pydgin-ispass2015.pdf
+[R17] B. Ilbeyi et al., «Pydgin for RISC-V», 2016. https://www.csl.cornell.edu/~cbatten/pdfs/ilbeyi-pydgin-riscv2016.pdf
+[R18] PyPy blog, «Pydgin: Using RPython to Generate Fast Instruction-Set Simulators», 2015-03-13. https://pypy.org/posts/2015/03/pydgin-using-rpython-to-generate-fast-1514065178985838697.html
+[R20] sysprog21/rv32emu. https://github.com/sysprog21/rv32emu
+[R22] JKU, «Fast Interpreter-Based Instruction Set Simulation for Virtual Prototypes», DATE 2025. https://research.jku.at/en/publications/fast-interpreter-based-instruction-set-simulation-for-virtual-pro/
+[R23] riscv-software-src/riscv-isa-sim (Spike). https://github.com/riscv-software-src/riscv-isa-sim
+[R25] Hackaday.io, 6502 en Python, log 2023-03-21. https://hackaday.io/project/186956/log/216932
+[R27] Wikipedia, «Intel 80486». https://en.wikipedia.org/wiki/Intel_80486
+[R28] Wikipedia, «P5 (microarchitecture)». https://en.wikipedia.org/wiki/P5_(microarchitecture)
+[R29] Wikipedia, «R3000». https://en.wikipedia.org/wiki/R3000
+[R30] ARM920T Technical Reference Manual, DDI 0151C (copia U. Waterloo). https://student.cs.uwaterloo.ca/~cs452/docs/ts7200/arm-920t.pdf
+[R32] Wikipedia, «Classic RISC pipeline». https://en.wikipedia.org/wiki/Classic_RISC_pipeline
+[R34] gem5, «O3CPU». https://www.gem5.org/documentation/general_docs/cpu_models/O3CPU
+[R36] ucb-bar/riscv-sodor. https://github.com/ucb-bar/riscv-sodor
+[R38] D. Sanchez, C. Kozyrakis, «ZSim: Fast and Accurate Microarchitectural Simulation of Thousand-Core Systems», ISCA 2013. https://people.csail.mit.edu/sanchez/papers/2013.zsim.isca.pdf
+[R39] T. E. Carlson, W. Heirman, L. Eeckhout, «Sniper: Exploring the Level of Abstraction for Scalable and Accurate Parallel Multi-Core Simulation», SC'11. https://www.comp.nus.edu.sg/~tcarlson/pdfs/carlson2011etloafsaapms.pdf
+[R40] SMARTS (registro EPFL Infoscience; cifras del resumen). https://infoscience.epfl.ch/record/135578?ln=fr
+[R42] Linux, `arch/riscv/Kconfig` (master). https://raw.githubusercontent.com/torvalds/linux/master/arch/riscv/Kconfig
+[R43] LKML, «Add RISC-V 32 NOMMU support», 2023-01. https://lkml.iu.edu/hypermail/linux/kernel/2301.2/04823.html
+[R44] Buildroot: `qemu_riscv32_nommu_virt_defconfig` (2023-10); `qemu_riscv32_virt` (2019-01, 2020-09). https://buildroot.uclibc.org/lists/buildroot/2023-October/738858.html ; https://lists.buildroot.org/pipermail/buildroot/2019-January/240168.html ; https://lists.buildroot.org/pipermail/buildroot/2020-September/291097.html
+[R45] HackMD, registro de arranque de mini-rv32ima. https://hackmd.io/@sysprog/SkvKPqnH1g
+[R46] Epiczhul/esp32p4-rv32ima. https://github.com/Epiczhul/esp32p4-rv32ima
+[R47] SpinalHDL/VexRiscv. https://github.com/SpinalHDL/VexRiscv
+[R48] mit-pdos/xv6-riscv. https://github.com/mit-pdos/xv6-riscv
+[R49] xv6-riscv, `kernel/memlayout.h`. https://raw.githubusercontent.com/mit-pdos/xv6-riscv/riscv/kernel/memlayout.h
+[R50] michaelengel/xv6-rv32. https://github.com/michaelengel/xv6-rv32
+[R51] Zephyr, `arch/riscv/Kconfig.isa`. https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/main/arch/riscv/Kconfig.isa
+[R52] FreeRTOS forums, port RISC-V sin `mtime`. https://forums.freertos.org/t/port-freertos-on-riscv-cpu-without-mtime-and-mtime-cmp-registers/18874
+[R55] eembc/coremark. https://github.com/eembc/coremark
+[R56] embench/embench-iot. https://github.com/embench/embench-iot
+[R57] ozkl/doomgeneric. https://github.com/ozkl/doomgeneric
+[R59] QEMU, «Record/replay». https://qemu.readthedocs.io/en/master/system/replay.html
+[R60] R. O'Callahan et al., «Engineering Record and Replay for Deployability» (rr), arXiv 1705.05937, 2017. https://ar5iv.labs.arxiv.org/html/1705.05937
+[R62] Wasmtime, «Interrupting Wasm execution». https://docs.wasmtime.dev/examples-interrupting-wasm.html
+[R63] ethereum.org, «Opcodes». https://ethereum.org/developers/docs/evm/opcodes/
+[R64] docs.ebpf.io, «Verifier». https://docs.ebpf.io/linux/concepts/verifier/
+[R65] docs.kernel.org, «eBPF verifier». https://docs.kernel.org/bpf/verifier.html
+[R66] QEMU, «Migration». https://qemu.readthedocs.io/en/master/devel/migration/main.html
+[R67] CRIU, «Memory changes tracking». https://criu.org/Memory_changes_tracking
+[R68] gem5, «Checkpoints». https://www.gem5.org/documentation/general_docs/checkpoints/
+[R70] chipsalliance/riscv-dv. https://github.com/chipsalliance/riscv-dv
+[R71] F. Solt et al., «Cascade: CPU Fuzzing via Intricate Program Generation», USENIX Security 2024. https://www.usenix.org/conference/usenixsecurity24/presentation/solt
+[R72] «TheHuzz», arXiv 2201.09941, 2022. https://arxiv.org/abs/2201.09941
+[R73] «Differential testing of QEMU against ARM devices», arXiv 2105.14273, 2021. https://arxiv.org/abs/2105.14273
+[R74] riscvarchive/riscv-v-spec, `v-spec.adoc` (1.1-draft). https://raw.githubusercontent.com/riscvarchive/riscv-v-spec/master/v-spec.adoc
+[R76] qemu-riscv, parche Zve32f/Zve64f, 2022-01-17. https://lists.gnu.org/archive/html/qemu-riscv/2022-01/msg00297.html
+[R77] LLVM, «RISC-V Usage». https://llvm.org/docs/RISCVUsage.html
+[R78] riscv-non-isa/rvv-intrinsic-doc. https://github.com/riscv-non-isa/rvv-intrinsic-doc/blob/main/README.md
+[R83] Kendryte SDK, `kpu.h`. https://raw.githubusercontent.com/kendryte/kendryte-standalone-sdk/develop/lib/drivers/include/kpu.h
+[R84] riscv.org, «XuanTie Matrix Multiply Extension», 2023-02-10. https://riscv.org/blog/xuantie-matrix-multiply-extension-instructions/
+[R88] Chipyard, «RoCC or MMIO». https://chipyard.readthedocs.io/en/stable/Customization/RoCC-or-MMIO.html
+[R89] QEMU, `target/riscv/vector_internals.h`. https://qemu.googlesource.com/qemu/+/074dbce5fcce597e61ff6c44d2977458f0ba2f29/target/riscv/vector_internals.h
+[R91] GCC, «GCC 7 Release Series: Changes». https://gcc.gnu.org/gcc-7/changes.html
+[R92] GCC, «RISC-V Options». https://gcc.gnu.org/onlinedocs/gcc/RISC-V-Options.html
+[R93] LLVM, «LLVM 9.0.0 Release Notes», 2019-09-19. https://releases.llvm.org/9.0.0/docs/ReleaseNotes.html
+[R95] GCC, «ARM Options». https://gcc.gnu.org/onlinedocs/gcc/ARM-Options.html
+[R96] ARM7TDMI r4p1 Technical Reference Manual, DDI 0210C (copia MIT). https://resenv.media.mit.edu/plug/ARM7TDMI_technical_reference.pdf
+[R97] Wikipedia, «MIPS architecture». https://en.wikipedia.org/wiki/MIPS_architecture
+[R98] GCC, «MIPS Options». https://gcc.gnu.org/onlinedocs/gcc/MIPS-Options.html
+[R99] Intel, «Intel 64 and IA-32 Architectures Software Developer Manuals», 2026-10-09. https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+[R100] GCC, «x86 Options». https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html
+[R101] Motorola/NXP, M68000 Family Programmer's Reference Manual, 1992. https://www.nxp.com/docs/en/reference-manual/M68000PRM.pdf
+[R102] GCC, «M680x0 Options». https://gcc.gnu.org/onlinedocs/gcc/M680x0-Options.html
+
+Las referencias del mapa que este RFC no cita ([R14], [R19], [R21], [R24], [R26], [R31], [R33], [R35], [R37], [R41], [R53], [R54], [R58], [R61], [R69], [R75], [R79]–[R82], [R90], [R94]) se conservan en el Anexo A con su numeración original.
+
+## Anexo A — Mapa del Territorio: método, verificación, frontera y lo no cubierto
+
+**Método.** Seis sectores ortogonales declarados antes del barrido (ISA y herramientas; emuladores funcionales; microarquitectura y tiempo; software real; determinismo, gas y snapshots; extensiones vectoriales y neuronales), un explorador por sector más un complemento para las ISA no RISC-V y los compiladores, con la regla de que todo hallazgo lleve fuente abierta, cita literal de quince palabras como máximo y fecha, y de que toda afirmación negativa pase antes por una consulta dirigida a refutarla. Un verificador ciego, sin acceso al razonamiento de los exploradores, abrió las fuentes y buscó la cita.
+
+**Verificación.** Sectores 1–5: 280 anclas, 73 muestreadas (22–35 % de cada reporte, las 38 críticas incluidas), 73 confirmadas, 0 falsas. Sector 6: 70 anclas, 68 verificadas, 63 confirmadas, 3 con cita truncada o reformulada (corregidas en el mapa) y 2 no verificables (retiradas). Complemento: 3 anclas comprobadas por el director, 3 exactas.
+
+**Frontera.** Las siete casillas F1–F7 de §2.8, cada una con su consulta asesina ejecutada y redactada como cota del barrido.
+
+**No cubierto.** Apertura formal de las especificaciones ARM, MIPS, x86 y m68k; clang para `-march=armv4t`, `mips1`, `i486` y `m68020`; Unicorn y los internos de TinyEMU; Bochs y 86Box; latencias por instrucción de cada CPU histórica; RAM mínima documentada de Linux RV32 nommu; newlib y libgloss; NEON y Arm SME; literatura comparativa ISA frente a MMIO más allá de Chipyard; formato en disco de savevm; DifuzzRTL de primera mano; estado de ratificación de las extensiones matriciales IME y AME; sobrecoste numérico de icount y del fuel de wasmtime.
+
+**Referencias del mapa no citadas en el cuerpo.** [R14] F. Bellard, TinyEMU, https://bellard.org/tinyemu/ · [R19] Pydrofoil, arXiv 2503.04389, https://arxiv.org/html/2503.04389v1 (233–255× sobre el simulador C de Sail; 26,7× más lento que QEMU) · [R21] takahirox/riscv-rust · [R24] Baekalfen/PyBoy · [R26] Joshy-R/riscemu · [R31] Wikipedia, «ARM7» · [R33] gem5, «SimpleCPU» · [R35] mortbopet/Ripes · [R37] avadhpatel/marss · [R41] Valgrind, «Cachegrind» · [R53] Wikipedia, «μClinux» · [R54] D. Gow, «Linux on i486»; The Register 2026-04-06 · [R58] knazarov/doom-riscv; Gigazine 2026-07-22 · [R61] Antithesis, «How Antithesis works» · [R69] GDB, «Process Record and Replay» · [R75] LKML 2024-05, Zve32x según RVV 1.0 (hwprobe) · [R79] Arm Research, «Making Helium», 2019-02-21 · [R80] binutils-gdb, commit MVE · [R81] Wikipedia, «MMX» · [R82] Wikipedia, «Streaming SIMD Extensions» · [R90] patchew, QEMU unit-stride grouping, 2024-05-31 · [R94] LLVM, «Building LLVM with CMake» (objetivos oficiales a agosto de 2025).

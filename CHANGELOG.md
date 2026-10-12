@@ -6,6 +6,30 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
+### 2026-10-12
+
+- **Hito H2.0 del RFC-EXP-00018** (enmienda de P1.6 aprobada el 2026-10-11): mapa de líneas de
+  código de 16 bytes en `rv32_mem`, `rv32_hart` y `rv32_blocks`. Un store del invitado solo
+  invalida las cachés (sube la generación de su página) si toca una línea con alguna palabra
+  decodificada o compilada; los demás solo marcan la página como escrita para el snapshot
+  (`written`, separado de `generations`). Las escrituras del host siguen invalidando siempre y
+  vaciar el mapa (`clear_code`, al reiniciar o recolocar el hart) sube la generación de las páginas
+  marcadas, de modo que varios harts sobre una memoria siguen coherentes. Sin cambios en la
+  semántica del invitado, el formato de snapshot v2 ni VM32. Medido en reposo sobre el código
+  integrado: Embench empaquetado 2,66× → 3,37× (huffbench 1,00× → 2,92×, nettle-sha256 1,59× →
+  3,27×, sglib-combined 1,75× → 3,33×, ud 2,13× → 4,75×), igual que alineado (3,32×); CoreMark
+  3,14× → 3,23×; el intérprete gana un 6 % en empaquetado. Reinvestigación previa con líneas de
+  64, 32, 16 y 8 bytes en `.forja/h2/investigacion-p16.md` (64 y 32 fallan en `ud`; 8 no mejora).
+  El mapa cuesta RAM/16 (4 MiB por 64 MiB), residente al crear la memoria.
+- Pruebas: la suite rv32 pasa de 108 a 135 (seis reescritas a la semántica nueva; nuevas de
+  frontera línea/código, nueve programas en seis modos frente al intérprete de referencia, fuzz
+  hostil con los invariantes «toda palabra cacheada tiene su línea marcada» y «byte ≠ 0 ⇒ página
+  escrita» comprobados en cada ejecución del diferencial, dos harts sobre una memoria, bordes de
+  página del host); 366 en total. Revisiones: oráculo matemático y tres ciegas sucesivas
+  (`.forja/h2/revision_*_p16.md`); hallazgos corregidos antes de integrar: vaciar el mapa
+  desprotegía las cachés de otro hart, doce mutantes de comportamiento vivos, disposiciones del
+  fuzz que no escribían sobre código, `load_bytes` con un byte de menos sin cobertura.
+
 ### 2026-10-10
 
 - `RFC-EXP-00018.md` (propuesto, firmado OMRI) y `RFC-EXP-00018-mapa.md`: un hart
@@ -31,10 +55,49 @@ primer commit, así que los cambios se agrupan por fecha.
     `array('i')` cuestan 0,63–0,86× y P1.1 sobrevive con esa redacción. El anillo
     que deshace instrucciones encarece memcpy/strcpy un 24–32 % según la versión
     de Python, en el umbral del 25 % o por encima: se retira y queda snapshot más
-    reejecución (P1.10).
+    reejecución (P1.10). Decisión: P1.1 se enmienda con la RAM del hart entera en
+    un `mmap` anónimo con vistas y mapa de bits de páginas de 4 KiB escritas
+    (`--plana`): cargas 0,53–0,78× de las vistas por página, escrituras
+    0,88–1,09×, sin caché derivada, materialización ni cruces de página.
 - Pruebas: `tests/test_benchmark_rv32_memoria.py` (la capa de bytes frente a un
   modelo `bytearray`, cruces de página, extensión de signo, fallos de rango,
   anillo y umbrales exactos de los veredictos).
+- **Hito H1 del RFC-EXP-00018** (RV32I, bloques, horizonte, UART; experimento E3):
+  - Siete módulos nuevos en `cpu_digital/`, sin tocar VM32: `rv32_isa` (tablas,
+    `Kind`, codificador de RV32IMA/Zifencei/Zicsr/`MRET`/`WFI`), `rv32_decode`
+    (decodificador que nunca lanza; desensamblador igual a `llvm-objdump` en las
+    3 194 instrucciones del CoreMark versionado, con lista cerrada de diferencias),
+    `rv32_alu` (funciones y plantillas equivalentes), `rv32_mem` (RAM contigua
+    `mmap` con vistas, generaciones monótonas por página de 4 KiB y snapshot v2),
+    `rv32_hart` (comprobar-y-confirmar, caché de decodificación por generación,
+    paradas con `mcause`/`mtval`, contadores Zicntr), `rv32_platform` (bus, UART,
+    SYSCON, CLINT, `Machine`) y `rv32_blocks` (bloques básicos compilados a Python
+    con salida lenta única, invalidación por generación y horizonte de gas).
+  - E3 (`benchmarks/benchmark_rv32_coremark.py`): CoreMark rv32i corre hasta el
+    apagado con 8 505 937 instrucciones y los CRC de E1 en los tres modos;
+    intérprete 2,24 / 2,44 / 1,96 M instr/s en Python 3.13 / 3.12 / 3.10 (umbral
+    0,4 M), bloques con horizonte 7,19 / 7,74 / 6,90 M (3,21× / 3,18× / 3,52× el
+    intérprete; umbral 2×), coste del horizonte del 1 al 3 % (umbral 10 %), gas
+    exacto. P1 sobrevive; el horizonte se conserva.
+  - Pruebas: `tests/test_rv32_{isa,alu,mem,hart,platform,blocks}.py` (ida y vuelta
+    y desensamblado dorado, oráculos de enteros, modelo `bytearray`, intérprete de
+    referencia independiente con cortes de gas, código automodificable, fallos sin
+    confirmar, CoreMark en el hart y en bloques); 330 pruebas en 3.13 y 99 de los
+    módulos nuevos en 3.10. Revisiones ciegas y oráculos matemáticos por módulo
+    (hallazgos corregidos: fetch bajo la base, recorte al ancho en el bus,
+    generaciones monótonas, plantillas con doble evaluación, `FENCE.I`, alias
+    `bltz`, envolvente del `pc`, tope de 8 recompilaciones por pc, caché de
+    bloques acotada a 4 096 entradas, texto de los bloques no retenido, un solo
+    divisor de tiempo para `rdtime` y el CLINT, `load_flat` que mide bytes y no
+    borra nada si la imagen no cabe, accesos MMIO que sobresalen de su ventana).
+  - Embench IoT 1.0 (`benchmarks/benchmark_rv32_embench.py`, soporte de placa en
+    `benchmarks/rv32_arranque/embench/`, 14 binarios rv32i versionados con sha256):
+    14 de 19 benchmarks compilan con clang (los 5 de coma flotante quedan fuera sin
+    soft-float para riscv32), todos verifican y cuentan igual en los tres modos;
+    media geométrica de los bloques con horizonte 3,30× el intérprete (1,79×–4,99×),
+    intérprete mínimo 1,89 M instr/s. Con los datos empaquetados en la página del
+    código la media baja a 2,66× (coste de P1.6 medido; propuesta para H2 en
+    VM32.md). `tests/test_benchmark_rv32_embench.py`.
 
 ### 2026-10-03
 

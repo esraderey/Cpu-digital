@@ -37,8 +37,13 @@ medir, cada operación se contrasta con un modelo ``bytearray``: direcciones al 
 los cuatro desplazamientos, los cruces de página, los límites de la RAM y valores
 negativos o de más de 32 bits (``--verificar`` solo hace eso).
 
+Con ``--plana`` se mide además la alternativa que adoptó P1.1 el 2026-10-10: la RAM
+entera en un ``mmap`` anónimo (el sistema operativo materializa cada página de 4 KiB al
+tocarla) con tres vistas ``B``/``I``/``i`` y un mapa de bits de páginas escritas, sin
+páginas en diccionario; sus accesos se comparan con los de las vistas por página.
+
 Uso (desde la raíz del repositorio):
-    python benchmarks/benchmark_rv32_memoria.py [--rondas 7] [--accesos 200000] [--json informe.json]
+    python benchmarks/benchmark_rv32_memoria.py [--rondas 7] [--accesos 200000] [--plana] [--json informe.json]
     python benchmarks/benchmark_rv32_memoria.py --verificar
 """
 
@@ -47,6 +52,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import mmap
 import platform
 import random
 import statistics
@@ -271,6 +277,191 @@ class LaneMemory:
         i = o & PAGE_MASK
         self.ring.append((pc, addr, page[i]))
         page[i] = value & 0xFF
+
+
+class FlatMemory:
+    """RAM contigua en un ``mmap`` anónimo con vistas ``B``/``I``/``i`` y mapa de bits de 4 KiB escritas.
+
+    Es el diseño de P1.1 enmendado: sin páginas en diccionario, sin caché derivada (las
+    vistas son función del búfer) y sin cruces de página. Exige host little-endian.
+    """
+
+    __slots__ = ("buffer", "lanes", "words_u", "words_i", "written", "limit", "size")
+
+    def __init__(self, size: int) -> None:
+        if sys.byteorder != "little":
+            raise RuntimeError("Los carriles nativos exigen un host little-endian")
+        if size <= 0 or size & 0xFFF:
+            raise ValueError("El tamaño de la RAM debe ser un múltiplo positivo de 4 KiB")
+        self.size = size
+        self.buffer = mmap.mmap(-1, size)
+        self.lanes = memoryview(self.buffer)
+        self.words_u = self.lanes.cast("I")
+        self.words_i = self.lanes.cast("i")
+        self.written = bytearray(size >> 12)
+        self.limit = BASE + size
+
+    def close(self) -> None:
+        self.words_i.release()
+        self.words_u.release()
+        self.lanes.release()
+        self.buffer.close()
+
+    def nothing_load(self, addr: int) -> None:
+        return None
+
+    def nothing_store(self, addr: int, value: int) -> None:
+        return None
+
+    def lw(self, addr: int) -> int:
+        if addr & 3 or not BASE <= addr < self.limit:
+            raise AccessFault(addr)
+        return self.words_u[(addr - BASE) >> 2]
+
+    def sw(self, addr: int, value: int) -> None:
+        if addr & 3 or not BASE <= addr < self.limit:
+            raise AccessFault(addr)
+        o = addr - BASE
+        self.written[o >> 12] = 1
+        self.words_u[o >> 2] = value & 0xFFFFFFFF
+
+    def lbu(self, addr: int) -> int:
+        if not BASE <= addr < self.limit:
+            raise AccessFault(addr)
+        return self.lanes[addr - BASE]
+
+    def lb(self, addr: int) -> int:
+        if not BASE <= addr < self.limit:
+            raise AccessFault(addr)
+        b = self.lanes[addr - BASE]
+        return b - 256 if b > 127 else b
+
+    def sb(self, addr: int, value: int) -> None:
+        if not BASE <= addr < self.limit:
+            raise AccessFault(addr)
+        o = addr - BASE
+        self.written[o >> 12] = 1
+        self.lanes[o] = value & 0xFF
+
+    def lhu(self, addr: int) -> int:
+        if not BASE <= addr < self.limit - 1:
+            raise AccessFault(addr)
+        o = addr - BASE
+        return self.lanes[o] | (self.lanes[o + 1] << 8)
+
+    def lh(self, addr: int) -> int:
+        if not BASE <= addr < self.limit - 1:
+            raise AccessFault(addr)
+        o = addr - BASE
+        h = self.lanes[o] | (self.lanes[o + 1] << 8)
+        return h - 65536 if h > 32767 else h
+
+    def sh(self, addr: int, value: int) -> None:
+        if not BASE <= addr < self.limit - 1:
+            raise AccessFault(addr)
+        o = addr - BASE
+        self.written[o >> 12] = 1
+        self.written[(o + 1) >> 12] = 1
+        self.lanes[o] = value & 0xFF
+        self.lanes[o + 1] = (value >> 8) & 0xFF
+
+    def lw_unaligned(self, addr: int) -> int:
+        if not BASE <= addr < self.limit - 3:
+            raise AccessFault(addr)
+        o = addr - BASE
+        return int.from_bytes(self.lanes[o:o + 4], "little")
+
+    def written_pages(self) -> list[int]:
+        return [index for index, flag in enumerate(self.written) if flag]
+
+
+def verify_flat(flat: FlatMemory, seed: int = 4096) -> int:
+    """Contrasta ``FlatMemory`` con un ``bytearray`` y comprueba la propiedad del mapa de bits."""
+    rng = random.Random(seed)
+    size = flat.size
+    model = bytearray(size)
+    checks = 0
+
+    def check(condition: bool, what: str) -> None:
+        nonlocal checks
+        if not condition:
+            raise AssertionError(what)
+        checks += 1
+
+    def value() -> int:
+        kind = rng.randrange(3)
+        if kind == 0:
+            return rng.getrandbits(32)
+        if kind == 1:
+            return rng.getrandbits(32) - (1 << 32)
+        return rng.getrandbits(40)
+
+    def reads(addr: int) -> None:
+        o = addr - BASE
+        check(flat.lbu(addr) == model[o], f"lbu en {addr:#x}")
+        check(flat.lb(addr) == int.from_bytes(model[o:o + 1], "little", signed=True), f"lb en {addr:#x}")
+        check(flat.lw(addr & ~3) == int.from_bytes(model[o & ~3:(o & ~3) + 4], "little"), f"lw en {addr:#x}")
+        if o + 1 < size:
+            check(flat.lhu(addr) == int.from_bytes(model[o:o + 2], "little"), f"lhu en {addr:#x}")
+            check(flat.lh(addr) == int.from_bytes(model[o:o + 2], "little", signed=True), f"lh en {addr:#x}")
+        if o + 3 < size:
+            check(flat.lw_unaligned(addr) == int.from_bytes(model[o:o + 4], "little"), f"lw_unaligned en {addr:#x}")
+
+    hot = [rng.randrange(size >> 12) for _ in range(8)]  # unas pocas páginas concentran las escrituras
+    for _ in range(20_000):
+        page = rng.choice(hot) if rng.random() < 0.8 else rng.randrange(size >> 12)
+        addr = BASE + (page << 12) + rng.randrange(4096)
+        o = addr - BASE
+        kind = rng.randrange(4)
+        if kind == 0:
+            reads(addr)
+        elif kind == 1:
+            v = value()
+            flat.sb(addr, v)
+            model[o] = v & 0xFF
+            checks += 1
+        elif kind == 2 and o + 1 < size:
+            v = value()
+            flat.sh(addr, v)
+            model[o:o + 2] = (v & 0xFFFF).to_bytes(2, "little")
+            checks += 1
+        else:
+            v = value()
+            flat.sw(addr & ~3, v)
+            model[o & ~3:(o & ~3) + 4] = (v & 0xFFFFFFFF).to_bytes(4, "little")
+            checks += 1
+    for addr in (BASE, BASE + 1, BASE + 2, BASE + 3, flat.limit - 4, flat.limit - 3, flat.limit - 2, flat.limit - 1):
+        reads(addr)
+    for addr in (BASE - 4, BASE - 1, flat.limit, flat.limit + 4, -1):
+        for op in (flat.lw, flat.lb, flat.lbu, flat.lh, flat.lhu, flat.lw_unaligned):
+            try:
+                op(addr)
+            except AccessFault:
+                checks += 1
+            else:
+                raise AssertionError(f"{op.__name__} no falló en {addr:#x}")
+        for op in (flat.sw, flat.sb, flat.sh):
+            try:
+                op(addr, 1)
+            except AccessFault:
+                checks += 1
+            else:
+                raise AssertionError(f"{op.__name__} no falló en {addr:#x}")
+    for addr in (BASE + 1, flat.limit - 2):
+        try:
+            flat.lw(addr)
+        except AccessFault:
+            checks += 1
+        else:
+            raise AssertionError("lw aceptó una dirección desalineada")
+    check(bytes(flat.lanes) == bytes(model), "la RAM entera difiere del modelo")
+    # Propiedad del snapshot: toda página con algún byte distinto de cero está marcada.
+    marked = set(flat.written_pages())
+    for page in range(size >> 12):
+        if any(model[page << 12:(page + 1) << 12]):
+            check(page in marked, f"página {page} escrita y sin marcar")
+    check(len(marked) <= len(hot) + 20_000 and len(marked) > 0, "el mapa de bits no tiene páginas escritas")
+    return checks
 
 
 # ── Oráculo: modelo bytearray little-endian ──
@@ -658,6 +849,53 @@ def access_rows(lanes: LaneMemory, region: int, size: int, rounds: int, count: i
     return rows
 
 
+def flat_rows(flat: FlatMemory, lanes: LaneMemory, region: int, size: int, rounds: int,
+              count: int) -> list[dict[str, object]]:
+    """Las mismas operaciones sobre la RAM contigua y sobre las vistas por página, en ns por acceso."""
+    rng = random.Random(7)
+    aligned = [region + rng.randrange(0, size, 4) for _ in range(count)]
+    anywhere = [region + rng.randrange(size - 4) for _ in range(count)]
+    values = [rng.getrandbits(32) for _ in range(count)]
+    aligned_pairs = list(zip(aligned, values))
+    anywhere_pairs = list(zip(anywhere, values))
+    for addr in range(region, region + size, 4):
+        word = lanes.lw(addr)
+        flat.sw(addr, word)
+
+    def loads(fn: Callable[[int], object], addrs: list[int]) -> Callable[[], None]:
+        def body() -> None:
+            for addr in addrs:
+                fn(addr)
+        return body
+
+    def stores(fn: Callable[[int, int], None], pairs: list[tuple[int, int]]) -> Callable[[], None]:
+        def body() -> None:
+            for addr, value in pairs:
+                fn(addr, value)
+        return body
+
+    cases = [
+        ("vacío_carga", loads, aligned), ("lw", loads, aligned), ("lb", loads, anywhere), ("lbu", loads, anywhere),
+        ("lh", loads, anywhere), ("lhu", loads, anywhere), ("lw_unaligned", loads, anywhere),
+        ("vacío_escritura", stores, aligned_pairs), ("sw", stores, aligned_pairs), ("sb", stores, anywhere_pairs),
+        ("sh", stores, anywhere_pairs),
+    ]
+    rows = []
+    for name, maker, addrs in cases:
+        method = {"vacío_carga": "nothing_load", "vacío_escritura": "nothing_store"}.get(name, name)
+        flat_best, _ = measure(maker(getattr(flat, method), addrs), rounds)
+        paged_best, _ = measure(maker(getattr(lanes, method), addrs), rounds)
+        rows.append({"op": name, "ns_plana": flat_best / count * 1e9, "ns_paginas": paged_best / count * 1e9})
+    by_op = {str(row["op"]): row for row in rows}
+    for row in rows:
+        floor_key = "vacío_escritura" if str(row["op"]) in ("sw", "sb", "sh", "vacío_escritura") else "vacío_carga"
+        fl, fp = float(by_op[floor_key]["ns_plana"]), float(by_op[floor_key]["ns_paginas"])
+        row["plana/paginas"] = float(row["ns_plana"]) / float(row["ns_paginas"])
+        denominator = float(row["ns_paginas"]) - fp
+        row["plana/paginas neto"] = (float(row["ns_plana"]) - fl) / denominator if denominator > 0 else math.inf
+    return rows
+
+
 def program_rows(lanes: LaneMemory, region: int, size: int, rounds: int) -> list[dict[str, object]]:
     half = size // 2
     src, dst = region, region + half
@@ -776,6 +1014,7 @@ def main() -> int:
     parser.add_argument("--rondas", type=int, default=7)
     parser.add_argument("--accesos", type=int, default=200_000, help="accesos por ronda en el microbanco")
     parser.add_argument("--verificar", action="store_true", help="solo contrastar con el modelo bytearray")
+    parser.add_argument("--plana", action="store_true", help="medir también la RAM contigua (mmap) frente a las vistas")
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args()
     if args.rondas < 1 or args.accesos < 1:
@@ -786,7 +1025,11 @@ def main() -> int:
     lanes.materialize(region, REGION_BYTES)
     checks = verify(lanes, region, REGION_BYTES)
     print(f"Verificación contra bytearray: {checks:,} comprobaciones OK")
+    flat = FlatMemory(MEMORY_WORDS * 4)
+    flat_checks = verify_flat(flat)
+    print(f"Verificación de la RAM contigua: {flat_checks:,} comprobaciones OK")
     if args.verificar:
+        flat.close()
         return 0
     rng = random.Random(3)
     for addr in range(region, region + REGION_BYTES, 4):
@@ -803,6 +1046,14 @@ def main() -> int:
         print(f"  {row['programa']:<9} {row['variante']:<22} {row['ns_instr_min']:7.1f} / "
               f"{row['ns_instr_mediana']:7.1f}   ({row['instrucciones']:,} instrucciones)")
     result = verdicts(access, programs)
+    flat_table: list[dict[str, object]] = []
+    if args.plana:
+        flat_table = flat_rows(flat, lanes, region, REGION_BYTES, args.rondas, args.accesos)
+        print("\nRAM contigua (mmap) frente a vistas por página (ns por acceso, mínimo; cociente bruto y neto):")
+        for row in flat_table:
+            print(f"  {row['op']:<16} {row['ns_plana']:7.1f} {row['ns_paginas']:8.1f}   "
+                  f"{_label(float(row['plana/paginas']))} / {_label(float(row['plana/paginas neto']))}")
+    flat.close()
     print("\nCocientes frente a la palabra alineada por vista I, el camino que tendrá el hart "
           "(bruto; «neto»: descontado el bucle con un método vacío):")
     for key, value in result["carriles"].items():
@@ -837,6 +1088,7 @@ def main() -> int:
             "accesos_filas": access,
             "programas": programs,
             "veredictos": result,
+            "plana": flat_table,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 

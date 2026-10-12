@@ -106,6 +106,38 @@ class LaneMemoryOracleTests(unittest.TestCase):
         self.assertEqual(len(self.lanes.ring), 0)
 
 
+class FlatMemoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.flat = E2.FlatMemory(1 << 18)
+        self.addCleanup(self.flat.close)
+
+    def test_matches_bytearray_model_and_bitmap(self) -> None:
+        self.assertGreater(E2.verify_flat(self.flat), 20_000)
+
+    def test_lanes_and_bitmap(self) -> None:
+        base = E2.BASE
+        self.flat.sw(base + 0x1000, 0x80FF7F01)
+        self.assertEqual((self.flat.lb(base + 0x1000), self.flat.lbu(base + 0x1003)), (1, 0x80))
+        self.assertEqual((self.flat.lh(base + 0x1002), self.flat.lhu(base + 0x1001)), (-32513, 0xFF7F))
+        self.assertEqual(self.flat.lw_unaligned(base + 0x1001), 0x0080FF7F)
+        self.flat.sh(base + 0x1FFF, 0xBEEF)  # cruza dos páginas de 4 KiB sin vía lenta
+        self.assertEqual(self.flat.lhu(base + 0x1FFF), 0xBEEF)
+        self.assertEqual(self.flat.written_pages(), [1, 2])
+
+    def test_untouched_pages_read_zero_and_are_not_marked(self) -> None:
+        self.assertEqual(self.flat.lw(E2.BASE + 0x3F000), 0)
+        self.assertEqual(self.flat.written_pages(), [])
+
+    def test_faults(self) -> None:
+        for addr in (E2.BASE - 1, self.flat.limit, E2.BASE + 2):
+            with self.assertRaises(E2.AccessFault):
+                self.flat.lw(addr)
+        with self.assertRaises(E2.AccessFault):
+            self.flat.sh(self.flat.limit - 1, 1)
+        with self.assertRaises(ValueError):
+            E2.FlatMemory(4096 + 1)
+
+
 class VerdictThresholdTests(unittest.TestCase):
     def test_exact_thresholds_survive(self) -> None:
         # Neto exacto 1,5: lb = vacío + 1,5·(lw − vacío) = 10 + 30 = 40; sb_shift = 12 + 1,5·20 = 42.

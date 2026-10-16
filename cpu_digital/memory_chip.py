@@ -1,4 +1,4 @@
-"""Almacenamiento persistente disperso para chips de memoria no volátil."""
+"""Almacenamiento persistente disperso optimizado para chips de memoria no volátil."""
 
 from __future__ import annotations
 
@@ -13,12 +13,7 @@ _FORMAT_VERSION = 1
 
 
 class NonVolatileMemoryChip:
-    """Chip de memoria no volátil respaldado por un archivo SQLite disperso.
-
-    La capacidad es direccionable, no se reserva al abrir el chip. Solo las
-    páginas escritas ocupan espacio en el archivo, y las escrituras confirmadas
-    sobreviven al cierre y a la reapertura del chip.
-    """
+    """Chip de memoria no volátil respaldado por un archivo SQLite disperso."""
 
     __slots__ = ("_path", "_capacity_bytes", "_page_bytes", "_db", "_lock")
 
@@ -40,12 +35,28 @@ class NonVolatileMemoryChip:
         self._lock = RLock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(self._path, timeout=10, check_same_thread=False)
-        self._db.execute("PRAGMA synchronous = FULL")
         try:
+            self._db.execute("PRAGMA journal_mode = WAL")
+            self._db.execute("PRAGMA synchronous = FULL")
             self._initialize_database()
         except Exception:
             self._db.close()
             raise
+
+    @classmethod
+    def open(cls, path: str | Path) -> NonVolatileMemoryChip:
+        """Abre un chip existente detectando su capacidad y tamaño de página."""
+        db_path = Path(path)
+        if not db_path.is_file():
+            raise FileNotFoundError(f"No existe el archivo de chip: {db_path}")
+        with sqlite3.connect(db_path, timeout=10) as tmp_db:
+            row = tmp_db.execute(
+                "SELECT capacity_bytes, page_bytes FROM chip_info WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                raise ValueError("El archivo no contiene metadatos válidos en chip_info")
+            capacity_bytes, page_bytes = int(row[0]), int(row[1])
+        return cls(db_path, capacity_bytes=capacity_bytes, page_bytes=page_bytes)
 
     @property
     def path(self) -> Path:
@@ -71,36 +82,50 @@ class NonVolatileMemoryChip:
         """Bytes de contenido almacenados; no incluye metadatos SQLite."""
         with self._lock:
             self._ensure_open()
-            row = self._db.execute("SELECT COALESCE(SUM(LENGTH(data)), 0) FROM chip_pages").fetchone()
+            row = self._db.execute(
+                "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM chip_pages"
+            ).fetchone()
             return int(row[0])
 
     def read(self, address: int, length: int) -> bytes:
-        """Lee bytes; las páginas nunca escritas se leen como cero."""
+        """Lee un rango de bytes en una sola consulta; las páginas ausentes valen cero."""
         self._check_range(address, length)
+        if length == 0:
+            return b""
+
         result = bytearray(length)
+        first_page = address // self._page_bytes
+        last_page = (address + length - 1) // self._page_bytes
+
         with self._lock:
             self._ensure_open()
-            cursor = address
-            output_offset = 0
-            remaining = length
-            while remaining:
-                page_index, page_offset = divmod(cursor, self._page_bytes)
-                chunk_size = min(remaining, self._page_length(page_index) - page_offset)
-                row = self._db.execute(
-                    "SELECT data FROM chip_pages WHERE page_index = ?", (page_index,)
-                ).fetchone()
-                if row is not None:
-                    page = row[0]
-                    result[output_offset:output_offset + chunk_size] = page[
-                        page_offset:page_offset + chunk_size
-                    ]
-                cursor += chunk_size
-                output_offset += chunk_size
-                remaining -= chunk_size
+            rows = self._db.execute(
+                "SELECT page_index, data FROM chip_pages "
+                "WHERE page_index BETWEEN ? AND ?",
+                (first_page, last_page),
+            ).fetchall()
+
+            for page_index, page_data in rows:
+                expected_len = self._page_length(page_index)
+                if len(page_data) != expected_len:
+                    raise sqlite3.DatabaseError(
+                        f"Página {page_index} corrupta: longitud {len(page_data)} != {expected_len}"
+                    )
+                page_start_addr = page_index * self._page_bytes
+                read_start = max(address, page_start_addr)
+                read_end = min(address + length, page_start_addr + expected_len)
+                chunk_size = read_end - read_start
+
+                page_offset = read_start - page_start_addr
+                output_offset = read_start - address
+                result[output_offset : output_offset + chunk_size] = page_data[
+                    page_offset : page_offset + chunk_size
+                ]
+
         return bytes(result)
 
     def write(self, address: int, data: bytes | bytearray | memoryview) -> None:
-        """Escribe bytes de forma transaccional y persistente."""
+        """Escribe bytes de forma transaccional, evitando lecturas en páginas completas."""
         try:
             view = memoryview(data).cast("B")
         except (TypeError, ValueError) as exc:
@@ -115,62 +140,123 @@ class NonVolatileMemoryChip:
                 cursor = address
                 input_offset = 0
                 remaining = len(view)
+                upserts: list[tuple[int, bytes]] = []
+                deletes: list[tuple[int]] = []
+
                 while remaining:
                     page_index, page_offset = divmod(cursor, self._page_bytes)
-                    chunk_size = min(remaining, self._page_length(page_index) - page_offset)
-                    row = self._db.execute(
-                        "SELECT data FROM chip_pages WHERE page_index = ?", (page_index,)
-                    ).fetchone()
-                    page = bytearray(row[0]) if row is not None else bytearray(
-                        self._page_length(page_index)
-                    )
-                    page[page_offset:page_offset + chunk_size] = view[
-                        input_offset:input_offset + chunk_size
-                    ]
-                    if any(page):
-                        self._db.execute(
-                            "INSERT INTO chip_pages(page_index, data) VALUES (?, ?) "
-                            "ON CONFLICT(page_index) DO UPDATE SET data = excluded.data",
-                            (page_index, bytes(page)),
-                        )
+                    page_len = self._page_length(page_index)
+                    chunk_size = min(remaining, page_len - page_offset)
+                    chunk = view[input_offset : input_offset + chunk_size]
+
+                    if page_offset == 0 and chunk_size == page_len:
+                        # Página completa: sin SELECT previo
+                        if any(chunk):
+                            upserts.append((page_index, bytes(chunk)))
+                        else:
+                            deletes.append((page_index,))
                     else:
-                        self._db.execute(
-                            "DELETE FROM chip_pages WHERE page_index = ?", (page_index,)
-                        )
+                        # Página parcial: requiere fusionar con datos existentes
+                        row = self._db.execute(
+                            "SELECT data FROM chip_pages WHERE page_index = ?",
+                            (page_index,),
+                        ).fetchone()
+                        if row is not None:
+                            if len(row[0]) != page_len:
+                                raise sqlite3.DatabaseError(
+                                    f"Página {page_index} corrupta en base de datos"
+                                )
+                            page = bytearray(row[0])
+                        else:
+                            page = bytearray(page_len)
+
+                        page[page_offset : page_offset + chunk_size] = chunk
+                        if any(page):
+                            upserts.append((page_index, bytes(page)))
+                        elif row is not None:
+                            deletes.append((page_index,))
+
                     cursor += chunk_size
                     input_offset += chunk_size
                     remaining -= chunk_size
 
+                if upserts:
+                    self._db.executemany(
+                        "INSERT INTO chip_pages(page_index, data) VALUES (?, ?) "
+                        "ON CONFLICT(page_index) DO UPDATE SET data = excluded.data",
+                        upserts,
+                    )
+                if deletes:
+                    self._db.executemany(
+                        "DELETE FROM chip_pages WHERE page_index = ?", deletes
+                    )
+
     def erase(self, address: int, length: int) -> None:
-        """Borra el rango indicado; las áreas borradas vuelven a ser dispersas."""
+        """Borra el rango indicado optimizando páginas completas mediante DELETE por rango."""
         self._check_range(address, length)
         if length == 0:
             return
+
         with self._lock:
             self._ensure_open()
             with self._db:
-                cursor = address
-                remaining = length
-                while remaining:
-                    page_index, page_offset = divmod(cursor, self._page_bytes)
-                    chunk_size = min(remaining, self._page_length(page_index) - page_offset)
-                    row = self._db.execute(
-                        "SELECT data FROM chip_pages WHERE page_index = ?", (page_index,)
-                    ).fetchone()
-                    if row is not None:
-                        page = bytearray(row[0])
-                        page[page_offset:page_offset + chunk_size] = bytes(chunk_size)
-                        if any(page):
-                            self._db.execute(
-                                "UPDATE chip_pages SET data = ? WHERE page_index = ?",
-                                (bytes(page), page_index),
-                            )
-                        else:
-                            self._db.execute(
-                                "DELETE FROM chip_pages WHERE page_index = ?", (page_index,)
-                            )
-                    cursor += chunk_size
-                    remaining -= chunk_size
+                start_page, start_offset = divmod(address, self._page_bytes)
+                end_addr = address + length
+                end_page, end_offset = divmod(end_addr, self._page_bytes)
+
+                # Caso 1: El borrado ocurre dentro de una única página
+                if start_page == end_page:
+                    self._erase_partial_page(start_page, start_offset, length)
+                    return
+
+                # Caso 2: Primera página parcial (si no empieza alineada)
+                first_full_page = start_page
+                if start_offset > 0:
+                    first_chunk = self._page_length(start_page) - start_offset
+                    self._erase_partial_page(start_page, start_offset, first_chunk)
+                    first_full_page += 1
+
+                # Caso 3: Última página parcial (si no termina alineada al final de página)
+                last_full_page = end_page - 1
+                if end_offset > 0 and end_addr < self._capacity_bytes:
+                    self._erase_partial_page(end_page, 0, end_offset)
+                elif end_addr == self._capacity_bytes and end_offset > 0:
+                    last_full_page = end_page
+
+                # Caso 4: Borrado masivo de todas las páginas completas intermedias
+                if first_full_page <= last_full_page:
+                    self._db.execute(
+                        "DELETE FROM chip_pages WHERE page_index BETWEEN ? AND ?",
+                        (first_full_page, last_full_page),
+                    )
+
+    def _erase_partial_page(self, page_index: int, offset: int, length: int) -> None:
+        page_len = self._page_length(page_index)
+        if offset == 0 and length == page_len:
+            self._db.execute("DELETE FROM chip_pages WHERE page_index = ?", (page_index,))
+            return
+
+        row = self._db.execute(
+            "SELECT data FROM chip_pages WHERE page_index = ?", (page_index,)
+        ).fetchone()
+        if row is not None:
+            page = bytearray(row[0])
+            page[offset : offset + length] = bytes(length)
+            if any(page):
+                self._db.execute(
+                    "UPDATE chip_pages SET data = ? WHERE page_index = ?",
+                    (bytes(page), page_index),
+                )
+            else:
+                self._db.execute(
+                    "DELETE FROM chip_pages WHERE page_index = ?", (page_index,)
+                )
+
+    def compact(self) -> None:
+        """Compacta el archivo SQLite para devolver al sistema operativo el espacio borrado."""
+        with self._lock:
+            self._ensure_open()
+            self._db.execute("VACUUM")
 
     def sync(self) -> None:
         """Fuerza el commit de cualquier transacción pendiente."""
@@ -184,9 +270,46 @@ class NonVolatileMemoryChip:
                 self._db.close()
                 self._db = None
 
-    def __enter__(self) -> "NonVolatileMemoryChip":
-        self._ensure_open()
-        return self
+    def __len__(self) -> int:
+        return self._capacity_bytes
+
+    def __getitem__(self, key: int | slice) -> int | bytes:
+        if isinstance(key, int):
+            if key < 0:
+                key += self._capacity_bytes
+            return self.read(key, 1)[0]
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self._capacity_bytes)
+            if step != 1:
+                raise ValueError("Solo se admiten slices contiguos (step=1)")
+            return self.read(start, max(0, stop - start))
+        raise TypeError("Índice debe ser int o slice")
+
+    def __setitem__(
+        self, key: int | slice, value: int | bytes | bytearray | memoryview
+    ) -> None:
+        if isinstance(key, int):
+            if key < 0:
+                key += self._capacity_bytes
+            if type(value) is not int or not (0 <= value <= 255):
+                raise ValueError("El valor para un índice entero debe ser un byte (0..255)")
+            self.write(key, bytes([value]))
+            return
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self._capacity_bytes)
+            if step != 1:
+                raise ValueError("Solo se admiten slices contiguos (step=1)")
+            view = memoryview(value).cast("B")
+            if len(view) != max(0, stop - start):
+                raise ValueError("La longitud de los datos no coincide con el tamaño del slice")
+            self.write(start, view)
+            return
+        raise TypeError("Índice debe ser int o slice")
+
+    def __enter__(self) -> NonVolatileMemoryChip:
+        with self._lock:
+            self._ensure_open()
+            return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
@@ -240,6 +363,3 @@ class NonVolatileMemoryChip:
     def _ensure_open(self) -> None:
         if self._db is None:
             raise RuntimeError("El chip de memoria está cerrado")
-
-
-__all__ = ["DEFAULT_CHIP_CAPACITY_BYTES", "DEFAULT_CHIP_PAGE_BYTES", "NonVolatileMemoryChip"]

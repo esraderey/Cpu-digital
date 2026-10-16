@@ -6,8 +6,31 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
-### 2026-10-12
+### 2026-10-15
 
+- **Chip de memoria no volátil (`memory_chip.py`):**
+  - consultas por lotes en `read` (`WHERE page_index BETWEEN ? AND ?`), `write`
+    (`executemany` con omisión de `SELECT` previo al sobrescribir páginas
+    completas de 4 KiB) y `erase` (borrado masivo de páginas intermedias
+    completas en una sola sentencia SQL);
+  - modo `WAL` (`PRAGMA journal_mode = WAL`) junto a `PRAGMA synchronous = FULL`,
+    verificación de integridad del tamaño de página al leer `BLOB` de
+    `chip_pages` y bloqueo con `RLock` al entrar al gestor de contexto
+    (`__enter__`);
+  - método de clase `NonVolatileMemoryChip.open()` para reabrir chips leyendo
+    `capacity_bytes` y `page_bytes` desde `chip_info`, método `compact()`
+    (`VACUUM`) para liberar espacio físico en disco y soporte de indexación y
+    *slicing* contiguo (`__len__`, `__getitem__`, `__setitem__`).
+- **Máquina de Turing persistente (`turing_machine.py`):**
+  - `PersistentTuringMachine` respaldada por `NonVolatileMemoryChip`, con cinta
+    bidireccional centrada en la mitad de la capacidad direccionable del chip y
+    mapeo del símbolo blanco al byte `0x00` para preservar el almacenamiento
+    disperso al borrar celdas;
+  - carga transaccional de entrada (`load_input`), lectura de ventanas de cinta
+    (`read_window`), ejecución paso a paso (`step`) o hasta parada con límite de
+    pasos (`run`) y ejemplo de incrementador binario.
+
+### 2026-10-12
 - **Hito H2.0 del RFC-EXP-00018** (enmienda de P1.6 aprobada el 2026-10-11): mapa de líneas de
   código de 16 bytes en `rv32_mem`, `rv32_hart` y `rv32_blocks`. Un store del invitado solo
   invalida las cachés (sube la generación de su página) si toca una línea con alguna palabra

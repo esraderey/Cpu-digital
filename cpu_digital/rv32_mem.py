@@ -27,7 +27,11 @@ sin signo; ``words_i``: palabras con signo) y tres estados por encima del búfer
   3,38× el intérprete).
 
 Los tres son estado derivado del contenido y de las escrituras, no estado arquitectónico: no
-entran en el snapshot (``code`` lo vacía el hart junto con sus cachés).
+entran en el snapshot (``code`` lo vacía el hart junto con sus cachés). El inventario de P2.5 lo
+declara en los atributos de clase ``STATE_FIELDS``, ``DERIVED_FIELDS``, ``CONFIG_FIELDS``,
+``STATS_FIELDS`` y ``HARNESS_FIELDS`` (H2.1): el contenido (el búfer y sus vistas) entra en el snapshot
+del hart como páginas v2; las generaciones nunca se restauran (suben), ``written`` se recalcula y ``code``
+se vacía.
 
 Semántica (RISC-V ISA Manual no privilegiado v20260120, §2.6): memoria direccionada por bytes,
 little-endian; las cargas de 8 y 16 bits extienden con signo (``load8s``, ``load16s``) o con
@@ -87,6 +91,18 @@ class AccessFault(Exception):
 class Rv32Memory:
     __slots__ = ("base", "size", "limit", "buffer", "lanes", "words_u", "words_i", "generations", "written", "code",
                  "_closed")
+    # Inventario de estado (P2.5): cada slot está en exactamente una de estas listas; tests/test_rv32_snapshot.py lo
+    # comprueba por introspección y fija la clasificación (un slot nuevo sin clasificar pone la suite en rojo).
+    STATE_FIELDS = ("buffer", "lanes", "words_u", "words_i")   # el contenido: snapshot()["ram"]["pages"] (formato v2)
+    DERIVED_FIELDS = {
+        "generations": "monótonas y nunca restauradas: restore_pages (reset + escritura del host) y clear_code las suben, "
+                       "así que ninguna caché construida antes de restaurar puede coincidir",
+        "written": "se recalcula al restaurar: exactamente las páginas cubiertas por los datos restaurados (y ninguna tras reset)",
+        "code": "lo vacía el hart con clear_code junto con sus cachés en restore, reset y attach_memory",
+    }
+    CONFIG_FIELDS = ("base", "size", "limit", "_closed")   # geometría y ciclo de vida: los decide el host
+    STATS_FIELDS = ()
+    HARNESS_FIELDS = ()
 
     def __init__(self, size: int, base: int = DEFAULT_BASE) -> None:
         if sys.byteorder != "little":
@@ -332,7 +348,10 @@ class Rv32Memory:
             index, values = record
             if type(index) is not int or not 0 <= index <= maximum_page or index in seen:
                 raise ValueError("Índice de página inválido o duplicado")
-            if not isinstance(values, list) or not 1 <= len(values) <= words_per_snapshot_page:
+            if not isinstance(values, list):
+                raise ValueError("Contenido de página inválido")
+            values = list(values)   # copia antes de medir y validar: lo validado es lo que se escribe, aunque el objeto mienta
+            if not 1 <= len(values) <= words_per_snapshot_page:   # sobre la copia: un __len__ falso no cuela más de 4 096 (ciega 4)
                 raise ValueError("Contenido de página inválido")
             if index * words_per_snapshot_page * 4 + len(values) * 4 > self.size:
                 raise ValueError("Página fuera del espacio de memoria")

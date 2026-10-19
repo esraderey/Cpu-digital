@@ -363,3 +363,6 @@ class NonVolatileMemoryChip:
     def _ensure_open(self) -> None:
         if self._db is None:
             raise RuntimeError("El chip de memoria está cerrado")
+
+
+__all__ = ["DEFAULT_CHIP_CAPACITY_BYTES", "DEFAULT_CHIP_PAGE_BYTES", "NonVolatileMemoryChip"]

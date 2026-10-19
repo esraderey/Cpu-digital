@@ -7,13 +7,33 @@ LSR en +5 con el transmisor siempre libre y el bit de dato recibido), SYSCON en 
 +0xBFF8, derivado de ``instret`` del hart). Toda dirección sin dispositivo es un fallo de acceso.
 Las capacidades como ventanas MMIO (P1.9) y las interrupciones del CLINT (H3) se añaden sobre
 este bus sin cambiar el hart.
+
+Snapshot (H2.1): ``Machine.snapshot()`` es el del hart más ``"uart": {"output": [bytes], "input":
+[bytes]}`` y ``"clint": {"mtimecmp": entero de 64 bits}``; ``restore`` valida los dispositivos sin
+tocarlos, restaura el hart (atómico) y solo entonces confirma UART y CLINT con pasos que no pueden
+fallar (la salida del UART se sustituye por un ``bytearray`` nuevo: una vista que el host tuviera sobre
+el anterior se queda con el anterior); ``from_snapshot_bytes`` crea una máquina con la geometría de RAM
+del snapshot (lo único de configuración que adopta de él; el divisor de tiempo es estado y se adopta en
+cualquier restauración) y la configuración predeterminada. ``load_flat`` devuelve el divisor al valor con
+que se construyó la máquina. Cada clase declara su inventario de estado (P2.5); un dispositivo nuevo con
+estado tendría que entrar en ``Machine.snapshot`` y en el inventario, porque el bus no entra en el snapshot.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections import deque
 
-from .rv32_hart import HostStop, Rv32Hart, Stop
+from .rv32_hart import (
+    MASK64,
+    HostStop,
+    Rv32Hart,
+    Stop,
+    canonical_json,
+    decode_snapshot,
+    encode_snapshot,
+    expect_keys,
+)
 from .rv32_mem import DEFAULT_BASE, AccessFault, Rv32Memory
 
 UART_BASE = 0x10000000
@@ -28,12 +48,28 @@ SYSCON_POWEROFF = 0x5555
 SYSCON_REBOOT = 0x7777
 MASK32 = 0xFFFFFFFF
 _WIDTH_MASK = {1: 0xFF, 2: 0xFFFF, 4: MASK32}
+_MACHINE_KEYS = frozenset({"version", "hart", "ram", "uart", "clint"})
+_UART_KEYS = frozenset({"output", "input"})
+_CLINT_KEYS = frozenset({"mtimecmp"})
+DEFAULT_MAX_SNAPSHOT_RAM = 64 << 20   # from_snapshot_bytes no reserva más RAM que esto sin permiso explícito
+
+
+def _byte_list(value: object, name: str) -> list[int]:
+    items = list(value) if isinstance(value, list) else None   # copia antes de validar: lo validado es lo que se usa
+    if items is None or not all(type(item) is int and 0 <= item <= 255 for item in items):
+        raise ValueError(f"{name} inválida en el snapshot")
+    return items
 
 
 class Uart:
     """8250 mínimo: lo que escriba el invitado sale por ``output``; ``feed`` encola entrada."""
 
     __slots__ = ("output", "input")
+    STATE_FIELDS = ("output", "input")   # inventario (P2.5): snapshot()["uart"]
+    CONFIG_FIELDS = ()
+    DERIVED_FIELDS: dict[str, str] = {}
+    STATS_FIELDS = ()
+    HARNESS_FIELDS = ()
 
     def __init__(self) -> None:
         self.output = bytearray()
@@ -56,7 +92,7 @@ class Uart:
         self.input.extend(data)
 
     def reset(self) -> None:
-        self.output.clear()
+        self.output = bytearray()   # objeto nuevo: una vista del host sobre el anterior no impide reiniciar (ni deja la máquina a medias)
         self.input.clear()
 
     @property
@@ -66,6 +102,11 @@ class Uart:
 
 class Syscon:
     __slots__ = ()
+    STATE_FIELDS = ()
+    CONFIG_FIELDS = ()
+    DERIVED_FIELDS: dict[str, str] = {}
+    STATS_FIELDS = ()
+    HARNESS_FIELDS = ()
 
     def load(self, offset: int, width: int) -> int:
         return 0
@@ -85,6 +126,11 @@ class Clint:
     de 1, 2 y 4 bytes en cualquier desplazamiento interior; fuera de ellos se lee 0 y se ignora."""
 
     __slots__ = ("hart", "mtimecmp")
+    STATE_FIELDS = ("mtimecmp",)   # inventario (P2.5): snapshot()["clint"]; mtime se deriva del hart
+    CONFIG_FIELDS = ("hart",)
+    DERIVED_FIELDS: dict[str, str] = {}
+    STATS_FIELDS = ()
+    HARNESS_FIELDS = ()
 
     def __init__(self, hart: Rv32Hart) -> None:
         self.hart = hart
@@ -96,7 +142,7 @@ class Clint:
 
     @property
     def mtime(self) -> int:
-        return self.hart.instret // self.hart.time_divisor
+        return (self.hart.instret & MASK64) // self.hart.time_divisor   # el mismo reloj que rdtime, envuelto a 64 bits
 
     def reset(self) -> None:
         self.mtimecmp = 0
@@ -126,6 +172,11 @@ class Bus:
     """
 
     __slots__ = ("windows",)
+    STATE_FIELDS = ()   # inventario (P2.5): las ventanas las decide el host; no entran en el snapshot
+    CONFIG_FIELDS = ("windows",)
+    DERIVED_FIELDS: dict[str, str] = {}
+    STATS_FIELDS = ()
+    HARNESS_FIELDS = ()
 
     def __init__(self) -> None:
         self.windows: list[tuple[int, int, object]] = []
@@ -155,12 +206,22 @@ class Bus:
 class Machine:
     """RAM, bus con UART/SYSCON/CLINT y un hart; carga binarios planos y ejecuta con gas."""
 
-    __slots__ = ("memory", "bus", "hart", "uart", "syscon", "clint")
+    __slots__ = ("memory", "bus", "hart", "uart", "syscon", "clint", "time_divisor")
+    STATE_FIELDS = ()   # inventario (P2.5): la máquina solo cablea; el estado vive en el hart, la RAM, el UART y el CLINT
+    CONFIG_FIELDS = ("memory", "bus", "hart", "uart", "syscon", "clint", "time_divisor")   # el divisor de construcción
+    DERIVED_FIELDS: dict[str, str] = {}
+    STATS_FIELDS = ()
+    HARNESS_FIELDS = ()
 
     def __init__(self, ram_bytes: int = 64 << 20, base: int = DEFAULT_BASE, time_divisor: int = 1) -> None:
         self.memory = Rv32Memory(ram_bytes, base)
         self.bus = Bus()
-        self.hart = Rv32Hart(self.memory, self.bus, time_divisor)   # el CLINT toma el reloj del hart
+        try:
+            self.hart = Rv32Hart(self.memory, self.bus, time_divisor)   # el CLINT toma el reloj del hart
+        except BaseException:
+            self.memory.close()   # divisor rechazado con la RAM ya reservada: no dejar el mmap vivo hasta el recolector (ciega 4)
+            raise
+        self.time_divisor = time_divisor                            # load_flat lo repone tras un restore
         self.uart = Uart()
         self.syscon = Syscon()
         self.clint = Clint(self.hart)
@@ -169,8 +230,9 @@ class Machine:
         self.bus.attach(CLINT_BASE, CLINT_SIZE, self.clint)
 
     def load_flat(self, image: bytes | bytearray | memoryview, address: int | None = None) -> None:
-        """Deja la máquina limpia (RAM a cero, UART y ``mtimecmp`` vacíos, hart a cero), carga un binario
-        plano (``llvm-objcopy -O binary``) y apunta el pc a su inicio. Si no cabe, ``AccessFault`` sin cargar."""
+        """Deja la máquina limpia (RAM a cero, UART y ``mtimecmp`` vacíos, hart a cero, divisor de tiempo el de la
+        construcción aunque un ``restore`` lo cambiara), carga un binario plano (``llvm-objcopy -O binary``) y apunta
+        el pc a su inicio. Si no cabe, ``AccessFault`` sin cargar."""
         start = self.memory.base if address is None else address
         if not 0 <= start - self.memory.base <= self.memory.size - memoryview(image).nbytes:
             raise AccessFault(start)   # bytes, no elementos: un array('I') cuenta 4 por elemento
@@ -179,6 +241,7 @@ class Machine:
         self.clint.reset()
         self.memory.load_bytes(start, image)
         self.hart.reset(start)
+        self.hart.time_divisor = self.time_divisor
 
     def run(self, gas: int) -> Stop:
         return self.hart.run(gas)
@@ -187,9 +250,69 @@ class Machine:
     def uart_text(self) -> str:
         return self.uart.text
 
+    # ── Snapshot y restauración (H2.1) ──
+
+    def snapshot(self) -> dict[str, object]:
+        """El snapshot del hart más el UART (salida y cola de entrada) y el CLINT (``mtimecmp``)."""
+        state = self.hart.snapshot()
+        state["uart"] = {"output": list(self.uart.output), "input": list(self.uart.input)}
+        state["clint"] = {"mtimecmp": self.clint.mtimecmp}
+        return state
+
+    def state_hash(self) -> str:
+        return hashlib.sha256(canonical_json(self.snapshot())).hexdigest()
+
+    def snapshot_bytes(self) -> bytes:
+        return encode_snapshot(self.snapshot())
+
+    def restore(self, state: object) -> None:
+        """Restaura hart, RAM, UART y CLINT de forma atómica: valida los dispositivos sin tocarlos, restaura el hart
+        (que valida todo lo suyo antes de escribir) y solo entonces confirma UART y ``mtimecmp`` con pasos que no
+        pueden fallar: la salida del UART pasa a ser un ``bytearray`` nuevo (redimensionar el anterior fallaría si el
+        host tuviera una vista sobre él). Un snapshot de ``Rv32Hart`` suelto no vale aquí (le faltan secciones):
+        ``ValueError``."""
+        top = expect_keys(state, _MACHINE_KEYS, "raíz")
+        uart = expect_keys(top["uart"], _UART_KEYS, "uart")
+        clint = expect_keys(top["clint"], _CLINT_KEYS, "clint")
+        output = _byte_list(uart["output"], "La salida del UART")
+        pending = _byte_list(uart["input"], "La cola de entrada del UART")
+        mtimecmp = clint["mtimecmp"]
+        if type(mtimecmp) is not int or not 0 <= mtimecmp < (1 << 64):
+            raise ValueError("mtimecmp inválido en el snapshot")
+        self.hart.restore({key: top[key] for key in ("version", "hart", "ram")})   # atómica
+        self.uart.output = bytearray(output)
+        self.uart.input.clear()
+        self.uart.input.extend(pending)
+        self.clint.mtimecmp = mtimecmp
+
+    def restore_bytes(self, data: bytes) -> None:
+        self.restore(decode_snapshot(data))
+
+    @classmethod
+    def from_snapshot_bytes(cls, data: bytes, *, max_ram_bytes: int = DEFAULT_MAX_SNAPSHOT_RAM) -> "Machine":
+        """Crea una máquina con la geometría de RAM que pide el snapshot (lo único de configuración que adopta de él;
+        el resto es la predeterminada, también el divisor de construcción, aunque el hart adopte el del snapshot) y
+        lo restaura. Rechaza una RAM mayor que ``max_ram_bytes`` antes de reservarla; si la restauración falla,
+        cierra la máquina y relanza."""
+        if type(max_ram_bytes) is not int or max_ram_bytes < 0:
+            raise ValueError("max_ram_bytes debe ser un entero no negativo")
+        payload = decode_snapshot(data)
+        ram = payload.get("ram")
+        if not isinstance(ram, dict) or type(ram.get("base")) is not int or type(ram.get("size")) is not int:
+            raise ValueError("Snapshot sin geometría de RAM válida")
+        if ram["size"] > max_ram_bytes:
+            raise ValueError(f"El snapshot pide {ram['size']} bytes de RAM y el tope es {max_ram_bytes}")
+        machine = cls(ram_bytes=ram["size"], base=ram["base"])   # Rv32Memory valida la geometría (ValueError)
+        try:
+            machine.restore(payload)
+        except BaseException:
+            machine.close()
+            raise
+        return machine
+
     def close(self) -> None:
         self.memory.close()
 
 
-__all__ = ["Bus", "CLINT_BASE", "CLINT_MTIME", "CLINT_MTIMECMP", "CLINT_SIZE", "Clint", "Machine", "SYSCON_BASE",
-           "SYSCON_SIZE", "Syscon", "UART_BASE", "UART_SIZE", "Uart"]
+__all__ = ["Bus", "CLINT_BASE", "CLINT_MTIME", "CLINT_MTIMECMP", "CLINT_SIZE", "Clint", "DEFAULT_MAX_SNAPSHOT_RAM", "Machine",
+           "SYSCON_BASE", "SYSCON_SIZE", "Syscon", "UART_BASE", "UART_SIZE", "Uart"]

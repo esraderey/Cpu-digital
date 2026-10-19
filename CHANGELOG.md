@@ -6,6 +6,57 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
+### 2026-10-19
+
+- **Hitos H2.1–H2.4 del RFC-EXP-00018** (snapshot del hart, invariante S bajo cortes, riscv-tests y ACT enteros y
+  fragmentados, mutantes de restauración; E4 y E5):
+  - `Rv32Hart.snapshot()`/`restore()`, `Machine.snapshot()`/`restore()`, `state_hash()`, `snapshot_bytes()`/
+    `restore_bytes()` y `Machine.from_snapshot_bytes()`: estado arquitectónico (registros, `pc`, `instret`, `csrs`,
+    reserva LR/SC, `time_divisor`), páginas escritas en el formato v2 de VM32, UART y `mtimecmp`; restauración
+    atómica y validada (copia antes de validar, lectura única) que vacía las cachés y el mapa de código; hash sha256
+    de la serialización canónica; envoltura con firma `RV32S\x01`, zlib y tope de tamaño como VM32. `run` envuelve
+    `instret` a 64 bits y `time`/`timeh`/`mtime` se calculan sobre el contador envuelto; el constructor del hart solo
+    admite divisores en [1, 2⁶⁴). Puerta de inventario (P2.5): cada clase con `__slots__` de los módulos `rv32_*`
+    clasifica sus campos (estado, derivado con su regla, configuración, estadística, gas) y las pruebas lo exigen por
+    introspección con la clasificación fijada, descubrimiento de módulos y clases, subclases con slots y perturbación
+    por campo. `Machine` repone su divisor de tiempo en `load_flat`; `Uart.reset` sustituye la salida por un
+    `bytearray` nuevo. Sin cambios en la semántica del invitado ni en VM32.
+  - `benchmarks/benchmark_rv32_invariante.py` (E4): `run(B1); snapshot; restore en otra máquina; run(B2)` frente a
+    `run(B1 + B2)` con cortes uniformes y sesgados (perfil sin horizonte que localiza stores sobre código, MMIO y
+    salidas lentas), destino alternando máquina nueva y usada más una sonda que ejecutó el programa entero, tres
+    modos, divisores de tiempo variados, referencia troceada por calentamiento y cronómetros de snapshot +
+    restauración. 0 divergencias en 229 programas (CoreMark, los 14 de Embench, 14 anclas, 200 aleatorios y
+    hostiles) × 2 000 cortes × 3 modos; snapshot + restauración 1,55 ms con 1 MiB (4,7 ms por bytes). P1 sobrevive a E4; se propone `accelerate=True` por defecto (pendiente del usuario).
+  - `benchmarks/benchmark_rv32_riscv_tests.py` y `benchmarks/benchmark_rv32_act.py` (E5): 42 tests rv32ui de
+    riscv-tests (commit `d7e86f70`) y 38 de riscv-arch-test 2.7.4 (`rv32i_m/I`, firmas Sail) ensamblados con entornos
+    propios (`benchmarks/rv32_arranque/riscv_tests/`, `act/`), instalados versionados en `bin/` (80 binarios, sha256 en
+    `SHA256SUMS` y `act/SIGNATURES.sha256`), enteros y fragmentados con 64 + 64 cortes: todos pasan sin divergencias..
+    `benchmarks/benchmark_rv32_mutantes.py`: 20 mutantes de restauración errónea con vivacidad en dos capas; 6 vivos en la batería, detectados los 6 (100 %) con cortes uniformes y
+    con sesgados (empate entre planes: la cláusula «sesgados superan a uniformes» de E5 no se cumple y se presenta al
+    usuario), 8 vivos solo en el corpus general (dispositivos, tiempo y patrones de memoria que rv32ui no ejercita;
+    los ven las anclas del arnés) y 6 equivalentes por el mecanismo de generaciones..
+  - Pruebas: `tests/test_rv32_snapshot.py` (62), `tests/test_rv32_invariante.py` (47),
+    `tests/test_benchmark_rv32_riscv_tests.py` (6) y `tests/test_benchmark_rv32_act.py` (2); 484 en total en 3.13 (366 en el baseline) y las 237 de rv32 también
+    en 3.10. Revisiones: oráculo matemático y tres ciegas sucesivas en H2.1, dos ciegas del arnés en H2.2
+    (`.forja/h2/revision_*`); hallazgos corregidos antes de integrar: restauración no atómica con una vista
+    exportada sobre la salida del UART, contadores sin cota, `time`/`mtime` que divergían con corte al cruzar 2⁶⁴ con
+    divisor ≠ 1, divisores no restaurables aceptados por el constructor, `load_flat` que conservaba el divisor de un
+    snapshot, `Block` fuera de la puerta de inventario y puerta sin descubrir módulos, subclases ni slots vacíos,
+    validador que releía listas y escalares, grafías alternativas de claves de CSR, topes negativos o enormes mal
+    tratados; en el arnés, divisor de tiempo nunca ejercitado, `restore_pages` sin `reset` invisible para la máquina
+    usada, MMIO y dispositivos fuera del corpus, cronómetro que no medía la restauración, línea base del
+    calentamiento 2 tomada del 1, ventana asimétrica, destino sin cerrar si `restore` lanza; y medio centenar de
+    mutantes de fuerza de pruebas anclados.
+  - Descargas (autorizadas por el usuario el 2026-10-19, solo al scratchpad; nada instalado): riscv-tests commit
+    `d7e86f701b929b5d801f8cda1a4871ab05f452bb` (sha256 del zip `efbca84cea4cfd0ce8e2e1af143bae246df6f7982ac894ac84e537d371081634`),
+    riscv-arch-test 2.7.4 (sha256 `c10cb4db50bdf6aa0e9c1aa2368b590ece7433b4cf631ff666d12c06d0ec61cd`).
+- **Importación del paquete reparada (`turing_machine.py`, `ejemplo_turing.py`):** los imports de módulo suelto del
+  commit `ebe153b` impedían `import cpu_digital.turing_machine` (`ModuleNotFoundError: No module named 'memory_chip'`);
+  ahora el módulo importa `.memory_chip` y el ejemplo `cpu_digital.*`, con la demostración bajo
+  `if __name__ == "__main__":` (`main(argv)`: ruta del sqlite opcional, temporal por defecto; ya no escribe
+  `turing_tape.sqlite` al importar); repuestos `__all__` y el salto de línea final de `memory_chip.py`; pruebas
+  nuevas en `tests/test_turing_machine.py` (9; la suite pasa de 484 a 493).
+
 ### 2026-10-15
 
 - **Chip de memoria no volátil (`memory_chip.py`):**

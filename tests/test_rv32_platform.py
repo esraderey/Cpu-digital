@@ -182,6 +182,10 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(machine.memory.load32(BASE + 0x2000), 0)
         self.assertEqual(machine.memory.load32(BASE + 8), 0)       # el resto de la imagen anterior se borró
         self.assertEqual((machine.uart.output, list(machine.uart.input), machine.clint.mtimecmp), (bytearray(), [], 0))
+        pristine = Machine(ram_bytes=1 << 16)   # H2.1: el estado tras load_flat es el de una máquina nueva (divisor: test_rv32_snapshot)
+        self.addCleanup(pristine.close)
+        pristine.load_flat(assemble([encode(Kind.ADDI, 2, 0, imm=3), EBREAK]))
+        self.assertEqual(machine.state_hash(), pristine.state_hash())
         self.assertEqual(machine.run(10).reason, "ebreak")
         self.assertEqual((machine.hart.regs[2], machine.hart.instret), (3, 1))
         machine.load_flat(b"")

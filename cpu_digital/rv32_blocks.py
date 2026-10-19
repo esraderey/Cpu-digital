@@ -62,6 +62,14 @@ Runner = Callable[[list[int]], tuple[int, int, int]]
 
 class Block:
     __slots__ = ("pc", "length", "cost", "pages", "generations", "run", "source", "page0", "gen0", "page1", "gen1")
+    # Inventario de estado (P2.5, H2.1): un bloque es contenido de la caché derivada ``Rv32Hart.blocks`` y muere con
+    # ella (restore, reset, attach_memory, generación de página distinta); ningún campo entra en el snapshot.
+    _RULE = "contenido de la caché derivada Rv32Hart.blocks: se descarta con ella y al cambiar la generación de sus páginas"
+    STATE_FIELDS = ()
+    DERIVED_FIELDS = dict.fromkeys(__slots__, _RULE)
+    CONFIG_FIELDS = ()
+    STATS_FIELDS = ()
+    HARNESS_FIELDS = ()
 
     def __init__(self, pc: int, length: int, cost: int, pages: tuple[int, ...], generations: tuple[int, ...],
                  run: Runner, source: str) -> None:

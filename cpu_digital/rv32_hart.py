@@ -8,7 +8,8 @@ entrará en ``mtvec``.
 
 Dos contadores (P1.3): ``gas`` mide el coste del host (tarifa provisional de 1 por instrucción)
 e ``instret`` las instrucciones confirmadas del invitado; ``cycle`` = ``instret`` hasta que P3
-aporte el modelo de tiempo y ``time`` = ``instret`` // ``TIME_DIVISOR``.
+aporte el modelo de tiempo y ``time`` = ``instret`` // ``time_divisor`` (estado del hart, que el snapshot
+lleva; ``TIME_DIVISOR`` es solo su valor por defecto).
 
 La decodificación se cachea por página de 4 KiB en una lista de 1 024 entradas asociada a la
 generación de la página (P1.6): una escritura que sube la generación, propia o ajena, la descarta
@@ -24,10 +25,37 @@ Fuente: RISC-V ISA Manual no privilegiado v20260120 §2.4–§2.8 y Zicsr; privi
 ``mcause``. Los atributos ``base``, ``size``, ``lanes``, ``words_u``, ``gens``, ``written`` y
 ``code`` son espejos de la memoria para el camino caliente: si se sustituye la memoria hay que
 llamar a ``attach_memory``.
+
+Snapshot y restauración (H2.1; P1.7, P2.3 y P2.5 del RFC). ``snapshot()`` devuelve el estado
+arquitectónico y el contenido de la RAM en un diccionario serializable en JSON::
+
+    {"version": 1,
+     "hart": {"regs": [32 enteros en [0, 2³²)], "pc": entero en [0, 2³²), "instret": entero en [0, 2⁶⁴)
+              (run lo envuelve a 64 bits al terminar y time/timeh/mtime se calculan sobre el contador
+              envuelto, como los contadores de Zicntr),
+              "csrs": {},                 # H2: sin CSR con estado propio; H3: {"0x300": valor, ...}
+              "reservation": null,        # H2: siempre null; H3: dirección de LR/SC o null
+              "time_divisor": entero en [1, 2⁶⁴)},
+     "ram": {"base": ..., "size": ..., "page_words": 4096, "pages": [[índice, [enteros con signo]], ...]}}
+
+No lleva el gas (lo fija el arnés en cada ``run``), ni la configuración (``accelerate``, ``horizon``,
+``warmup``, ``max_blocks``, ``keep_block_sources``, el bus), ni las cachés ni las estadísticas: todo eso
+está clasificado en el inventario de la clase (``STATE_FIELDS``, ``DERIVED_FIELDS``, ``CONFIG_FIELDS``,
+``STATS_FIELDS``, ``HARNESS_FIELDS``), que una prueba recorre por introspección. ``restore`` valida todo
+antes de tocar nada (atómico), restaura la RAM por ``restore_pages`` y vacía las cachés y el mapa de
+código; ``state_hash`` es el sha256 de la serialización canónica (P2.3) y ``snapshot_bytes`` /
+``restore_bytes`` la envuelven con firma, zlib y tope de tamaño como los snapshots de VM32. La invariante S
+(``run(B1); snapshot; restore; run(B2)`` ≡ ``run(B1 + B2)``) se enuncia sobre ``run`` con gas exacto, es decir,
+con ``horizon=True`` (el valor por defecto): sin horizonte, cuánto rebasa cada ``run`` depende de qué bloques
+estén compilados, y eso no es estado del invitado.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import sys
+import zlib
 from typing import Callable, NamedTuple
 
 from .rv32_decode import decode
@@ -47,9 +75,10 @@ from .rv32_isa import (
     CSR_TIMEH,
     Kind,
 )
-from .rv32_mem import LINE_MASK, LINE_SHIFT, AccessFault, Rv32Memory
+from .rv32_mem import LINE_MASK, LINE_SHIFT, SNAPSHOT_PAGE_WORDS, AccessFault, Rv32Memory
 
 MASK32 = 0xFFFFFFFF
+MASK64 = (1 << 64) - 1
 GAS_PER_INSTRUCTION = 1
 TIME_DIVISOR = 1
 PAGE_SHIFT = 12
@@ -61,6 +90,80 @@ MAX_RECOMPILATIONS = 8
 # Entradas de la caché de bloques (y de calentamiento): al llenarse se vacía entera, como la caché de
 # bloques de QEMU. Un bloque sin fuente retiene ~4,4 KB: 4 096 entradas acotan la caché en ~18 MB.
 MAX_BLOCKS = 4096
+# Snapshot (H2.1): versión del esquema, firma de la serialización y tope del JSON descomprimido (una RAM de
+# 64 MiB entera cabe). STATEFUL_CSRS son los CSR con estado propio que entran en snapshot()["hart"]["csrs"]
+# con claves hexadecimales en texto ("0x300"); en H2 no hay ninguno (los contadores de Zicntr se derivan de
+# instret y del divisor) y cualquier clave se rechaza. H3 añade los de modo M.
+SNAPSHOT_VERSION = 1
+SNAPSHOT_MAGIC = b"RV32S\x01"
+MAX_SNAPSHOT_RAW_BYTES = 256 * 1024 * 1024
+STATEFUL_CSRS: frozenset[int] = frozenset()
+_TOP_KEYS = frozenset({"version", "hart", "ram"})
+_HART_KEYS = frozenset({"regs", "pc", "instret", "csrs", "reservation", "time_divisor"})
+_RAM_KEYS = frozenset({"base", "size", "page_words", "pages"})
+
+
+def canonical_json(payload: object) -> bytes:
+    """Serialización canónica de un snapshot (claves ordenadas, sin espacios, ASCII): lo que firma el hash de
+    estado y lo que comprime ``encode_snapshot``; dos snapshots iguales dan los mismos bytes en cualquier proceso."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def encode_snapshot(payload: object) -> bytes:
+    """Firma + zlib (nivel 9) de la serialización canónica: determinista para una misma zlib (entre versiones de
+    zlib lo estable es el JSON canónico y el hash, no los bytes comprimidos)."""
+    return SNAPSHOT_MAGIC + zlib.compress(canonical_json(payload), 9)
+
+
+def decode_snapshot(data: bytes, maximum: int | None = None) -> dict[str, object]:
+    """Inverso de ``encode_snapshot`` con la receta de VM32: firma, descompresión acotada a ``maximum`` bytes
+    (``MAX_SNAPSHOT_RAW_BYTES`` si no se da; un snapshot truncado, corrupto o con bytes de más se rechaza), JSON y
+    diccionario. Solo valida la envoltura; el contenido lo valida ``restore``. Toda anomalía de ``data`` es
+    ``ValueError``; el tope acota los bytes descomprimidos, no la memoria que ocupa el JSON cargado (unas diez
+    veces más en el peor caso medido)."""
+    if maximum is None:
+        maximum = MAX_SNAPSHOT_RAW_BYTES
+    if type(maximum) is not int or maximum < 0:   # un tope negativo haría descomprimir sin límite antes de rechazar
+        raise ValueError("Tope de tamaño del snapshot inválido")
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ValueError("El snapshot RV32 debe ser bytes")
+    data = bytes(data)
+    if not data.startswith(SNAPSHOT_MAGIC):
+        raise ValueError("Firma de snapshot RV32 inválida")
+    decompressor = zlib.decompressobj()
+    try:
+        raw = decompressor.decompress(data[len(SNAPSHOT_MAGIC):], min(maximum, sys.maxsize - 1) + 1)
+    except zlib.error as exc:
+        raise ValueError("Snapshot RV32 corrupto") from exc
+    if len(raw) > maximum or decompressor.unconsumed_tail or decompressor.unused_data or not decompressor.eof:
+        raise ValueError("Snapshot RV32 excede el tamaño permitido o está truncado")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("JSON de snapshot RV32 inválido") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Estructura de snapshot RV32 inválida")
+    return payload
+
+
+def expect_keys(mapping: object, expected: frozenset[str], name: str) -> dict[str, object]:
+    """``mapping`` debe ser un diccionario con exactamente las claves ``expected``; si no, ``ValueError``. Devuelve
+    una copia plana con cada clave leída una sola vez: el mapeo original no se vuelve a consultar (un objeto hostil
+    no puede cambiar entre validar y restaurar) y una clave que sus claves prometen pero su lectura no tiene es
+    ``ValueError``, no ``KeyError`` (ciega 4)."""
+    if not isinstance(mapping, dict):
+        raise ValueError(f"La sección {name} del snapshot debe ser un diccionario")
+    if set(mapping) != expected:
+        raise ValueError(f"Claves inválidas en la sección {name} del snapshot: faltan "
+                         f"{sorted(map(repr, expected - set(mapping)))}, sobran {sorted(map(repr, set(mapping) - expected))}")
+    try:
+        return {key: mapping[key] for key in expected}
+    except KeyError as exc:
+        raise ValueError(f"La sección {name} del snapshot anuncia una clave que no tiene: {exc.args[0]!r}") from None
+
+
+def _is_uint(value: object, bits: int) -> bool:
+    return type(value) is int and 0 <= value < (1 << bits)
 
 
 class Stop(NamedTuple):
@@ -99,18 +202,41 @@ class _Halt(Exception):
 
 
 class Rv32Hart:
-    __slots__ = ("memory", "bus", "regs", "pc", "instret", "gas", "decode_cache", "time_divisor",
+    __slots__ = ("memory", "bus", "regs", "pc", "instret", "gas", "decode_cache", "time_divisor", "reservation",
                  "base", "size", "lanes", "words_u", "gens", "written", "code",
                  "accelerate", "horizon", "warmup", "blocks", "block_hits", "block_instructions", "compilations",
                  "recompilations", "keep_block_sources", "max_blocks", "cache_flushes")
+    # Inventario de estado (P2.5): cada slot está en exactamente una de estas listas; tests/test_rv32_snapshot.py lo
+    # comprueba por introspección sobre toda clase con __slots__ de los módulos rv32_* y fija la clasificación exacta
+    # (un slot nuevo sin clasificar, o clasificado de otra forma, pone la suite en rojo).
+    STATE_FIELDS = ("regs", "pc", "instret", "reservation", "time_divisor")   # snapshot()["hart"], más "csrs"
+    DERIVED_FIELDS = {
+        "decode_cache": "diccionario página → (generación con la que se llenó, lista de decodificaciones); vacío en restore, "
+                        "reset y attach_memory",
+        "blocks": "bloques compilados con la generación de sus páginas; vacíos en restore, reset y attach_memory",
+        "block_hits": "calentamiento por pc: decide cuándo compilar, no qué se ejecuta; vacío en restore, reset y attach_memory",
+        "recompilations": "recompilaciones por pc: deciden cuándo dejar de compilar, no qué se ejecuta; vacías en restore, "
+                          "reset y attach_memory",
+        "base": "espejo de memory.base; attach_memory lo refresca",
+        "size": "espejo de memory.size; attach_memory lo refresca",
+        "lanes": "espejo de memory.lanes; attach_memory lo refresca",
+        "words_u": "espejo de memory.words_u; attach_memory lo refresca",
+        "gens": "espejo de memory.generations; attach_memory lo refresca",
+        "written": "espejo de memory.written; attach_memory lo refresca",
+        "code": "espejo de memory.code; attach_memory lo refresca",
+    }
+    CONFIG_FIELDS = ("memory", "bus", "accelerate", "horizon", "warmup", "keep_block_sources", "max_blocks")
+    STATS_FIELDS = ("block_instructions", "compilations", "cache_flushes")
+    HARNESS_FIELDS = ("gas",)   # presupuesto que run recibe y devuelve: lo fija el arnés, nunca el snapshot
 
     def __init__(self, memory: Rv32Memory, bus: object | None = None, time_divisor: int = TIME_DIVISOR) -> None:
-        if type(time_divisor) is not int or time_divisor < 1:
-            raise ValueError("time_divisor debe ser un entero positivo")
+        if type(time_divisor) is not int or not 1 <= time_divisor < (1 << 64):   # el dominio del snapshot
+            raise ValueError("time_divisor debe ser un entero en [1, 2⁶⁴)")
         self.bus = bus
         self.regs: list[int] = [0] * 32
         self.instret = 0
         self.gas = 0
+        self.reservation = None   # reserva LR/SC: entra en el snapshot; None hasta H3
         self.time_divisor = time_divisor
         # Bloques compilados (rv32_blocks): desactivados por defecto en H1 (E3 los midió en 3,21× el
         # intérprete; se activan por defecto cuando H2 los someta a la invariante S).
@@ -156,6 +282,7 @@ class Rv32Hart:
         self.pc = self.base if pc is None else pc
         self.instret = 0
         self.gas = 0
+        self.reservation = None
         self.decode_cache = {}
         self.blocks = {}
         self.block_hits = {}
@@ -205,11 +332,105 @@ class Rv32Hart:
             return self.instret & MASK32
         if csr == CSR_CYCLEH or csr == CSR_INSTRETH:
             return (self.instret >> 32) & MASK32
-        if csr == CSR_TIME:
-            return (self.instret // self.time_divisor) & MASK32
+        if csr == CSR_TIME:                                   # sobre el contador envuelto: igual antes y después
+            return ((self.instret & MASK64) // self.time_divisor) & MASK32   # de una restauración (ciega 3)
         if csr == CSR_TIMEH:
-            return ((self.instret // self.time_divisor) >> 32) & MASK32
+            return (((self.instret & MASK64) // self.time_divisor) >> 32) & MASK32
         raise _Halt("fallo", CAUSE_ILLEGAL_INSTRUCTION, raw)
+
+    # ── Snapshot y restauración (H2.1) ──
+
+    def snapshot(self) -> dict[str, object]:
+        """Estado arquitectónico del hart y contenido de la RAM, serializable en JSON (esquema en la cabecera del
+        módulo). No lleva el gas, la configuración, las cachés ni las estadísticas. No modifica nada."""
+        memory = self.memory
+        return {
+            "version": SNAPSHOT_VERSION,
+            "hart": {"regs": list(self.regs), "pc": self.pc & MASK32, "instret": self.instret & MASK64, "csrs": {},
+                     "reservation": self.reservation, "time_divisor": self.time_divisor},
+            "ram": {"base": memory.base, "size": memory.size, "page_words": SNAPSHOT_PAGE_WORDS,
+                    "pages": memory.snapshot_pages()},
+        }
+
+    def state_hash(self) -> str:
+        """sha256 (hexadecimal) de la serialización canónica de ``snapshot()`` (P2.3): igual en dos harts con el
+        mismo estado arquitectónico, con o sin bloques, en cualquier proceso."""
+        return hashlib.sha256(canonical_json(self.snapshot())).hexdigest()
+
+    def snapshot_bytes(self) -> bytes:
+        return encode_snapshot(self.snapshot())
+
+    def restore(self, state: object) -> None:
+        """Deja el hart y su RAM exactamente como describe ``state`` (lo que devolvió ``snapshot``, o su JSON).
+        Valida todo antes de tocar nada: si lanza ``ValueError``, el hart, la memoria, las cachés, las estadísticas
+        y el gas quedan como estaban. Al confirmar vacía la caché de decodificación, los bloques, el calentamiento,
+        las recompilaciones y el mapa de código (``clear_code`` sube la generación de las páginas marcadas y
+        ``restore_pages`` la de las restauradas y borradas: ninguna caché anterior, de este hart o de otro sobre la
+        misma memoria, puede coincidir). No adopta configuración ni toca el gas ni las estadísticas; sí adopta
+        ``time_divisor``, que es estado del invitado."""
+        regs, pc, instret, time_divisor, pages = self._parse_snapshot(state)
+        self.memory.restore_pages(pages)   # valida su entrada antes de escribir: si lanza, nada ha cambiado
+        self.regs[:] = regs                # la misma lista, como reset
+        self.pc = pc
+        self.instret = instret
+        self.reservation = None
+        self.time_divisor = time_divisor
+        self.decode_cache = {}
+        self.blocks = {}
+        self.block_hits = {}
+        self.recompilations = {}
+        self.memory.clear_code()
+
+    def restore_bytes(self, data: bytes) -> None:
+        self.restore(decode_snapshot(data))
+
+    def _parse_snapshot(self, state: object) -> tuple[list[int], int, int, int, object]:
+        """Valida un snapshot contra este hart sin modificarlo; devuelve los campos normalizados: ``regs`` copiada
+        antes de validarse y cada clave leída una sola vez (``expect_keys`` copia cada sección), de modo que lo
+        validado es lo que se restaura aunque el objeto cambie al releerlo. Las páginas las copia y valida
+        ``Rv32Memory.restore_pages`` registro a registro, cada una copiada antes de medirla y validarla (también
+        antes de escribir)."""
+        if self.memory.buffer.closed:
+            raise ValueError("La RAM del hart está cerrada")
+        top = expect_keys(state, _TOP_KEYS, "raíz")
+        version = top["version"]
+        if type(version) is not int or version != SNAPSHOT_VERSION:
+            raise ValueError("Versión de snapshot RV32 no compatible")
+        hart = expect_keys(top["hart"], _HART_KEYS, "hart")
+        ram = expect_keys(top["ram"], _RAM_KEYS, "ram")
+        given = hart["regs"]
+        regs = list(given) if isinstance(given, list) else None
+        if regs is None or len(regs) != 32 or not all(_is_uint(value, 32) for value in regs):
+            raise ValueError("Registros inválidos en el snapshot")
+        if regs[0] != 0:
+            raise ValueError("x0 debe valer cero en el snapshot")
+        pc = hart["pc"]
+        if not _is_uint(pc, 32):
+            raise ValueError("pc inválido en el snapshot")
+        instret = hart["instret"]
+        if not _is_uint(instret, 64):   # el contador de Zicntr es de 64 bits; y así siempre se serializa
+            raise ValueError("instret inválido en el snapshot")
+        csrs = hart["csrs"]
+        if not isinstance(csrs, dict):
+            raise ValueError("CSR inválidos en el snapshot")
+        for key in csrs:
+            # Una sola grafía por CSR: "0x" y tres dígitos hexadecimales en minúscula ("0x300").
+            canonical = (isinstance(key, str) and len(key) == 5 and key[:2] == "0x"
+                         and all(digit in "0123456789abcdef" for digit in key[2:]))
+            if not canonical or int(key, 16) not in STATEFUL_CSRS:
+                raise ValueError(f"CSR sin estado propio en esta implementación o clave no canónica: {key!r}")
+        if hart["reservation"] is not None:
+            raise ValueError("La reserva LR/SC no existe hasta H3: reservation debe ser null")
+        time_divisor = hart["time_divisor"]
+        if type(time_divisor) is not int or not 1 <= time_divisor < (1 << 64):
+            raise ValueError("time_divisor inválido en el snapshot")
+        memory = self.memory
+        base, size, page_words = ram["base"], ram["size"], ram["page_words"]
+        if type(base) is not int or type(size) is not int or (base, size) != (memory.base, memory.size):
+            raise ValueError("El snapshot requiere otra RAM (base o tamaño distintos)")
+        if type(page_words) is not int or page_words != SNAPSHOT_PAGE_WORDS:
+            raise ValueError("Tamaño de página de snapshot inválido")
+        return regs, pc, instret, time_divisor, ram["pages"]
 
     # ── Bloques compilados ──
 
@@ -276,6 +497,7 @@ class Rv32Hart:
         if pc & 3:
             # Solo puede venir de fuera (los saltos comprueban el destino): parada sin cobrar gas.
             self.pc = pc
+            self.instret = instret & MASK64   # también aquí envuelve: run nunca deja el contador fuera de 64 bits (ciega 4)
             self.gas = gas
             return Stop("fallo", CAUSE_INSTRUCTION_MISALIGNED, pc) if gas else Stop("gas")
         try:
@@ -342,7 +564,7 @@ class Rv32Hart:
             stop = Stop(host.reason)
         finally:
             self.pc = pc & MASK32   # pc + 4 en la última palabra del espacio envuelve a 0 (RV32)
-            self.instret = instret
+            self.instret = instret & MASK64   # el contador de Zicntr envuelve a 64 bits (snapshot y time también)
             self.gas = gas
             self.block_instructions = block_instructions
         return stop
@@ -674,5 +896,6 @@ for _kind, _handler in {
 }.items():
     HANDLERS[int(_kind)] = _handler
 
-__all__ = ["GAS_PER_INSTRUCTION", "HANDLERS", "HostStop", "MAX_BLOCKS", "MAX_RECOMPILATIONS", "Rv32Hart", "Stop",
-           "TIME_DIVISOR"]
+__all__ = ["GAS_PER_INSTRUCTION", "HANDLERS", "HostStop", "MASK64", "MAX_BLOCKS", "MAX_RECOMPILATIONS", "MAX_SNAPSHOT_RAW_BYTES",
+           "Rv32Hart", "SNAPSHOT_MAGIC", "SNAPSHOT_VERSION", "STATEFUL_CSRS", "Stop", "TIME_DIVISOR", "canonical_json",
+           "decode_snapshot", "encode_snapshot", "expect_keys"]

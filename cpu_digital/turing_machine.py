@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Mapping
 
-from memory_chip import NonVolatileMemoryChip
+from .memory_chip import NonVolatileMemoryChip
 
 
 class Direction(IntEnum):

@@ -3,13 +3,14 @@
 El mapa es el de mini-rv32ima, que es el que arranca Linux nommu y el que usan los binarios de
 CoreMark versionados: RAM desde 0x80000000, UART 8250 en 0x10000000 (registro de datos en +0,
 LSR en +5 con el transmisor siempre libre y el bit de dato recibido), SYSCON en 0x11100000
-(0x5555 apaga, 0x7777 reinicia) y CLINT en 0x11000000 (``mtimecmp`` en +0x4000, ``mtime`` en
-+0xBFF8, derivado de ``instret`` del hart). Toda dirección sin dispositivo es un fallo de acceso.
-Las capacidades como ventanas MMIO (P1.9) y las interrupciones del CLINT (H3) se añaden sobre
-este bus sin cambiar el hart.
+(0x5555 apaga, 0x7777 reinicia) y CLINT en 0x11000000 (``msip`` en +0, ``mtimecmp`` en +0x4000,
+``mtime`` en +0xBFF8, derivado de ``instret`` del hart). Toda dirección sin dispositivo es un fallo de
+acceso. Las capacidades como ventanas MMIO (P1.9) se añaden sobre este bus sin cambiar el hart; las interrupciones del
+CLINT (H3.4) llegan al hart por ``hart.interrupts`` (``Clint.pending_bits`` y ``Clint.timer_deadline``).
 
-Snapshot (H2.1): ``Machine.snapshot()`` es el del hart más ``"uart": {"output": [bytes], "input":
-[bytes]}`` y ``"clint": {"mtimecmp": entero de 64 bits}``; ``restore`` valida los dispositivos sin
+Snapshot (H2.1; esquema v2 desde H3.0): ``Machine.snapshot()`` es el del hart más ``"uart": {"output":
+[bytes], "input": [bytes]}`` y ``"clint": {"mtimecmp": entero de 64 bits, "msip": 0 o 1}`` (un snapshot de la
+versión 1 no lleva ``msip``: se restaura a 0); ``restore`` valida los dispositivos sin
 tocarlos, restaura el hart (atómico) y solo entonces confirma UART y CLINT con pasos que no pueden
 fallar (la salida del UART se sustituye por un ``bytearray`` nuevo: una vista que el host tuviera sobre
 el anterior se queda con el anterior); ``from_snapshot_bytes`` crea una máquina con la geometría de RAM
@@ -26,6 +27,7 @@ from collections import deque
 
 from .rv32_hart import (
     MASK64,
+    SNAPSHOT_VERSIONS,
     HostStop,
     Rv32Hart,
     Stop,
@@ -34,6 +36,7 @@ from .rv32_hart import (
     encode_snapshot,
     expect_keys,
 )
+from .rv32_isa import MIP_MSIP, MIP_MTIP
 from .rv32_mem import DEFAULT_BASE, AccessFault, Rv32Memory
 
 UART_BASE = 0x10000000
@@ -42,6 +45,7 @@ SYSCON_BASE = 0x11100000
 SYSCON_SIZE = 0x4
 CLINT_BASE = 0x11000000
 CLINT_SIZE = 0x10000
+CLINT_MSIP = 0x0
 CLINT_MTIMECMP = 0x4000
 CLINT_MTIME = 0xBFF8
 SYSCON_POWEROFF = 0x5555
@@ -50,7 +54,8 @@ MASK32 = 0xFFFFFFFF
 _WIDTH_MASK = {1: 0xFF, 2: 0xFFFF, 4: MASK32}
 _MACHINE_KEYS = frozenset({"version", "hart", "ram", "uart", "clint"})
 _UART_KEYS = frozenset({"output", "input"})
-_CLINT_KEYS = frozenset({"mtimecmp"})
+_CLINT_KEYS_V1 = frozenset({"mtimecmp"})
+_CLINT_KEYS = _CLINT_KEYS_V1 | {"msip"}
 DEFAULT_MAX_SNAPSHOT_RAM = 64 << 20   # from_snapshot_bytes no reserva más RAM que esto sin permiso explícito
 
 
@@ -122,11 +127,14 @@ class Syscon:
 
 class Clint:
     """``mtime`` = ``instret`` del hart // el divisor **del hart** (un solo reloj para ``rdtime`` y el CLINT);
-    ``mtimecmp`` se guarda (las interrupciones llegan en H3). Los dos registros de 64 bits admiten accesos
-    de 1, 2 y 4 bytes en cualquier desplazamiento interior; fuera de ellos se lee 0 y se ignora."""
+    con ``mtimecmp`` y ``msip`` el hart entrega las interrupciones de temporizador y de software (H3.4: ``pending_bits`` da
+    MSIP y MTIP, ``timer_deadline`` el plazo del temporizador). Los dos registros de 64 bits admiten
+    accesos de 1, 2 y 4 bytes en cualquier desplazamiento interior; fuera de ellos se lee 0 y se ignora. ``msip`` es
+    un registro de 32 bits en +0 del que solo el bit 0 tiene estado (WARL: los demás leen 0 y se ignoran al
+    escribir), con los mismos accesos parciales."""
 
-    __slots__ = ("hart", "mtimecmp")
-    STATE_FIELDS = ("mtimecmp",)   # inventario (P2.5): snapshot()["clint"]; mtime se deriva del hart
+    __slots__ = ("hart", "mtimecmp", "msip")
+    STATE_FIELDS = ("mtimecmp", "msip")   # inventario (P2.5): snapshot()["clint"]; mtime se deriva del hart
     CONFIG_FIELDS = ("hart",)
     DERIVED_FIELDS: dict[str, str] = {}
     STATS_FIELDS = ()
@@ -135,6 +143,7 @@ class Clint:
     def __init__(self, hart: Rv32Hart) -> None:
         self.hart = hart
         self.mtimecmp = 0
+        self.msip = 0
 
     @property
     def time_divisor(self) -> int:
@@ -144,17 +153,42 @@ class Clint:
     def mtime(self) -> int:
         return (self.hart.instret & MASK64) // self.hart.time_divisor   # el mismo reloj que rdtime, envuelto a 64 bits
 
+    def pending_bits(self) -> int:
+        """Bits pendientes de ``mip`` que aporta el CLINT (H3.1): MSIP si ``msip`` = 1 y MTIP si ``mtime`` ≥
+        ``mtimecmp`` (comparador por nivel, como un CLINT real: con ``mtimecmp`` = 0 tras el reinicio está pendiente)."""
+        return (MIP_MSIP if self.msip else 0) | (MIP_MTIP if self.mtime >= self.mtimecmp else 0)
+
+    def timer_deadline(self) -> int | None:
+        """Plazo del temporizador (H3.4): el menor ``instret`` ≥ el actual del hart con ``mtime`` ≥ ``mtimecmp`` dentro de
+        la vuelta de 2⁶⁴ en curso (``mtime`` ≥ ``mtimecmp`` ⇔ ``instret`` mod 2⁶⁴ ≥ ``mtimecmp`` × divisor), o ``None`` si
+        no cabe en ella: entonces ``mtime`` = (2⁶⁴ − 1) // divisor < ``mtimecmp`` y MTIP no llega nunca. Si MTIP ya
+        está pendiente, el plazo es el ``instret`` actual."""
+        instret = self.hart.instret
+        threshold = self.mtimecmp * self.hart.time_divisor
+        if threshold > 0xFFFFFFFFFFFFFFFF:
+            return None
+        deadline = instret - (instret & 0xFFFFFFFFFFFFFFFF) + threshold
+        return deadline if deadline > instret else instret
+
     def reset(self) -> None:
         self.mtimecmp = 0
+        self.msip = 0
 
     def load(self, offset: int, width: int) -> int:
         if CLINT_MTIME <= offset < CLINT_MTIME + 8:
             return (self.mtime >> (8 * (offset - CLINT_MTIME))) & _WIDTH_MASK[width]
         if CLINT_MTIMECMP <= offset < CLINT_MTIMECMP + 8:
             return (self.mtimecmp >> (8 * (offset - CLINT_MTIMECMP))) & _WIDTH_MASK[width]
+        if CLINT_MSIP <= offset < CLINT_MSIP + 4:
+            return (self.msip >> (8 * (offset - CLINT_MSIP))) & _WIDTH_MASK[width]
         return 0
 
     def store(self, offset: int, width: int, value: int) -> None:
+        if CLINT_MSIP <= offset < CLINT_MSIP + 4:
+            shift = 8 * (offset - CLINT_MSIP)
+            mask = _WIDTH_MASK[width] << shift
+            self.msip = (self.msip & ~mask | (value & _WIDTH_MASK[width]) << shift) & 1   # solo el bit 0 tiene estado
+            return
         if CLINT_MTIMECMP <= offset < CLINT_MTIMECMP + 8:
             shift = 8 * (offset - CLINT_MTIMECMP)
             mask = _WIDTH_MASK[width] << shift
@@ -225,6 +259,7 @@ class Machine:
         self.uart = Uart()
         self.syscon = Syscon()
         self.clint = Clint(self.hart)
+        self.hart.interrupts = self.clint   # fuente de los bits pendientes de mip
         self.bus.attach(UART_BASE, UART_SIZE, self.uart)
         self.bus.attach(SYSCON_BASE, SYSCON_SIZE, self.syscon)
         self.bus.attach(CLINT_BASE, CLINT_SIZE, self.clint)
@@ -253,10 +288,10 @@ class Machine:
     # ── Snapshot y restauración (H2.1) ──
 
     def snapshot(self) -> dict[str, object]:
-        """El snapshot del hart más el UART (salida y cola de entrada) y el CLINT (``mtimecmp``)."""
+        """El snapshot del hart más el UART (salida y cola de entrada) y el CLINT (``mtimecmp`` y ``msip``)."""
         state = self.hart.snapshot()
         state["uart"] = {"output": list(self.uart.output), "input": list(self.uart.input)}
-        state["clint"] = {"mtimecmp": self.clint.mtimecmp}
+        state["clint"] = {"mtimecmp": self.clint.mtimecmp, "msip": self.clint.msip}
         return state
 
     def state_hash(self) -> str:
@@ -270,20 +305,27 @@ class Machine:
         (que valida todo lo suyo antes de escribir) y solo entonces confirma UART y ``mtimecmp`` con pasos que no
         pueden fallar: la salida del UART pasa a ser un ``bytearray`` nuevo (redimensionar el anterior fallaría si el
         host tuviera una vista sobre él). Un snapshot de ``Rv32Hart`` suelto no vale aquí (le faltan secciones):
-        ``ValueError``."""
+        ``ValueError``. La versión (1 o 2) decide las claves del CLINT; un snapshot de la versión 1 deja ``msip`` a 0."""
         top = expect_keys(state, _MACHINE_KEYS, "raíz")
+        version = top["version"]
+        if type(version) is not int or version not in SNAPSHOT_VERSIONS:
+            raise ValueError("Versión de snapshot RV32 no compatible")
         uart = expect_keys(top["uart"], _UART_KEYS, "uart")
-        clint = expect_keys(top["clint"], _CLINT_KEYS, "clint")
+        clint = expect_keys(top["clint"], _CLINT_KEYS if version == 2 else _CLINT_KEYS_V1, "clint")
         output = _byte_list(uart["output"], "La salida del UART")
         pending = _byte_list(uart["input"], "La cola de entrada del UART")
         mtimecmp = clint["mtimecmp"]
         if type(mtimecmp) is not int or not 0 <= mtimecmp < (1 << 64):
             raise ValueError("mtimecmp inválido en el snapshot")
+        msip = clint["msip"] if version == 2 else 0
+        if type(msip) is not int or msip not in (0, 1):
+            raise ValueError("msip inválido en el snapshot: 0 o 1")
         self.hart.restore({key: top[key] for key in ("version", "hart", "ram")})   # atómica
         self.uart.output = bytearray(output)
         self.uart.input.clear()
         self.uart.input.extend(pending)
         self.clint.mtimecmp = mtimecmp
+        self.clint.msip = msip
 
     def restore_bytes(self, data: bytes) -> None:
         self.restore(decode_snapshot(data))
@@ -314,5 +356,5 @@ class Machine:
         self.memory.close()
 
 
-__all__ = ["Bus", "CLINT_BASE", "CLINT_MTIME", "CLINT_MTIMECMP", "CLINT_SIZE", "Clint", "DEFAULT_MAX_SNAPSHOT_RAM", "Machine",
+__all__ = ["Bus", "CLINT_BASE", "CLINT_MSIP", "CLINT_MTIME", "CLINT_MTIMECMP", "CLINT_SIZE", "Clint", "DEFAULT_MAX_SNAPSHOT_RAM", "Machine",
            "SYSCON_BASE", "SYSCON_SIZE", "Syscon", "UART_BASE", "UART_SIZE", "Uart"]

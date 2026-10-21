@@ -75,6 +75,72 @@ class VersionedBattery(unittest.TestCase):
                 self.assertEqual(fragmented["divergencias"], 0, fragmented)
 
 
+class MachineModeBattery(unittest.TestCase):
+    """H3.1: los 13 tests rv32mi del perfil (CSR, traps, MRET, modo U, accesos desalineados) versionados con su sha256,
+    enteros y fragmentados; los tres de fuera llevan su motivo."""
+
+    def test_the_rv32mi_list_and_its_exclusions(self) -> None:
+        from benchmarks import benchmark_rv32_riscv_tests as R
+        self.assertEqual(len(R.TESTS_MI), 13)
+        self.assertEqual(set(R.EXCLUDED_MI), {"breakpoint", "pmpaddr", "instret_overflow"})
+        self.assertFalse(set(R.TESTS_MI) & set(R.EXCLUDED_MI))
+        prefixes = [suite[1] for suite in R.SUITES.values()]
+        for first in prefixes:                                  # los filtros de SHA256SUMS no mezclan las suites
+            for second in prefixes:
+                if first != second:
+                    self.assertNotIn(first, second)
+        self.assertEqual(set(R.SUITES), {"rv32ui", "rv32mi", "rv32um", "rv32ua"})
+
+    def test_versioned_rv32mi_binaries_pass_whole_and_fragmented(self) -> None:
+        from benchmarks import benchmark_rv32_riscv_tests as R
+        binaries = R.versioned("rv32mi")
+        self.assertEqual(set(binaries), set(R.TESTS_MI))
+        self.assertEqual(set(R.versioned("rv32ui")), set(TESTS))   # la suite rv32ui no ve los de rv32mi
+        for name, path in sorted(binaries.items()):
+            with self.subTest(test=name):
+                self.assertTrue(path.name.startswith(R.PREFIX_MI))
+                image = path.read_bytes()
+                whole = run_whole(image)
+                self.assertEqual(whole["veredicto"], "pass", whole)
+                fragmented = run_fragmented(name, image, 16, random.Random(4))
+                self.assertEqual(fragmented["divergencias"], 0, fragmented)
+
+
+class MultiplyBattery(unittest.TestCase):
+    """H3.2: los 8 tests rv32um (ensamblados con -march=rv32im_zicsr) versionados con su sha256, enteros y fragmentados."""
+
+    def test_versioned_rv32um_binaries_pass_whole_and_fragmented(self) -> None:
+        from benchmarks import benchmark_rv32_riscv_tests as R
+        self.assertEqual(R.SUITES["rv32um"][3], "rv32im_zicsr")
+        binaries = R.versioned("rv32um")
+        self.assertEqual(set(binaries), set(R.TESTS_UM))
+        for name, path in sorted(binaries.items()):
+            with self.subTest(test=name):
+                self.assertTrue(path.name.startswith(R.PREFIX_UM) and path.name.endswith("_rv32im_zicsr.bin"))
+                image = path.read_bytes()
+                whole = run_whole(image)
+                self.assertEqual(whole["veredicto"], "pass", whole)
+                fragmented = run_fragmented(name, image, 16, random.Random(6))
+                self.assertEqual(fragmented["divergencias"], 0, fragmented)
+
+
+class AtomicBattery(unittest.TestCase):
+    """H3.3: los 10 tests rv32ua (-march=rv32ima_zicsr) versionados con su sha256, enteros y fragmentados."""
+
+    def test_versioned_rv32ua_binaries_pass_whole_and_fragmented(self) -> None:
+        from benchmarks import benchmark_rv32_riscv_tests as R
+        self.assertEqual(R.SUITES["rv32ua"][3], "rv32ima_zicsr")
+        binaries = R.versioned("rv32ua")
+        self.assertEqual(set(binaries), set(R.TESTS_UA))
+        for name, path in sorted(binaries.items()):
+            with self.subTest(test=name):
+                image = path.read_bytes()
+                whole = run_whole(image)
+                self.assertEqual(whole["veredicto"], "pass", whole)
+                fragmented = run_fragmented(name, image, 16, random.Random(7))
+                self.assertEqual(fragmented["divergencias"], 0, fragmented)
+
+
 class MutantRunner(unittest.TestCase):
     def test_every_mutant_anchor_matches_the_code_exactly_once(self) -> None:
         for name, edits in MUTANTS.items():

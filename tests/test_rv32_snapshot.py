@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 import cpu_digital
-from cpu_digital import rv32_alu, rv32_blocks, rv32_decode, rv32_hart, rv32_isa, rv32_mem, rv32_platform
+from cpu_digital import rv32_alu, rv32_blocks, rv32_decode, rv32_dtb, rv32_hart, rv32_isa, rv32_mem, rv32_platform
 from cpu_digital.memory import PagedMemory
 from cpu_digital.rv32_blocks import Block
 from cpu_digital.rv32_hart import (
@@ -56,20 +56,22 @@ PATCHED = encode(Kind.ADDI, 1, 1, imm=1)
 # vuelta invalida el bloque (recompilations) y, con warmup 2, el punto de control se calienta (block_hits).
 PATCH_LOOP = [encode(Kind.ADDI, 20, 0, imm=14), PATCHED, encode(Kind.SW, 0, 10, 5, imm=4),
               encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-12), EBREAK]
-RV32_MODULES = (rv32_alu, rv32_blocks, rv32_decode, rv32_hart, rv32_isa, rv32_mem, rv32_platform)
+RV32_MODULES = (rv32_alu, rv32_blocks, rv32_decode, rv32_dtb, rv32_hart, rv32_isa, rv32_mem, rv32_platform)
 INVENTORIED = (Rv32Hart, Rv32Memory, Uart, Clint, Bus, Syscon, Machine, Block)
 # Clasificación exacta de cada slot (fija la lista correcta, no solo «alguna lista»; hallazgo de las revisiones).
 GOLDEN = {
-    Rv32Hart: {"STATE_FIELDS": {"regs", "pc", "instret", "reservation", "time_divisor"},
+    Rv32Hart: {"STATE_FIELDS": {"regs", "pc", "instret", "reservation", "time_divisor", "privilege", "mstatus", "mie", "mtvec",
+                                "mscratch", "mepc", "mcause", "mtval"},
                "DERIVED_FIELDS": {"decode_cache", "blocks", "block_hits", "recompilations", "base", "size", "lanes", "words_u",
                                   "gens", "written", "code"},
-               "CONFIG_FIELDS": {"memory", "bus", "accelerate", "horizon", "warmup", "keep_block_sources", "max_blocks"},
+               "CONFIG_FIELDS": {"memory", "bus", "interrupts", "accelerate", "horizon", "warmup", "keep_block_sources",
+                                 "max_blocks"},
                "STATS_FIELDS": {"block_instructions", "compilations", "cache_flushes"}, "HARNESS_FIELDS": {"gas"}},
     Rv32Memory: {"STATE_FIELDS": {"buffer", "lanes", "words_u", "words_i"}, "DERIVED_FIELDS": {"generations", "written", "code"},
                  "CONFIG_FIELDS": {"base", "size", "limit", "_closed"}, "STATS_FIELDS": set(), "HARNESS_FIELDS": set()},
     Uart: {"STATE_FIELDS": {"output", "input"}, "DERIVED_FIELDS": set(), "CONFIG_FIELDS": set(), "STATS_FIELDS": set(),
            "HARNESS_FIELDS": set()},
-    Clint: {"STATE_FIELDS": {"mtimecmp"}, "DERIVED_FIELDS": set(), "CONFIG_FIELDS": {"hart"}, "STATS_FIELDS": set(),
+    Clint: {"STATE_FIELDS": {"mtimecmp", "msip"}, "DERIVED_FIELDS": set(), "CONFIG_FIELDS": {"hart"}, "STATS_FIELDS": set(),
             "HARNESS_FIELDS": set()},
     Bus: {"STATE_FIELDS": set(), "DERIVED_FIELDS": set(), "CONFIG_FIELDS": {"windows"}, "STATS_FIELDS": set(), "HARNESS_FIELDS": set()},
     Syscon: {"STATE_FIELDS": set(), "DERIVED_FIELDS": set(), "CONFIG_FIELDS": set(), "STATS_FIELDS": set(), "HARNESS_FIELDS": set()},
@@ -147,11 +149,12 @@ class RoundTrip(unittest.TestCase):
         self.assertEqual(set(state), {"version", "hart", "ram", "uart", "clint"})
         self.assertEqual(state["version"], SNAPSHOT_VERSION)
         hart = state["hart"]
-        self.assertEqual((hart["pc"], hart["instret"], hart["csrs"], hart["reservation"], hart["time_divisor"]),
-                         (CODE + 24, 6, {}, None, 1))
+        zero_csrs = {f"{number:#05x}": 0 for number, _ in rv32_hart.CSR_SLOTS}   # v2: los siete CSR de modo M (H3.0)
+        self.assertEqual((hart["pc"], hart["instret"], hart["csrs"], hart["privilege"], hart["reservation"], hart["time_divisor"]),
+                         (CODE + 24, 6, zero_csrs, "M", None, 1))
         self.assertEqual(hart["regs"][1], 1)
         self.assertEqual(state["uart"], {"output": [0x41], "input": [0x7A, 0x7A]})
-        self.assertEqual(state["clint"], {"mtimecmp": 0x12345})
+        self.assertEqual(state["clint"], {"mtimecmp": 0x12345, "msip": 0})
         self.assertEqual((state["ram"]["base"], state["ram"]["size"], state["ram"]["page_words"]), (BASE, RAM, 4096))
         self.assertEqual([index for index, _ in state["ram"]["pages"]], [0, 1])   # páginas 0–2 y 4 de 4 KiB
         for maker in (self.restore_dict, self.restore_bytes, self.from_bytes):
@@ -311,11 +314,12 @@ class AtomicRejection(unittest.TestCase):
             cases.append(mutate(f"instret {label}", lambda s, v=value: s["hart"].__setitem__("instret", v)))
         for value, label in ((0, "0"), (-1, "-1"), (True, "True"), (2.0, "2.0"), (None, "None")):
             cases.append(mutate(f"time_divisor {label}", lambda s, v=value: s["hart"].__setitem__("time_divisor", v)))
-        for value, label in ((0, "0"), (2, "2"), ("1", "'1'"), (True, "True"), (None, "None")):
+        # v2 (H3.0): 1 y 2 son versiones válidas; una reserva es una dirección de palabra en la RAM.
+        for value, label in ((0, "0"), (3, "3"), ("2", "'2'"), (True, "True"), (None, "None")):
             cases.append(mutate(f"version {label}", lambda s, v=value: s.__setitem__("version", v)))
         for value, label in (([], "lista"), ({"0x300": 1}, "con una clave"), ({"x": 1}, "clave no numérica"), (None, "None")):
             cases.append(mutate(f"csrs {label}", lambda s, v=value: s["hart"].__setitem__("csrs", v)))
-        for value, label in ((0, "0"), (False, "False"), (CODE, "dirección"), ("", "''")):
+        for value, label in ((0, "0"), (False, "False"), (CODE + 2, "desalineada"), (CODE + RAM, "fuera de la RAM"), ("", "''")):
             cases.append(mutate(f"reservation {label}", lambda s, v=value: s["hart"].__setitem__("reservation", v)))
         cases.append(mutate("base distinta", lambda s: s["ram"].__setitem__("base", BASE + 0x1000)))
         cases.append(mutate("size distinto", lambda s: s["ram"].__setitem__("size", RAM * 2)))
@@ -484,9 +488,10 @@ class Configuration(unittest.TestCase):
 
 
 class StateHash(unittest.TestCase):
-    # Valores calculados en otro proceso (python -c sobre la copia aislada de H2.1): fijan la serialización canónica.
-    MACHINE_HASH = "31aa61338afbd8d7be15c5ce29438abc2842a36f5c26f79ee322adde13064ae0"
-    HART_HASH = "5273dc1c786dbbb3417845468e1eaf6dbb827ef2427302dc86856d151a858328"
+    # Valores calculados en otro proceso (un guion aparte sobre la copia aislada de H3.0, esquema v2): fijan la
+    # serialización canónica. Los de H2.1 (v1) eran 31aa6133… y 5273dc1c….
+    MACHINE_HASH = "140ca2ab8eea8a1bdd92617f13aa447dda32f697ea81832937d2fc1769d850e1"
+    HART_HASH = "a63c7078aca2e683258b0b97999d63990ed8864e79e35e5ed4b0b54f97be0989"
 
     def deterministic(self) -> Machine:
         machine = make_machine([encode(Kind.ADDI, 1, 0, imm=5), encode(Kind.SB, 0, 10, 1, imm=0), EBREAK], {10: UART_BASE})
@@ -541,11 +546,12 @@ class Inventory(unittest.TestCase):
         for cls in INVENTORIED:
             with self.subTest(cls=cls.__name__):
                 self.assertEqual(inventory_errors(cls), [])
-        self.assertEqual(set(Rv32Hart.STATE_FIELDS), {"regs", "pc", "instret", "reservation", "time_divisor"})
+        self.assertEqual(set(Rv32Hart.STATE_FIELDS), {"regs", "pc", "instret", "reservation", "time_divisor", "privilege",
+                                                      "mstatus", "mie", "mtvec", "mscratch", "mepc", "mcause", "mtval"})
         self.assertEqual(set(Rv32Hart.HARNESS_FIELDS), {"gas"})
         self.assertEqual(set(Rv32Memory.STATE_FIELDS), {"buffer", "lanes", "words_u", "words_i"})
         self.assertEqual(set(Rv32Memory.DERIVED_FIELDS), {"generations", "written", "code"})
-        self.assertEqual((set(Uart.STATE_FIELDS), set(Clint.STATE_FIELDS)), ({"output", "input"}, {"mtimecmp"}))
+        self.assertEqual((set(Uart.STATE_FIELDS), set(Clint.STATE_FIELDS)), ({"output", "input"}, {"mtimecmp", "msip"}))
         self.assertEqual((Bus.STATE_FIELDS, Syscon.STATE_FIELDS, Machine.STATE_FIELDS), ((), (), ()))
 
     def test_the_gate_flags_an_unclassified_slot(self) -> None:
@@ -573,7 +579,12 @@ class Inventory(unittest.TestCase):
         machine = make_machine(PROGRAM, PROGRAM_REGS)
         self.addCleanup(machine.close)
         state = machine.snapshot()
-        self.assertEqual(set(state["hart"]), set(Rv32Hart.STATE_FIELDS) | {"csrs"})
+        csr_slots = {slot for _, slot in Rv32Hart.CSR_FIELDS}
+        self.assertLessEqual(csr_slots, set(Rv32Hart.STATE_FIELDS))                     # cada CSR con estado es un STATE_FIELD
+        self.assertEqual(set(state["hart"]), (set(Rv32Hart.STATE_FIELDS) - csr_slots) | {"csrs"})
+        self.assertEqual(set(state["hart"]["csrs"]), {f"{number:#05x}" for number, _ in Rv32Hart.CSR_FIELDS})
+        self.assertEqual({number for number, _ in Rv32Hart.CSR_FIELDS}, rv32_hart.STATEFUL_CSRS)
+        self.assertEqual(len({slot for _, slot in Rv32Hart.CSR_FIELDS}), len(Rv32Hart.CSR_FIELDS))   # un slot por CSR
         self.assertEqual(set(state["uart"]), set(Uart.STATE_FIELDS))
         self.assertEqual(set(state["clint"]), set(Clint.STATE_FIELDS))
         self.assertEqual(set(state["ram"]), {"base", "size", "page_words", "pages"})
@@ -847,23 +858,29 @@ class ReviewFindings(unittest.TestCase):
                 self.assertEqual((target.hart.time_divisor, target.state_hash()), (divisor, pristine.state_hash()))
 
     def test_csr_keys_have_a_single_spelling(self) -> None:
+        # v2 (H3.0): csrs lleva exactamente las siete claves canónicas; cualquier otra grafía de "0x300" es una clave
+        # de más y otra de menos. En v1, csrs vacío.
         memory = Rv32Memory(RAM)
         self.addCleanup(memory.close)
         hart = Rv32Hart(memory)
-        with mock.patch.object(rv32_hart, "STATEFUL_CSRS", frozenset({0x300})):
-            for key in ("300", "0X300", " 0x300 ", "0x_3_00", "+0x300", "0x0300", "0x30", 0x300, "0x30g"):
-                state = hart.snapshot()
-                state["hart"]["csrs"] = {key: 1}
-                with self.subTest(key=key):
-                    with self.assertRaises(ValueError):
-                        hart.restore(state)
+        for key in ("300", "0X300", " 0x300 ", "0x_3_00", "+0x300", "0x0300", "0x30", 0x300, "0x30g"):
             state = hart.snapshot()
-            state["hart"]["csrs"] = {"0x300": 1}                  # la grafía canónica pasa la validación de claves
-            hart.restore(state)                                     # (H2 no tiene CSR con estado: el valor no se guarda)
-        self.assertEqual(hart.snapshot()["hart"]["csrs"], {})
+            state["hart"]["csrs"][key] = state["hart"]["csrs"].pop("0x300")
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    hart.restore(state)
+        state = hart.snapshot()
+        state["hart"]["csrs"]["0x300"] = rv32_isa.MSTATUS_MIE         # la grafía canónica entra, y el valor se guarda
+        hart.restore(state)
+        self.assertEqual((hart.mstatus, hart.snapshot()["hart"]["csrs"]["0x300"]), (rv32_isa.MSTATUS_MIE,) * 2)
+        state["version"] = 1
+        del state["hart"]["privilege"]
         state["hart"]["csrs"] = {"0x300": 1}
-        with self.assertRaises(ValueError):                         # sin el parche, ningún CSR tiene estado en H2
+        with self.assertRaises(ValueError):                         # un snapshot v1 no lleva CSR con estado
             hart.restore(state)
+        state["hart"]["csrs"] = {}
+        hart.restore(state)
+        self.assertEqual(hart.mstatus, 0)                           # v1: los CSR quedan en su reinicio
 
     def test_the_validator_reads_the_registers_once(self) -> None:
         class Shifty(list):
@@ -1023,16 +1040,22 @@ class SecondBlindReview(unittest.TestCase):
         memory = Rv32Memory(RAM)
         self.addCleanup(memory.close)
         hart = Rv32Hart(memory)
-        with mock.patch.object(rv32_hart, "STATEFUL_CSRS", frozenset({0xC00})):
-            for key in ("0xC00", "0XC00", "0xc0G", " 0xc00"):
-                state = hart.snapshot()
-                state["hart"]["csrs"] = {key: 1}
-                with self.subTest(key=key):
-                    with self.assertRaises(ValueError):
-                        hart.restore(state)
+        for key in ("0X305", "0x30F", "0x3O5", " 0x305"):            # v2: solo "0x305", en minúscula y sin adornos
             state = hart.snapshot()
-            state["hart"]["csrs"] = {"0xc00": 1}
-            hart.restore(state)
+            state["hart"]["csrs"][key] = state["hart"]["csrs"].pop("0x305")
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    hart.restore(state)
+        for key in ("0xc00", "0x344", "0x301"):                         # contador, mip y misa: CSR sin estado propio
+            state = hart.snapshot()
+            state["hart"]["csrs"][key] = 0
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    hart.restore(state)
+        state = hart.snapshot()
+        state["hart"]["csrs"]["0x305"] = BASE + 0x100
+        hart.restore(state)
+        self.assertEqual(hart.mtvec, BASE + 0x100)
 
     def test_time_divisor_of_64_bits_round_trips(self) -> None:
         for divisor in (1 << 32, (1 << 40) + 3, (1 << 64) - 1):
@@ -1081,7 +1104,8 @@ class SecondBlindReview(unittest.TestCase):
                 closed.call_args.args[0].memory.close()
 
     def test_wire_format_constants_are_pinned(self) -> None:
-        self.assertEqual((SNAPSHOT_MAGIC, SNAPSHOT_VERSION, MAX_SNAPSHOT_RAW_BYTES), (b"RV32S\x01", 1, 256 * 1024 * 1024))
+        self.assertEqual((SNAPSHOT_MAGIC, SNAPSHOT_VERSION, MAX_SNAPSHOT_RAW_BYTES), (b"RV32S\x01", 2, 256 * 1024 * 1024))
+        self.assertEqual(rv32_hart.SNAPSHOT_VERSIONS, frozenset({1, 2}))      # H3.0: emite v2 y lee v1 y v2
 
     def test_snapshot_bytes_is_level_9_on_dense_memory(self) -> None:
         machine = self.machine()
@@ -1154,29 +1178,46 @@ class GateHardening(unittest.TestCase):
                 self.assertIsInstance(value, allowed, f"{cls.__name__}.{name}")
 
     def test_every_state_field_of_the_hart_is_carried_by_the_snapshot(self) -> None:
+        # Cada perturbación pone un valor legal distinto del de reinicio (H3.0: CSR de modo M, privilegio y reserva).
         perturb = {"regs": lambda h: h.regs.__setitem__(7, 0xDEADBEEF), "pc": lambda h: setattr(h, "pc", BASE + 12),
                    "instret": lambda h: setattr(h, "instret", (1 << 40) + 5),
                    "reservation": lambda h: setattr(h, "reservation", BASE + 8),
-                   "time_divisor": lambda h: setattr(h, "time_divisor", 9)}
+                   "time_divisor": lambda h: setattr(h, "time_divisor", 9),
+                   "privilege": lambda h: setattr(h, "privilege", rv32_isa.PRIV_U),
+                   "mstatus": lambda h: setattr(h, "mstatus", rv32_isa.MSTATUS_MPIE | rv32_isa.MSTATUS_MPP | rv32_isa.MSTATUS_TW),
+                   "mie": lambda h: setattr(h, "mie", rv32_isa.MIE_MTIE | rv32_isa.MIE_MEIE),
+                   "mtvec": lambda h: setattr(h, "mtvec", BASE + 0x101),
+                   "mscratch": lambda h: setattr(h, "mscratch", 0x12345678),
+                   "mepc": lambda h: setattr(h, "mepc", BASE + 0x40),
+                   "mcause": lambda h: setattr(h, "mcause", 0x80000007),
+                   "mtval": lambda h: setattr(h, "mtval", 0xCAFEBABE)}
         self.assertEqual(set(perturb), set(Rv32Hart.STATE_FIELDS))   # un campo de estado nuevo obliga a añadir su perturbación
         pristine = Rv32Memory(RAM)
         self.addCleanup(pristine.close)
         pristine_hash = Rv32Hart(pristine).state_hash()
+        csr_keys = {slot: f"{number:#05x}" for number, slot in Rv32Hart.CSR_FIELDS}
         for field, change in perturb.items():
             with self.subTest(field=field):
                 memory = Rv32Memory(RAM)
                 self.addCleanup(memory.close)
                 hart = Rv32Hart(memory)
+                reset_value = getattr(hart, field) if field != "regs" else list(hart.regs)
                 change(hart)
-                self.assertEqual(hart.snapshot()["hart"][field], getattr(hart, field))   # el snapshot lo lleva
+                self.assertNotEqual(getattr(hart, field), reset_value)                    # la perturbación no es vacua
+                carried = hart.snapshot()["hart"]
+                if field in csr_keys:
+                    self.assertEqual(carried["csrs"][csr_keys[field]], getattr(hart, field))   # el snapshot lo lleva
+                elif field == "privilege":
+                    self.assertEqual(carried["privilege"], "U")
+                else:
+                    self.assertEqual(carried[field], getattr(hart, field))
                 self.assertNotEqual(hart.state_hash(), pristine_hash)                     # y el hash lo ve
-                if field == "reservation":
-                    continue                                 # H2: restore exige null (se limpia); H3 la restaurará
                 other = Rv32Memory(RAM)
                 self.addCleanup(other.close)
                 twin = Rv32Hart(other)
                 twin.restore(hart.snapshot())
-                self.assertEqual(getattr(twin, field), getattr(hart, field))
+                self.assertEqual(getattr(twin, field), getattr(hart, field))             # y restore lo restaura
+                self.assertEqual(twin.state_hash(), hart.state_hash())
 
 
 class ThirdBlindReview(unittest.TestCase):
@@ -1308,17 +1349,26 @@ class ThirdBlindReview(unittest.TestCase):
     def test_every_csr_key_is_validated_in_every_position(self) -> None:
         machine = self.machine()
         good = machine.snapshot()
-        with mock.patch.object(rv32_hart, "STATEFUL_CSRS", frozenset({0x300})):
-            for csrs in ({"0x300": 1, "bad": 2}, {"bad": 1, "0x300": 2}, {"0x300": 1, "0X300": 2}, {"0x300": 1, "0x304": 2},
-                         {"0x300": 1, "0x3000": 2}):
+        complete = dict(good["hart"]["csrs"])
+        # v2: una clave de más en cualquier posición del diccionario, o una de menos, se rechaza.
+        for extra in ("bad", "0X300", "0x3000", "0x344"):
+            for first in (True, False):
+                csrs = {extra: 2, **complete} if first else {**complete, extra: 2}
                 state = copy.deepcopy(good)
                 state["hart"]["csrs"] = csrs
-                with self.subTest(csrs=csrs):
+                with self.subTest(extra=extra, first=first):
                     with self.assertRaises(ValueError):
                         machine.restore(state)
+        for missing in complete:
             state = copy.deepcopy(good)
-            state["hart"]["csrs"] = {"0x300": 1}
-            machine.restore(state)
+            del state["hart"]["csrs"][missing]
+            with self.subTest(missing=missing):
+                with self.assertRaises(ValueError):
+                    machine.restore(state)
+        state = copy.deepcopy(good)
+        state["hart"]["csrs"]["0x340"] = 1
+        machine.restore(state)
+        self.assertEqual(machine.hart.mscratch, 1)
 
     def test_decode_snapshot_and_restore_bytes_accept_every_bytes_like(self) -> None:
         machine = self.machine()
@@ -1725,6 +1775,457 @@ class FourthBlindReview(unittest.TestCase):
                 if name in self.STANDARD_CLASS_ATTRIBUTES or name == "DERIVED_FIELDS" or isinstance(value, skip):
                     continue
                 self.assertIsInstance(value, allowed, f"{cls.__name__}.{name}")   # «__log__ = []» tampoco se cuela
+
+
+def set_new_state(machine: Machine) -> dict[str, object]:
+    """Pone, como el host, un valor legal y distinto del reinicio en cada campo que H3.0 añade (CSR de modo M,
+    privilegio, reserva y ``msip``); devuelve lo puesto por nombre de atributo."""
+    isa, hart = rv32_isa, machine.hart
+    # mtvec fuera de la RAM (vectorizado, base 0x200): con H3.1 un trap sigue deteniendo el hart (modo compatible), así
+    # que ninguna instrucción toca este estado y debe viajar intacto por cada corte.
+    values = {"mstatus": isa.MSTATUS_MPIE | isa.MSTATUS_MPP | isa.MSTATUS_MPRV, "mie": isa.MIE_MSIE | isa.MIE_MTIE,
+              "mtvec": 0x201, "mscratch": 0xA5A5A5A5, "mepc": BASE + 0x80, "mcause": 0x8000000B, "mtval": 0x1234,
+              "privilege": isa.PRIV_U, "reservation": DATA + 0x10}
+    for name, value in values.items():
+        setattr(hart, name, value)
+    machine.clint.msip = 1
+    return {**values, "msip": 1}
+
+
+def new_state_of(machine: Machine) -> dict[str, object]:
+    hart = machine.hart
+    names = ("mstatus", "mie", "mtvec", "mscratch", "mepc", "mcause", "mtval", "privilege", "reservation")
+    return {**{name: getattr(hart, name) for name in names}, "msip": machine.clint.msip}
+
+
+def as_v1(state: dict) -> dict:
+    """El mismo estado con el esquema de H2 (versión 1): sin privilegio, sin CSR, sin reserva ni ``msip``."""
+    old = copy.deepcopy(state)
+    old["version"] = 1
+    del old["hart"]["privilege"]
+    old["hart"]["csrs"] = {}
+    old["hart"]["reservation"] = None
+    if "clint" in old:
+        old["clint"] = {"mtimecmp": old["clint"]["mtimecmp"]}
+    return old
+
+
+class SchemaV2(unittest.TestCase):
+    """Esquema v2 del snapshot (H3.0): campos nuevos de ida y vuelta, lectura de v1, rechazo atómico, lecturas únicas,
+    hash, reinicio e invariante S acotada con el estado nuevo puesto por el host."""
+
+    def source(self) -> Machine:
+        machine = make_machine(PROGRAM, PROGRAM_REGS)
+        self.addCleanup(machine.close)
+        self.assertEqual(machine.run(100).reason, "ebreak")
+        machine.uart.feed("zz")
+        return machine
+
+    def used_target(self) -> Machine:
+        target = make_machine(LOOP, {20: 20}, accelerate=True, warmup=1)
+        self.addCleanup(target.close)
+        self.assertEqual(target.run(1000).reason, "ebreak")
+        return target
+
+    def test_every_new_field_round_trips_by_dict_bytes_and_constructor(self) -> None:
+        machine = self.source()
+        put = set_new_state(machine)
+        state = machine.snapshot()
+        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["hart"]["csrs"], {"0x300": put["mstatus"], "0x304": put["mie"], "0x305": put["mtvec"],
+                                                 "0x340": put["mscratch"], "0x341": put["mepc"], "0x342": put["mcause"],
+                                                 "0x343": put["mtval"]})
+        self.assertEqual((state["hart"]["privilege"], state["hart"]["reservation"], state["clint"]["msip"]), ("U", DATA + 0x10, 1))
+        self.assertEqual(json.loads(json.dumps(state)), state)
+        for route in ("diccionario", "bytes", "constructor", "usada"):
+            with self.subTest(route=route):
+                if route == "constructor":
+                    target = Machine.from_snapshot_bytes(machine.snapshot_bytes())
+                    self.addCleanup(target.close)
+                else:
+                    target = self.used_target() if route == "usada" else Machine(ram_bytes=RAM)
+                    if route != "usada":
+                        self.addCleanup(target.close)
+                    (target.restore_bytes(machine.snapshot_bytes()) if route == "bytes" else target.restore(state))
+                self.assertEqual(target.snapshot(), state)
+                self.assertEqual(target.state_hash(), machine.state_hash())
+                self.assertEqual(new_state_of(target), put)
+
+    def test_a_v1_snapshot_puts_the_new_state_at_its_reset_values(self) -> None:
+        machine = self.source()
+        v2 = machine.snapshot()                     # el origen tiene el estado nuevo en su reinicio
+        v1 = as_v1(v2)
+        reset = {"mstatus": 0, "mie": 0, "mtvec": 0, "mscratch": 0, "mepc": 0, "mcause": 0, "mtval": 0,
+                 "privilege": rv32_isa.PRIV_M, "reservation": None, "msip": 0}
+        targets = []
+        for route in ("diccionario", "bytes", "hart suelto"):
+            with self.subTest(route=route):
+                target = self.used_target()
+                set_new_state(target)
+                if route == "hart suelto":
+                    target.hart.restore({key: v1[key] for key in ("version", "hart", "ram")})
+                    self.assertEqual(target.hart.snapshot(), {key: v2[key] for key in ("version", "hart", "ram")})
+                    continue
+                (target.restore_bytes(encode_snapshot(v1)) if route == "bytes" else target.restore(v1))
+                self.assertEqual(new_state_of(target), reset)
+                self.assertEqual(target.snapshot(), v2)          # snapshot() emite siempre v2
+                targets.append(target)
+        for target in targets:                                 # y sigue como una máquina nueva que restauró el mismo v1
+            twin = Machine(ram_bytes=RAM)
+            self.addCleanup(twin.close)
+            twin.restore(v1)
+            for machine_ in (target, twin):
+                machine_.uart.feed("q")
+            self.assertEqual(target.run(50), twin.run(50))
+            self.assertEqual(target.snapshot(), twin.snapshot())
+        # Un v1 escrito a mano con el esquema de H2 sigue restaurándose y ejecutándose.
+        literal = {"version": 1,
+                   "hart": {"regs": [0] * 32, "pc": BASE, "instret": 3, "csrs": {}, "reservation": None, "time_divisor": 7},
+                   "ram": {"base": BASE, "size": RAM, "page_words": 4096,
+                           "pages": [[0, [rv32_alu.to_signed(encode(Kind.ADDI, 1, 0, imm=7)), rv32_alu.to_signed(EBREAK)]]]},
+                   "uart": {"output": [65], "input": []}, "clint": {"mtimecmp": 9}}
+        hand = Machine(ram_bytes=RAM)
+        self.addCleanup(hand.close)
+        hand.restore(literal)
+        self.assertEqual(hand.run(10).reason, "ebreak")
+        self.assertEqual((hand.hart.regs[1], hand.hart.instret, hand.hart.time_divisor, hand.clint.mtimecmp, hand.uart.text),
+                         (7, 4, 7, 9, "A"))
+
+    def test_mixing_v1_and_v2_keys_is_rejected_atomically(self) -> None:
+        good = self.source().snapshot()
+        target = self.used_target()
+        set_new_state(target)
+        target.hart.gas = 11
+        before = full_state(target)
+        v1 = as_v1(good)
+        full_csrs = dict(good["hart"]["csrs"])
+        cases = {
+            "v1 con privilege": lambda: {**v1, "hart": {**v1["hart"], "privilege": "M"}},
+            "v1 con los CSR": lambda: {**v1, "hart": {**v1["hart"], "csrs": full_csrs}},
+            "v1 con una reserva": lambda: {**v1, "hart": {**v1["hart"], "reservation": DATA}},
+            "v1 con msip": lambda: {**v1, "clint": {"mtimecmp": 0, "msip": 0}},
+            "v2 sin privilege": lambda: {**good, "hart": {k: v for k, v in good["hart"].items() if k != "privilege"}},
+            "v2 con csrs vacío": lambda: {**good, "hart": {**good["hart"], "csrs": {}}},
+            "v2 sin msip": lambda: {**good, "clint": {"mtimecmp": 0}},
+            "v2 con clave de más en clint": lambda: {**good, "clint": {**good["clint"], "mip": 0}},
+        }
+        for name, make in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    target.restore(copy.deepcopy(make()))
+                self.assertEqual(full_state(target), before)
+        with self.assertRaises(ValueError):                   # y por la ruta del hart suelto
+            target.hart.restore({"version": 1, "hart": {**v1["hart"], "privilege": "M"}, "ram": v1["ram"]})
+        self.assertEqual(full_state(target), before)
+
+    def test_the_version_is_an_int_on_both_routes(self) -> None:
+        # True == 1 y 2.0 == 2 están en {1, 2}: solo la comprobación de tipo los rechaza, con la forma de su versión
+        # (si no, otra clave los delataría); la máquina comprueba antes que el hart, así que la ruta del hart va aparte
+        # (oráculo 1 de H3, mutante parse_sin_check_version_range).
+        good = self.source().snapshot()
+        target = self.used_target()
+        set_new_state(target)
+        target.hart.gas = 11
+        before = full_state(target)
+        v1 = as_v1(good)
+        hart_keys = ("version", "hart", "ram")
+        for name, state in (("True con forma v1", {**v1, "version": True}), ("1.0 con forma v1", {**v1, "version": 1.0}),
+                            ("2.0 con forma v2", {**good, "version": 2.0})):
+            for route in ("machine", "hart"):
+                with self.subTest(case=name, route=route):
+                    with self.assertRaises(ValueError):
+                        if route == "machine":
+                            target.restore(copy.deepcopy(state))
+                        else:
+                            target.hart.restore(copy.deepcopy({key: state[key] for key in hart_keys}))
+                    self.assertEqual(full_state(target), before)
+
+    def test_illegal_values_of_the_new_fields_are_rejected_atomically(self) -> None:
+        good = self.source().snapshot()
+        target = self.used_target()
+        set_new_state(target)
+        before = full_state(target)
+        isa = rv32_isa
+        generic = (True, -1, 1 << 32, 1.0, "0", None)
+        csr_cases = {"0x300": (1, 1 << 2, isa.MSTATUS_MPP & (1 << 11), isa.MSTATUS_MPP & (2 << 11), 1 << 31, 1 << 22),
+                     "0x304": (1 << 5, 1 << 1, 1 << 9, 1 << 31), "0x305": (2, 3, BASE + 2), "0x341": (1, 2, 3, BASE + 1),
+                     "0x340": (), "0x342": (), "0x343": ()}
+        cases: list[tuple[str, object]] = []
+        for key, illegal in csr_cases.items():
+            for value in illegal + generic:
+                cases.append((f"csr {key} = {value!r}", lambda s, k=key, v=value: s["hart"]["csrs"].__setitem__(k, v)))
+        for value in ("S", "m", "MU", "", 3, 0, None, True):
+            cases.append((f"privilege {value!r}", lambda s, v=value: s["hart"].__setitem__("privilege", v)))
+        for value in (DATA + 1, DATA + 2, DATA + 3, BASE - 4, BASE + RAM - 3, BASE + RAM, BASE + RAM + 4, 1 << 40, True, -4,
+                      float(DATA), str(DATA)):
+            cases.append((f"reservation {value!r}", lambda s, v=value: s["hart"].__setitem__("reservation", v)))
+        for value in (2, -1, True, None, "1", 1.0, 1 << 32):
+            cases.append((f"msip {value!r}", lambda s, v=value: s["clint"].__setitem__("msip", v)))
+        for name, change in cases:
+            state = copy.deepcopy(good)
+            change(state)
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    target.restore(state)
+                self.assertEqual(full_state(target), before)
+        self.assertGreater(len(cases), 60)
+        # Los bordes legales sí entran.
+        for key, value in (("0x300", rv32_hart.MSTATUS_WRITABLE), ("0x304", rv32_hart.MIE_WRITABLE), ("0x305", 0xFFFFFFFD),
+                           ("0x341", 0xFFFFFFFC), ("0x340", MASK32), ("0x342", MASK32), ("0x343", MASK32)):
+            state = copy.deepcopy(good)
+            state["hart"]["csrs"][key] = value
+            state["hart"]["reservation"] = BASE + RAM - 4
+            target.restore(state)
+            self.assertEqual(target.snapshot()["hart"]["csrs"][key], value)
+        self.assertEqual(target.hart.reservation, BASE + RAM - 4)
+
+    def test_the_legalization_is_the_fixed_warl_profile(self) -> None:
+        isa, legalize = rv32_isa, rv32_hart.legalize_csr
+        self.assertEqual(legalize(isa.CSR_MSTATUS, MASK32), rv32_hart.MSTATUS_WRITABLE)
+        self.assertEqual(legalize(isa.CSR_MSTATUS, 1 << 11), 0)                     # MPP = S → U
+        self.assertEqual(legalize(isa.CSR_MSTATUS, (2 << 11) | isa.MSTATUS_MIE), isa.MSTATUS_MIE)   # MPP = 2 → U
+        self.assertEqual(legalize(isa.CSR_MSTATUS, isa.MSTATUS_MPP), isa.MSTATUS_MPP)
+        self.assertEqual(legalize(isa.CSR_MIE, MASK32), isa.MIE_MSIE | isa.MIE_MTIE | isa.MIE_MEIE)
+        self.assertEqual(legalize(isa.CSR_MTVEC, MASK32), 0xFFFFFFFD)
+        self.assertEqual(legalize(isa.CSR_MEPC, MASK32), 0xFFFFFFFC)
+        for csr in (isa.CSR_MSCRATCH, isa.CSR_MCAUSE, isa.CSR_MTVAL):
+            self.assertEqual(legalize(csr, 0xDEADBEEF), 0xDEADBEEF)
+        for csr in (isa.CSR_MIP, isa.CSR_MISA, isa.CSR_CYCLE, 0x7C0):
+            with self.assertRaises(ValueError):
+                legalize(csr, 0)
+        self.assertEqual(rv32_hart.MSTATUS_WRITABLE, 0x221888)
+        self.assertEqual(rv32_hart.MIE_WRITABLE, 0x888)
+
+    def test_the_new_keys_are_read_once_by_both_restores(self) -> None:
+        machine = self.source()
+        set_new_state(machine)
+        good = machine.snapshot()
+
+        class Shifty(dict):
+            def __init__(self, data, key, alt):
+                super().__init__(data)
+                self.key, self.alt, self.reads = key, alt, 0
+
+            def __getitem__(self, name):
+                if name == self.key:
+                    self.reads += 1
+                    if self.reads > 1:
+                        return self.alt
+                return dict.__getitem__(self, name)
+
+        alts = {("root", "version"): [1, 3], ("hart", "privilege"): ["M", "S", None], ("hart", "reservation"): [DATA, DATA + 1, None],
+                ("hart", "csrs"): [{}, None], ("clint", "msip"): [0, 2, None]}
+        for key in good["hart"]["csrs"]:
+            alts[("csrs", key)] = [0, 3, None]
+        count = 0
+        for (level, key), options in alts.items():
+            for alt in options:
+                for route in ("hart", "machine"):
+                    if route == "hart" and level == "clint":
+                        continue
+                    state = copy.deepcopy(good)
+                    if route == "hart":
+                        state = {k: state[k] for k in ("version", "hart", "ram")}
+                    if level == "root":
+                        state = Shifty(state, key, alt)
+                    elif level == "csrs":
+                        state["hart"]["csrs"] = Shifty(state["hart"]["csrs"], key, alt)
+                    else:
+                        state[level] = Shifty(state[level], key, alt)
+                    target = self.used_target()
+                    before = full_state(target)
+                    expected = good if route == "machine" else {k: good[k] for k in ("version", "hart", "ram")}
+                    with self.subTest(route=route, level=level, key=key, alt=repr(alt)[:20]):
+                        try:
+                            (target.hart if route == "hart" else target).restore(state)
+                        except ValueError:
+                            self.assertEqual(full_state(target), before)
+                        else:
+                            snap = target.snapshot()
+                            self.assertEqual(snap if route == "machine" else {k: snap[k] for k in ("version", "hart", "ram")},
+                                             expected)
+                        count += 1
+        self.assertGreater(count, 40)
+
+    def test_every_new_field_changes_the_hash(self) -> None:
+        machine = self.source()
+        reference = machine.state_hash()
+        seen = {reference}
+        isa = rv32_isa
+        changes = {"mstatus": isa.MSTATUS_MIE, "mie": isa.MIE_MSIE, "mtvec": 4, "mscratch": 1, "mepc": 4, "mcause": 1, "mtval": 1,
+                   "privilege": isa.PRIV_U, "reservation": DATA}
+        for name, value in [*changes.items(), ("msip", 1)]:
+            with self.subTest(field=name):
+                state = machine.snapshot()
+                setattr(machine.clint if name == "msip" else machine.hart, name, value)
+                digest = machine.state_hash()
+                self.assertNotIn(digest, seen)
+                seen.add(digest)
+                machine.restore(state)
+                self.assertEqual(machine.state_hash(), reference)
+
+    def test_reset_attach_memory_and_load_flat_return_the_new_state_to_reset(self) -> None:
+        machine = self.source()
+        put = set_new_state(machine)
+        reset = {"mstatus": 0, "mie": 0, "mtvec": 0, "mscratch": 0, "mepc": 0, "mcause": 0, "mtval": 0,
+                 "privilege": rv32_isa.PRIV_M, "reservation": None}
+        other = Rv32Memory(RAM)
+        self.addCleanup(other.close)
+        original = machine.memory
+        machine.hart.attach_memory(other)                      # pierde la reserva; conserva CSR y privilegio
+        self.assertEqual(new_state_of(machine), {**put, "reservation": None})
+        machine.hart.attach_memory(original)
+        machine.hart.reset()
+        self.assertEqual(new_state_of(machine), {**reset, "msip": 1})   # el reinicio del hart no toca el CLINT
+        set_new_state(machine)
+        machine.load_flat(assemble(PROGRAM))
+        self.assertEqual(new_state_of(machine), {**reset, "msip": 0})
+
+    def test_bounded_invariant_s_carries_the_new_state_through_every_cut(self) -> None:
+        rng = random.Random(30)
+        for index in range(12):
+            words = random_program(rng, rng.randrange(20, 120))
+            if index % 2:
+                words = hostile_layout(words, rng, 0x40, max(64, 4 * len(words) - 0x40))
+            image = assemble(words)
+
+            def fresh(accelerate: bool, warmup: int = 1, image: bytes = image) -> Machine:
+                machine = Machine(ram_bytes=RAM)
+                self.addCleanup(machine.close)
+                machine.load_flat(image)
+                machine.hart.accelerate, machine.hart.warmup = accelerate, warmup
+                return machine
+
+            whole = fresh(False)
+            put = set_new_state(whole)
+            whole_stop = whole.run(600)
+            expected = whole.snapshot()
+            self.assertEqual(new_state_of(whole), put)          # ninguna instrucción de H3.0 los toca
+            current = fresh(True)
+            set_new_state(current)
+            consumed = 0
+            stop = Stop("gas")
+            for step in range(40):
+                chunk = min(rng.randrange(1, 30), 600 - consumed)
+                stop = current.run(chunk)
+                consumed += chunk - current.hart.gas
+                if stop.reason != "gas" or consumed == 600:
+                    break
+                target = fresh(step % 2 == 0, 1 + step % 2) if step % 3 else self.used_target()
+                (target.restore_bytes(current.snapshot_bytes()) if step % 4 == 0 else target.restore(current.snapshot()))
+                self.assertEqual(target.state_hash(), current.state_hash())
+                current = target
+            if stop.reason == "gas" and consumed < 600:
+                stop = current.run(600 - consumed)
+            with self.subTest(program=index):
+                self.assertEqual(stop, whole_stop)
+                self.assertEqual(current.snapshot(), expected)
+                self.assertEqual(new_state_of(current), put)
+
+
+class TrapsUnderSnapshots(unittest.TestCase):
+    """H3.1: la invariante S acotada con traps manejados, MRET y modo U: cada corte (snapshot, restauración en máquina
+    nueva o usada, a veces por bytes, con aceleración distinta) da lo mismo que la ejecución entera."""
+
+    def test_random_trap_programs_survive_every_cut(self) -> None:
+        from tests.test_rv32_hart import random_trap_program, with_handler
+        rng = random.Random(311)
+        traps = users = 0
+        for index in range(40):
+            image = with_handler(random_trap_program(rng, rng.randrange(20, 120)))
+            gas = 500
+
+            def fresh(accelerate: bool, warmup: int = 1, image: bytes = image) -> Machine:
+                machine = Machine(ram_bytes=RAM)
+                self.addCleanup(machine.close)
+                machine.load_flat(image)
+                machine.hart.accelerate, machine.hart.warmup = accelerate, warmup
+                return machine
+
+            whole = fresh(False)
+            whole_stop = whole.run(gas)
+            expected = whole.snapshot()
+            traps += whole.hart.mcause != 0
+            users += whole.hart.privilege == rv32_isa.PRIV_U
+            cuts = sorted({rng.randrange(1, gas) for _ in range(12)})
+            current = fresh(True)
+            last, stop = 0, Stop("gas")
+            for step, cut in enumerate(cuts):
+                stop = current.run(cut - last)
+                if stop.reason != "gas":
+                    break
+                last = cut
+                target = fresh(step % 2 == 1, 1 + step % 2) if step % 3 else make_machine(LOOP, {20: 20}, accelerate=True, warmup=1)
+                if not step % 3:
+                    self.addCleanup(target.close)
+                    target.run(1000)                                   # destino usado
+                (target.restore_bytes(current.snapshot_bytes()) if step % 4 == 0 else target.restore(current.snapshot()))
+                self.assertEqual(target.state_hash(), current.state_hash())
+                current = target
+            if stop.reason == "gas":
+                stop = current.run(gas - last)
+            with self.subTest(program=index):
+                self.assertEqual(stop, whole_stop)
+                self.assertEqual(current.snapshot(), expected)
+        self.assertGreater(traps, 30)
+        self.assertGreater(users, 2)
+
+
+class InterruptsUnderSnapshots(unittest.TestCase):
+    """H3.4: la invariante S acotada con interrupciones del CLINT y WFI: todo lo que decide la entrega (mie, mstatus,
+    privilegio, msip, mtimecmp, instret, divisor) viaja en el snapshot y el plazo se recalcula en cada run, así que cada
+    corte (también el que cae justo tras una WFI que durmió o justo antes de una entrada en interrupción) da lo mismo
+    que la ejecución entera."""
+
+    def test_random_interrupt_programs_survive_every_cut(self) -> None:
+        from tests.test_rv32_hart import Reference, random_interrupt_program, with_interrupt_handler
+        rng = random.Random(341)
+        interrupted = slept = 0
+        for index in range(40):
+            divisor = (1, 3, 7)[index % 3]
+            image = with_interrupt_handler(random_interrupt_program(rng, rng.randrange(20, 120), rng.random() < 0.4),
+                                           rng.choice((0, 7, 25)))
+            gas = 600
+
+            def fresh(accelerate: bool, warmup: int = 1, image: bytes = image, divisor: int = divisor) -> Machine:
+                machine = Machine(ram_bytes=RAM, time_divisor=divisor)
+                self.addCleanup(machine.close)
+                machine.load_flat(image)
+                machine.hart.accelerate, machine.hart.warmup = accelerate, warmup
+                return machine
+
+            whole = fresh(False)
+            whole_stop = whole.run(gas)
+            expected, expected_gas = whole.snapshot(), whole.hart.gas
+            census = Reference(image, clint=True, divisor=divisor)   # recuento de cobertura: interrupciones tomadas
+            census.run(gas)
+            interrupted += bool(census.taken)
+            slept += whole.hart.instret > gas - whole.hart.gas
+            cuts = sorted({rng.randrange(1, gas) for _ in range(14)})
+            current = fresh(True)
+            last, stop, consumed = 0, Stop("gas"), 0
+            for step, cut in enumerate(cuts):
+                stop = current.run(cut - last)
+                consumed += cut - last - current.hart.gas
+                if stop.reason != "gas":
+                    break
+                last = cut
+                target = fresh(step % 2 == 1, 1 + step % 2) if step % 3 else make_machine(LOOP, {20: 20}, accelerate=True, warmup=1)
+                if not step % 3:
+                    self.addCleanup(target.close)
+                    target.run(1000)                                   # destino usado (y con el divisor predeterminado)
+                (target.restore_bytes(current.snapshot_bytes()) if step % 4 == 0 else target.restore(current.snapshot()))
+                self.assertEqual(target.state_hash(), current.state_hash())
+                current = target
+            if stop.reason == "gas":
+                stop = current.run(gas - last)
+                consumed += gas - last - current.hart.gas
+            with self.subTest(program=index):
+                self.assertEqual(stop, whole_stop)
+                self.assertEqual(current.snapshot(), expected)
+                self.assertEqual(consumed, gas - expected_gas)             # el mismo gas consumido, troceado o no
+        self.assertGreater(interrupted, 15)
+        self.assertGreater(slept, 3)
 
 
 class CoreMarkUnderSnapshots(unittest.TestCase):

@@ -3,7 +3,7 @@
 | Campo | Valor |
 |---|---|
 | Identificador | RFC-EXP-00019 |
-| Estado | PROPUESTO (RFC de investigación abierto por decisión del usuario del 2026-10-12, RFC-EXP-00018 §5 «Hoja de ruta»); ningún experimento ejecutado salvo la prueba de humo del toolchain [L4] |
+| Estado | PROPUESTO (RFC de investigación abierto por decisión del usuario del 2026-10-12, RFC-EXP-00018 §5 «Hoja de ruta»); ningún experimento ejecutado salvo la prueba de humo del toolchain [L4]. Revisado el 2026-10-21 tras H3 de RFC-EXP-00018 (Anexo C): enmiendas propuestas, ningún código Rust en el repositorio, verificación del Anexo A pendiente |
 | Fecha | 2026-10-17 |
 | Firmado | OMRI |
 | Relacionado | RFC-EXP-00018 (P1 hart, P2 arnés bajo corte, P2.3 hash, P2.5 inventario, P5 núcleo nativo, E4, E8, «Hoja de ruta»); RFC-EXP-00015 (§32 criterios para abandonar el estado experimental) |
@@ -22,6 +22,8 @@ Seis experimentos (EN1–EN6) con cifra asesina deciden si el núcleo entra: si 
 ## 2. Estado del arte (mapa breve; detalle y verificación en el Anexo A)
 
 ### 2.1 Punto de partida (HECHO, repositorio)
+
+*Estado al 2026-10-17, cierre de H2. El hart tras H3 y la medida del arranque de Linux están en el Anexo C.1.*
 
 - El hart Python implementa RV32I y los contadores Zicntr con comprobar-y-confirmar, dos contadores (gas del host e `instret`), horizonte de eventos por bloque, caché de decodificación y bloques compilados invalidados por generación de página con mapa de líneas de código de 16 bytes (H2.0), y una plataforma mínima (UART, SYSCON, CLINT) [L1][L2]. 2 372 líneas en siete módulos, 135 pruebas propias, especificaciones y revisiones en `.forja/h1` y `.forja/h2` [L2].
 - Medidas: CoreMark rv32i 2,24/2,44/1,96 M instr/s interpretado en Python 3.13/3.12/3.10, bloques con horizonte 3,21×/3,18×/3,52×; Embench (14 benchmarks) 3,30–3,37× de media geométrica; Linux nommu hasta el shell cuesta 64,9 M de instrucciones en mini-rv32ima [L1].
@@ -61,7 +63,7 @@ Lectura: hay precedentes serios de RISC-V en Rust con ejecución determinista y 
 
 ### 2.5 El toolchain de la máquina del proyecto (HECHO [L4], 2026-10-17)
 
-`rustc 1.90.0` y `cargo 1.90.0` (canal `stable-x86_64-pc-windows-msvc`), Visual Studio 2022 Build Tools con SDK de Windows 10.0.26100, LLD 21.1.0 de LLVM, caché local de crates de 717 MB. El `link.exe` de Git (`E:\Git\usr\bin`) precede al de MSVC en el `PATH`; fijando `linker = "C:/Program Files/LLVM/bin/lld-link.exe"` en `.cargo/config.toml` un `cdylib` con `panic = "abort"`, `lto`, `codegen-units = 1` y `overflow-checks = true` compila y enlaza en 1,7 s (9 728 bytes) y `ctypes.CDLL` lo carga y llama. No hay que instalar nada para los experimentos EN1–EN3 y EN5; Miri y cargo-fuzz exigen el canal nightly, que no está instalado (EN4 pide permiso antes).
+`rustc 1.90.0` y `cargo 1.90.0` (canal `stable-x86_64-pc-windows-msvc`), Visual Studio 2022 Build Tools con SDK de Windows 10.0.26100, LLD 21.1.0 de LLVM, caché local de crates de 717 MB. El `link.exe` de Git (`E:\Git\usr\bin`) precede al de MSVC en el `PATH`; fijando `linker = "C:/Program Files/LLVM/bin/lld-link.exe"` en `.cargo/config.toml` un `cdylib` con `panic = "abort"`, `lto`, `codegen-units = 1` y `overflow-checks = true` compila y enlaza en 1,7 s (9 728 bytes) y `ctypes.CDLL` lo carga y llama. No hay que instalar nada para los experimentos EN1–EN3 y EN5; Miri y cargo-fuzz exigen el canal nightly, que no está instalado (EN4 pide permiso antes). **Corregido el 2026-10-21 (Anexo C.1):** `nightly-2025-02-14` con el componente `miri` ya estaba instalado; no están cargo-fuzz ni Kani.
 
 ### 2.6 Frontera del barrido
 
@@ -71,7 +73,7 @@ No se localizó: un port de mini-rv32ima a Rust; cifras de MIPS publicadas de rv
 
 ### N1. Qué es el núcleo Rust y qué no es (PROPUESTA)
 
-1. Un **ejecutor rápido** de la semántica del hart Python de RFC-EXP-00018 P1 (RV32I + Zicntr en su primera versión; M, A, Zicsr y traps cuando H3 los tenga en Python), con la misma tarifa de gas, el mismo horizonte, la misma plataforma mínima (UART, SYSCON, CLINT) y las mismas libertades fijadas (P1.8). No añade nada que el hart Python no haga; una instrucción que el Python trata como ilegal, el núcleo también.
+1. Un **ejecutor rápido** de la semántica del hart Python de RFC-EXP-00018 P1 (RV32I + Zicntr en su primera versión; M, A, Zicsr y traps cuando H3 los tenga en Python), con la misma tarifa de gas, el mismo horizonte, la misma plataforma mínima (UART, SYSCON, CLINT) y las mismas libertades fijadas (P1.8). No añade nada que el hart Python no haga; una instrucción que el Python trata como ilegal, el núcleo también. Orden de las capas tras H3: Anexo C.2.1.
 2. **Opcional y silencioso en su ausencia**: `cpu_digital/rv32_native.py` busca el binario, comprueba su hash y su autoprueba (N4 V7) y, si algo falla, el proyecto sigue en Python puro con el motivo registrado. La rueda de PyPI sigue siendo Python puro y no lleva el binario.
 3. **El hart Python es la especificación ejecutable y el único juez.** El núcleo Rust nunca certifica nada; se le certifica (N3). Las pruebas de conformidad (riscv-tests, ACT4, invariante S) se ejecutan contra el Python; el núcleo las pasa por equivalencia.
 4. **Determinismo por construcción**: sin coma flotante del host, sin hilos, sin reloj, sin asignación dinámica durante la ejecución (la RAM la aporta Python), enteros siempre con `wrapping_*`/`checked_*` explícitos, sin `as` que trunque sin anotación revisada.
@@ -79,16 +81,16 @@ No se localizó: un port de mini-rv32ima a Rust; cifras de MIPS publicadas de rv
 ### N2. La frontera: ABI C mínima por ventana, memoria compartida, sin dependencias (PROPUESTA)
 
 1. **Un `cdylib` con ABI C** (`#[repr(C)]`, `extern "C"`), cargado con `ctypes.CDLL` (libera el GIL durante la llamada [R14]; la disciplina es que Python no toca la RAM compartida mientras el núcleo corre). Sin PyO3 ni maturin en la primera versión: cero dependencias nuevas de Python y la rueda intacta; se reconsidera si la frontera domina el coste (§4).
-2. **Memoria compartida sin copia**: Python pasa en cada llamada el puntero y el tamaño del `mmap` de `Rv32Memory` (`ctypes.addressof` sobre el búfer) y el núcleo lo usa solo durante esa llamada; nunca guarda el puntero. La RAM, las páginas escritas y el snapshot siguen siendo de Python.
-3. **Funciones** (≤ 10): `rv32n_version() -> u32`, `rv32n_abi_hash() -> u64` (hash de la definición del ABI, comprobado al cargar), `rv32n_run(estado*, ram*, ram_len, dispositivos*, gas) -> parada`, `rv32n_step(...)` (una instrucción; **solo para la validación V1**, no para producción), `rv32n_dirty(...)` (mapa de bits de páginas escritas en la ventana), `rv32n_selftest() -> u32`. El `estado` es una `struct` C con registros, `pc`, `instret`, CSR y la reserva LR/SC (campo presente desde el principio, P2.5), espejo exacto del inventario del snapshot Python.
+2. **Memoria compartida sin copia**: Python pasa en cada llamada el puntero y el tamaño del `mmap` de `Rv32Memory` (`ctypes.addressof` sobre el búfer) y el núcleo lo usa solo durante esa llamada; nunca guarda el puntero. La RAM, las páginas escritas y el snapshot siguen siendo de Python. La coherencia con `written`, `generations` y `code` está en el Anexo C.2.4.
+3. **Funciones** (≤ 10): `rv32n_version() -> u32`, `rv32n_abi_hash() -> u64` (hash de la definición del ABI, comprobado al cargar), `rv32n_run(estado*, ram*, ram_len, dispositivos*, gas) -> parada`, `rv32n_step(...)` (una instrucción; **solo para la validación V1**, no para producción), `rv32n_dirty(...)` (mapa de bits de páginas escritas en la ventana), `rv32n_selftest() -> u32`. El `estado` es una `struct` C con registros, `pc`, `instret`, CSR y la reserva LR/SC (campo presente desde el principio, P2.5), espejo exacto del inventario del snapshot Python. El inventario v2 y la semántica del bucle externo están en el Anexo C.2.2 y C.2.3.
 4. **Nada escapa como excepción**: `panic = "abort"` y, además, todo error previsible vuelve como código de parada; el núcleo no puede entrar en pánico por una entrada del invitado (lo prueban V3 y V4). Los pánicos en `extern "C"` abortan desde 1.81 [R19]: eso es una red, no el mecanismo de error.
-5. **Una llamada por ventana** (W ≥ 2²⁰ instrucciones; EN2 elige W): con 435 ns por llamada [L4], la frontera cuesta < 0,1 % a 10 MIPS.
+5. **Una llamada por ventana** (W ≥ 2²⁰ instrucciones; EN2 elige W): con 435 ns por llamada [L4], la frontera cuesta < 0,1 % a 10 MIPS. La ventana se mide en gas (Anexo C.2.5).
 
 ### N3. Certificación por ventanas (PROPUESTA; refina RFC-EXP-00018 P5)
 
 1. El núcleo ejecuta la ventana i desde el estado S_i y entrega un **fotograma** F_i = (S_{i+1}, páginas escritas en la ventana con su imagen posterior, entradas no deterministas consumidas con su `instret`, bytes emitidos por el UART, motivo de parada, hash P2.3 de S_{i+1}).
 2. El hart Python **reejecuta cada ventana** desde S_i con el mismo gas y compara su resultado con F_i bit a bit (estado, páginas, salidas, parada, hash). Las ventanas son independientes y se certifican en P procesos. Si todas coinciden, por inducción la ejecución nativa entera es la de la especificación Python.
-3. Dos modos: **completo** (toda ventana certificada; obligatorio en CI para CoreMark, Embench, riscv-tests y la invariante S) y **muestreado** (una de cada k ventanas; solo como prueba de humo declarada, nunca como garantía: SMARTS estima medias, no universales, RFC-EXP-00018 [R40]).
+3. Dos modos: **completo** (toda ventana certificada; obligatorio en CI para CoreMark, Embench, riscv-tests y la invariante S) y **muestreado** (una de cada k ventanas; solo como prueba de humo declarada, nunca como garantía: SMARTS estima medias, no universales, RFC-EXP-00018 [R40]). Un tercer modo, interactivo diferido, se propone en el Anexo C.2.7 y queda pendiente de decisión del usuario.
 4. La **puerta de inventario** (P2.5) cierra el agujero de la inducción: cada campo del estado nativo figura en la `struct` del ABI y en el snapshot Python, o en la lista blanca de cachés derivadas con su regla de invalidación. Un campo nuevo sin clasificar pone la CI en rojo.
 5. **Modo diagnóstico**: con `rv32n_step` y el hash P2.3 por instrucción, la primera divergencia se localiza sin bisección.
 
@@ -97,7 +99,7 @@ No se localizó: un port de mini-rv32ima a Rust; cifras de MIPS publicadas de rv
 | Peldaño | Qué exige | Evidencia que se presenta | Quién la verifica |
 |---|---|---|---|
 | V0 Tipos y lints | `#![deny(unsafe_code)]` en toda la crate salvo `ffi.rs` (≤ 60 líneas, cada `unsafe` con su comentario de invariante); `#![deny(warnings)]` y clippy pedante en CI; `overflow-checks = true` también en `release`; `panic = "abort"`; sin `as` que trunque sin `#[allow]` justificado; sin coma flotante; cero crates externas | `cargo clippy` y `cargo build` limpios con la configuración versionada | CI y revisor Rust |
-| V1 Equivalencia instrucción a instrucción | `rv32n_step` frente al hart Python sobre ≥ 10⁶ programas aleatorios (los generadores de las pruebas de H1 más uno propio del revisor), riscv-tests (H2.3), CoreMark y Embench completos comparando el hash P2.3 **en cada instrucción** | 0 divergencias; recuento de instrucciones y clases cubiertas | Oráculo matemático independiente |
+| V1 Equivalencia instrucción a instrucción | `rv32n_step` frente al hart Python sobre ≥ 10⁶ programas aleatorios (los generadores de las pruebas de H1 más uno propio del revisor), riscv-tests (H2.3), CoreMark y Embench completos comparando el hash P2.3 **en cada instrucción** (enmendado en el Anexo C.2.6) | 0 divergencias; recuento de instrucciones y clases cubiertas | Oráculo matemático independiente |
 | V2 Invariante S con el núcleo | Cortes de gas arbitrarios y sesgados en la frontera de ventana; `run(B1); fotograma; restore en Python; run(B2)` ≡ ejecución seguida, con y sin certificación | ≥ 1 000 cortes por programa, 0 divergencias (E4 extendido) | Arnés de H2.2 |
 | V3 Fuzzing | (a) Interno: cargo-fuzz con `arbitrary` sobre decodificador y ejecutor, sanitizadores, 24 h sin pánico ni UB; (b) diferencial: programas hostiles generados desde Python (fuera de RAM, desalineados, código automodificable, MMIO) contra el hart Python | Corpus versionado; 0 fallos; cobertura de ramas del núcleo ≥ 95 % | Revisor ciego 2 |
 | V4 Miri y Kani | Miri sobre toda la suite Rust (0 UB, incluidas las reglas de alias experimentales); arneses Kani que **demuestran** las guardas de memoria (ningún acceso fuera de la RAM para cualquier dirección y ancho), la extensión de signo, el desbordamiento de `pc` y la decodificación `decode(encode(x)) = x` sobre los campos | Salidas literales; lista de arneses | Revisor Rust |
@@ -139,9 +141,9 @@ Cada experimento nombra la cifra que mata la propuesta; si se alcanza, se para, 
 - **EN3 — Invariante S con el núcleo (sobre H2.2).** 1 000 cortes por programa en la frontera de ventana y dentro de ella (parada por gas y continuación en Python). **Mata** N1–N3 si aparece una divergencia que solo se cure con checkpoint por instrucción en el núcleo o con un coste que dependa de la partición.
 - **EN4 — Escalera de validación (1–2 semanas; nightly con permiso).** Miri limpio, arneses Kani demostrados, 24 h de fuzz sin fallo, ≥ 50 mutantes con ≥ 95 % muertos **por la certificación**. **Mata** N3 (obliga a rediseñar el fotograma) si el certificador deja vivos más del 5 % de los mutantes no equivalentes.
 - **EN5 — Reproducibilidad y cadena.** Dos construcciones en rutas distintas en Windows y en Linux con el mismo toolchain fijado dan el mismo sha256; `cargo vet` sin nada que auditar. **Mata** la carga condicionada al hash (N4 V7) si los binarios no son reproducibles en los corredores de CI; la alternativa sería firmar artefactos, que no se propone aquí.
-- **EN6 — Arranque de Linux nommu (después de H3).** El objetivo real: tiempo de arranque hasta el shell en nativo frente a Python, certificado por completo (65 M de instrucciones son 16–62 ventanas de 2²²). La cifra «cómoda» para el shell y para Doom la fija el usuario; el experimento la mide, no la inventa.
+- **EN6 — Arranque de Linux nommu (después de H3).** El objetivo real: tiempo de arranque hasta el shell en nativo frente a Python, certificado por completo (65 M de instrucciones son 16–62 ventanas de 2²²). La cifra «cómoda» para el shell y para Doom la fija el usuario; el experimento la mide, no la inventa. La base medida en el hart está en el Anexo C.1. Las ventanas se cuentan en gas (C.2.5).
 
-**Riesgos transversales.** R-G: la escalera N4 puede costar más que el núcleo; se acepta porque es el precio de una segunda implementación. R-H: el canal nightly puede romper Miri o cargo-fuzz entre versiones; se fija también la fecha del nightly. R-I: una ventaja de 50× haría tentador relajar la certificación a muestreo en producción; este RFC lo prohíbe fuera de la prueba de humo. R-J: el núcleo RV32I de la primera versión queda atrás cuando H3 añada M, A, Zicsr y traps al Python; la regla es que el núcleo nunca va por delante del Python y que la certificación falla en rojo si el Python ejecuta algo que el núcleo no (parada «no implementado» en nativo ⇒ vuelta a Python para esa ventana).
+**Riesgos transversales.** R-G: la escalera N4 puede costar más que el núcleo; se acepta porque es el precio de una segunda implementación. R-H: el canal nightly puede romper Miri o cargo-fuzz entre versiones; se fija también la fecha del nightly. R-I: una ventaja de 50× haría tentador relajar la certificación a muestreo en producción; este RFC lo prohíbe fuera de la prueba de humo. R-J: el núcleo RV32I de la primera versión queda atrás cuando H3 añada M, A, Zicsr y traps al Python; la regla es que el núcleo nunca va por delante del Python y que la certificación falla en rojo si el Python ejecuta algo que el núcleo no (parada «no implementado» en nativo ⇒ vuelta a Python para esa ventana). Desde H3 el núcleo arranca por detrás del Python; el orden de las capas está en el Anexo C.2.1.
 
 **Preguntas abiertas.** ¿Qué W minimiza coste total (EN2)? ¿Conviene que el núcleo reporte también el hash P2.3 por instrucción en modo diagnóstico, o basta por ventana? ¿Se versiona algún binario para los usuarios sin toolchain, o solo se construye en CI? ¿Qué cifra es «cómoda» para el shell y para Doom?
 
@@ -187,6 +189,12 @@ Cada experimento nombra la cifra que mata la propuesta; si se alcanza, se para, 
 - [L2] `cpu_digital/rv32_{isa,decode,alu,mem,hart,platform,blocks}.py`, `tests/test_rv32_*.py`, `.forja/h1/`, `.forja/h2/`: el hart Python, sus especificaciones y revisiones.
 - [L3] `pyproject.toml` (paquete Python puro, `dependencies = ["tramoya==1.5.3"]`) y `.github/workflows/ci.yml` (lint, pruebas en 3.10–3.13 en Linux, 3.13 en Windows informativo).
 - [L4] Prueba de humo del 2026-10-17 en la máquina del proyecto (Anexo B): toolchain, construcción del `cdylib`, lint de `no_mangle`, coste de la llamada `ctypes`.
+- [L5] Revisión del 2026-10-21 (Anexo C; `.forja/rfc19/revision_director_2026-10-21.md`). Fuentes:
+  - `cpu_digital/rv32_{hart,mem,platform}.py` tras H3: inventario `STATE_FIELDS`, contrato de escritura de `Rv32Memory`, `state_hash`, `run` y `Stop`;
+  - `.forja/h3/cifras_h3/linux_h35.json`;
+  - `.forja/progress.json` de H3;
+  - `wc -l cpu_digital/rv32_*.py`;
+  - `rustup toolchain list` y `rustup +nightly-2025-02-14 component list --installed`, en solo lectura.
 
 ## Anexo A — Mapa breve: método y verificación
 
@@ -213,3 +221,84 @@ Coste de una llamada ctypes (5 rondas de 300 000): 434–436 ns; la misma suma e
 ```
 
 Consecuencias de diseño: N2.5 (frontera por ventana), N4 V0 (`deny(unsafe_code)` con `unsafe` solo en la frontera y atributos `unsafe(no_mangle)`), N5 (`.cargo/config.toml` con `lld-link` versionado), R-C.
+
+## Anexo C — Revisión del 2026-10-21 tras H3 de RFC-EXP-00018
+
+Esta es la revisión del director (informe en `.forja/rfc19/revision_director_2026-10-21.md`). No sustituye a la verificación del Anexo A, que sigue pendiente. El anexo enmienda por número: el texto de arriba se conserva como se firmó, con una remisión aquí en cada punto afectado (§2.1, §2.5, N1.1, N2.2, N2.3, N2.5, N3.3, V1, EN6, R-J).
+
+**C.1 Punto de partida tras H3 (HECHO [L5]; RFC-EXP-00018 [L13]).**
+
+- **El hart.** El hart Python es RV32IMA_Zicsr con modos M y U. Tiene:
+  - traps, con modo compatible cuando el destino del trap no está en la RAM;
+  - interrupciones del CLINT (MEI > MSI > MTI) con plazo del temporizador y `WFI`;
+  - reserva LR/SC con la política R-9;
+  - generador de DTB y snapshot v2.
+
+  Son ocho módulos `rv32_*` con 3 385 líneas. Pasan riscv-tests rv32mi 13/13, rv32um 8/8 y rv32ua 10/10, y E4 da 0 divergencias de la invariante S en 338 programas.
+- **P2.5 y P2.3.** La puerta de inventario de P2.5 está implementada. El hash de P2.3 no: `state_hash` es un sha256 del snapshot canónico entero, no un hash incremental.
+- **Linux nommu hasta `~ #`.** El arranque cuesta 64 991 743 de gas y 65 135 914 de `instret`. Tarda:
+
+  | Modo | Tiempo | Compilaciones |
+  |---|---|---|
+  | Intérprete | 41,7 s | — |
+  | Bloques, calentamiento 1 | 85,9 s | 259 843 |
+  | Bloques, calentamiento 2 | 42,7 s | 96 192 |
+
+  Los bloques no aceleran el arranque. La base de EN6 es el intérprete, a ~1,6 M instr/s en el kernel.
+- **Toolchain** (2026-10-21, solo lectura). Además del stable 1.90.0 está instalado `nightly-2025-02-14` (`rustc 1.86.0-nightly`), con el componente `miri` y `cargo-miri`. Su carpeta es anterior a este RFC, así que §2.5 era inexacto al firmarse: la prueba de humo solo miró el toolchain activo. No están cargo-fuzz ni Kani.
+
+**C.2 Enmiendas propuestas (PROPUESTA).**
+
+1. **N1.1 y R-J: orden de las capas.** El núcleo se implementa por capas y cada capa se certifica antes de empezar la siguiente:
+   1. RV32I + Zicntr (EN1, CoreMark rv32i);
+   2. M;
+   3. Zicsr con traps M/U y modo compatible;
+   4. A con R-9;
+   5. CLINT con plazo, gas apartado y `WFI`.
+
+   EN6 exige todas. Mientras falte una, el núcleo para con `no_implementado` antes de la instrucción y la ventana sigue en Python. R-J no cambia.
+2. **N2.3: la `struct` del ABI es el inventario v2.** Contiene:
+   - del hart: `regs`, `pc`, `instret`, `reservation`, `time_divisor`, `privilege`, `mstatus`, `mie`, `mtvec`, `mscratch`, `mepc`, `mcause` y `mtval`;
+   - del CLINT: `mtimecmp` y `msip`;
+   - del UART: la cola de entrada y los bytes de salida de la ventana.
+
+   `rv32n_abi_hash` cubre la disposición de la `struct`. La puerta P2.5 se extiende a la `struct` de `rv32_native.py`: un campo de `STATE_FIELDS` sin espejo en ella pone la suite en rojo.
+3. **N2.3: semántica del bucle externo.** El núcleo replica la de `Rv32Hart.run`:
+   - Reevalúa las interrupciones al empezar, tras un trap y tras cada instrucción que cambia qué es tomable: escritura de `mstatus` o `mie`, `MRET`, store a un dispositivo y `WFI`.
+   - Aparta el gas que rebasa el plazo del temporizador y lo devuelve al reevaluar o al salir.
+   - `WFI` adelanta `instret` hasta el plazo sin cobrar gas. Si no hay evento posible, para con `wfi`.
+   - Los motivos de parada son los de `Stop` (`gas`, `apagado`, `reinicio`, `fallo`, `ebreak`, `ecall`, `interrupcion`, `wfi`) más `no_implementado`, con `cause` y `value`.
+4. **N2.2: coherencia de las cachés y del snapshot.** Una ventana nativa cuenta como una escritura del host. Al volver, `rv32_native.py` hace dos cosas:
+   - pone `written` y sube `generations` en cada página del mapa sucio, como `load_bytes`;
+   - si el estado devuelto tiene reserva, vuelve a marcar su línea en `code`, como `restore`.
+
+   Sin esto, el snapshot pierde páginas o una caché Python ejecuta código viejo; por ejemplo, tras una ventana nativa que reescribe código. V2 lo prueba con dos mutantes del cargador: «sin `written`» y «sin subir la generación».
+5. **N2.5, N3 y EN6: ventanas en gas.** La ventana se mide en gas, que es lo que reparte `run(gas)` y lo que conserva S. Desde H3 gas e `instret` difieren: un trap cobra gas sin `instret` y `WFI` adelanta `instret` sin gas (144 171 de diferencia en el arranque de Linux). El fotograma lleva los dos contadores.
+6. **V1: comparación por instrucción.** Mientras P2.3 no tenga hash incremental, V1 compara en cada paso dos cosas:
+   - un resumen arquitectónico: registros, `pc`, `instret`, gas, los CSR del inventario, privilegio y reserva;
+   - la lista de stores del paso (dirección, ancho, valor).
+
+   El sha256 entero solo se compara en las fronteras de ventana. El modo diagnóstico de N3.5 hace lo mismo.
+7. **N3.3: modo interactivo diferido.** El modo completo (CI) y el muestreado (humo) no cambian. En el nuevo modo:
+   - el núcleo corre por delante y P procesos certifican sus ventanas en segundo plano;
+   - toda salida del UART de una ventana sin certificar se marca como no certificada;
+   - si una ventana diverge, la máquina vuelve al último fotograma certificado y sigue en Python, con el motivo en el registro.
+
+   R-I se mantiene: el muestreo nunca es garantía y este modo no declara nada certificado hasta que lo está. **Decisión del usuario:** si este modo entra.
+8. **V3(a) y V4: plataforma.**
+   - Miri puede correr con el nightly instalado, con permiso del usuario para usarlo. Ese nightly se fija en el `rust-toolchain.toml` del arnés de Miri, no en el del núcleo, que sigue en 1.90.0.
+   - cargo-fuzz y Kani necesitan instalarse.
+   - CONJETURA, a confirmar en la verificación del Anexo A: si no tienen soporte en Windows MSVC, esos peldaños corren solo en el corredor Linux de `native-nightly`.
+
+**C.3 Coste (CONJETURA).**
+
+- Las capas M, Zicsr con traps, A y CLINT añaden al núcleo del orden de 600–900 líneas de Rust con sus pruebas, sobre las 1 500–2 500 de N6.
+- Certificar el arranque de Linux entero con 4 procesos costaría del orden de 10–15 s de pared con el intérprete Python de C.1. Cabe en la CI de EN2.
+
+**C.4 Pendiente.**
+
+- La verificación del Anexo A es requisito antes de EN1: un ciego revisa las 31 [R#] y otro ataca N2–N4 con estas enmiendas.
+- Preguntas nuevas para el usuario:
+  - si entra el modo interactivo diferido (C.2.7);
+  - si V1 espera al hash incremental de P2.3 o usa el resumen (C.2.6);
+  - el permiso para usar el nightly instalado en EN4 (C.2.8).

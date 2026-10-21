@@ -63,6 +63,37 @@ class MachineTests(unittest.TestCase):
             machine.hart.regs[index] = value
         return machine
 
+    def test_msip_register_keeps_only_bit_zero_under_partial_accesses(self) -> None:
+        # H3.0: registro msip del CLINT en +0, 32 bits de los que solo el bit 0 tiene estado (WARL).
+        from cpu_digital import rv32_platform
+        msip_offset = rv32_platform.CLINT_MSIP
+        machine = self.make([EBREAK])
+        clint, bus, base = machine.clint, machine.bus, CLINT_BASE + msip_offset
+        self.assertEqual(clint.msip, 0)
+        bus.store(base, 4, 0xFFFFFFFF)
+        self.assertEqual((clint.msip, bus.load(base, 4), bus.load(base, 2), bus.load(base, 1)), (1, 1, 1, 1))
+        for offset in (1, 2, 3):                               # bytes 1–3: leen 0 y escribirlos no toca el bit 0
+            self.assertEqual(bus.load(base + offset, 1), 0)
+            bus.store(base + offset, 1, 0xFF)
+            self.assertEqual(clint.msip, 1)
+        bus.store(base + 2, 2, 0)
+        bus.store(base + 3, 4, 0)                              # sobresale del registro: solo su byte 3, sin efecto
+        self.assertEqual(clint.msip, 1)
+        bus.store(base, 2, 0x0100)                             # bit 0 a cero en una escritura de media palabra
+        self.assertEqual(clint.msip, 0)
+        bus.store(base, 1, 0x03)
+        self.assertEqual((clint.msip, bus.load(base, 4)), (1, 1))
+        self.assertEqual((clint.mtimecmp, bus.load(CLINT_BASE + CLINT_MTIMECMP, 4)), (0, 0))   # mtimecmp intacto
+        # Desde el invitado: sw, sb y lw sobre el registro.
+        words = [encode(Kind.SW, 0, 14, 0, imm=0), encode(Kind.LW, 1, 14, imm=0), encode(Kind.ADDI, 2, 0, imm=5),
+                 encode(Kind.SB, 0, 14, 2, imm=0), encode(Kind.LW, 3, 14, imm=0), encode(Kind.LBU, 4, 14, imm=1), EBREAK]
+        machine = self.make(words, regs={14: base})
+        machine.clint.msip = 1
+        self.assertEqual(machine.run(20).reason, "ebreak")
+        self.assertEqual((machine.hart.regs[1], machine.hart.regs[3], machine.hart.regs[4], machine.clint.msip), (0, 1, 0, 1))
+        machine.load_flat(assemble([EBREAK]))
+        self.assertEqual(machine.clint.msip, 0)                # load_flat deja la máquina limpia
+
     def test_uart_data_and_line_status(self) -> None:
         words = [encode(Kind.LBU, 1, UART, imm=5), encode(Kind.LBU, 2, UART, imm=0), encode(Kind.LBU, 3, UART, imm=5),
                  encode(Kind.LB, 4, UART, imm=0), encode(Kind.LBU, 5, UART, imm=0), encode(Kind.LW, 6, UART, imm=4),

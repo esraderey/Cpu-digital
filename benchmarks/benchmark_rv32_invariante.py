@@ -27,9 +27,10 @@ H2.0 (toda palabra cacheada tiene su línea marcada y coincide con la memoria; t
 misma fuente; byte ≠ 0 ⇒ página escrita) y la ida y vuelta de las páginas del snapshot. El origen de cada programa
 corre con un divisor de tiempo propio (1, 3, 7, 1 000 y, en las anclas de tiempo, 2⁶⁴ − 1, 2³² + 5 y 70 001) y las
 máquinas nuevas de destino (cortes pares) nacen con el predeterminado y adoptan el del snapshot; la máquina usada y
-la sonda entera ya lo llevan. El corpus del CLI incluye los catorce programas ancla (parches sobre el propio
+la sonda entera ya lo llevan. El corpus del CLI incluye los quince programas ancla (parches sobre el propio
 código, tope de recompilaciones, MMIO con cola de entrada del UART, `mtimecmp` de 64 bits y `mtime` por MMIO, una
-palabra por grupo de snapshot, salida larga del UART, CSR de tiempo con divisores extremos), además de CoreMark,
+palabra por grupo de snapshot, salida larga del UART, CSR de tiempo con divisores extremos, `msip` del CLINT con
+accesos parciales), además de CoreMark,
 Embench y los aleatorios con registros iniciales al azar.
 
 Criterio del RFC (§5, E4): mata P1 (y P3) una divergencia que solo se cure reintroduciendo el checkpoint por
@@ -58,7 +59,7 @@ from pathlib import Path
 
 from cpu_digital.rv32_blocks import compile_block
 from cpu_digital.rv32_decode import decode
-from cpu_digital.rv32_hart import Stop
+from cpu_digital.rv32_hart import CSR_SLOTS, Stop
 from cpu_digital.rv32_mem import LINE_SHIFT, Rv32Memory
 from cpu_digital.rv32_platform import Machine
 
@@ -77,9 +78,18 @@ CHECK_EVERY = 25          # uno de cada veinticinco cortes comprueba los invaria
 # ── Estado observable y comprobaciones ──
 
 def observable(machine: Machine) -> tuple:
+    """Todo el estado del invitado que el snapshot lleva, campo a campo (H3.0 añade al final los CSR de modo M, el
+    privilegio, la reserva de LR/SC y ``msip``: los índices anteriores no cambian)."""
     hart = machine.hart
     return (list(hart.regs), hart.pc, hart.instret, bytes(machine.memory.lanes), bytes(machine.uart.output),
-            list(machine.uart.input), machine.clint.mtimecmp, hart.time_divisor)
+            list(machine.uart.input), machine.clint.mtimecmp, hart.time_divisor,
+            tuple(getattr(hart, slot) for _, slot in CSR_SLOTS), hart.privilege, hart.reservation, machine.clint.msip)
+
+
+def csr_state(machine: Machine) -> tuple:
+    """CSR de modo M y privilegio: lo que el perfil vigila como evento ``csr``."""
+    hart = machine.hart
+    return (*(getattr(hart, slot) for _, slot in CSR_SLOTS), hart.privilege)
 
 
 def derived_errors(machine: Machine) -> list[str]:
@@ -147,40 +157,57 @@ def new_machine(image: bytes, ram: int, accelerate: bool, warmup: int, regs: dic
 
 def profile(image: bytes, ram: int, gas: int, regs: dict[int, int] | None, step: int, feed: bytes = b"",
             time_divisor: int = 1) -> dict[str, object]:
-    """Ejecuta con bloques (``warmup`` 1, sin horizonte) en trozos de ``step`` gas y anota las ventanas de ``instret``
-    en que la suma de generaciones sube (store sobre código), la salida o la cola del UART o ``mtimecmp`` cambian
-    (MMIO) o el intérprete ejecuta algo (salida lenta de un bloque, instrucción no traducible o su cola). Sin
-    horizonte el trozo puede rebasar el gas: las ventanas se miden en ``instret``. Devuelve el total de
-    instrucciones, la parada, las ventanas, la cobertura de bloques y las compilaciones."""
+    """Ejecuta con bloques (``warmup`` 1, sin horizonte) en trozos de ``step`` gas y anota las ventanas de **gas
+    consumido** en que la suma de generaciones sube (store sobre código), la salida o la cola del UART, ``mtimecmp`` o
+    ``msip`` cambian (MMIO), cambian los CSR de modo M o el privilegio (``csr``: también la entrada en una interrupción)
+    o la reserva de LR/SC (``reserva``), ``instret`` avanza más que el gas (``wfi``: una WFI durmió hasta el plazo del
+    temporizador) o el intérprete ejecuta algo (salida lenta de un bloque, instrucción no traducible o su cola). Las
+    ventanas y los cortes se miden en gas desde H3.4: los traps cobran gas sin avanzar ``instret`` y WFI avanza
+    ``instret`` sin gas, así que en ``instret`` un corte sesgado caería fuera de su ventana (hasta H3.3 se medían en
+    ``instret``). Sin horizonte el trozo puede rebasar el gas (y el gas consumido, el trozo). Devuelve el total de
+    instrucciones y de gas, la parada, las ventanas, la cobertura de bloques y las compilaciones."""
     machine = new_machine(image, ram, True, 1, regs, feed, time_divisor)
     machine.hart.horizon = False
     try:
         hart, memory, uart, clint = machine.hart, machine.memory, machine.uart, machine.clint
         windows: list[tuple[int, int, str]] = []
         generations = sum(memory.generations)
-        output, pending, mtimecmp = len(uart.output), len(uart.input), clint.mtimecmp
+        output, pending, mtimecmp, msip = len(uart.output), len(uart.input), clint.mtimecmp, clint.msip
+        csrs, reservation = csr_state(machine), hart.reservation
         remaining = gas
+        used = 0
         stop = Stop("gas")
         while remaining > 0 and stop.reason == "gas":
             before = hart.instret
+            used_before = used
             blocks_before = hart.block_instructions
             chunk = min(step, remaining)
             stop = hart.run(chunk)
             executed = hart.instret - before
-            remaining -= chunk - hart.gas
+            spent = chunk - hart.gas
+            used += spent
+            remaining -= spent
             kinds = []
             total = sum(memory.generations)
             if total != generations:
                 kinds.append("código")
                 generations = total
-            if (len(uart.output), len(uart.input), clint.mtimecmp) != (output, pending, mtimecmp):
+            if (len(uart.output), len(uart.input), clint.mtimecmp, clint.msip) != (output, pending, mtimecmp, msip):
                 kinds.append("mmio")
-                output, pending, mtimecmp = len(uart.output), len(uart.input), clint.mtimecmp
+                output, pending, mtimecmp, msip = len(uart.output), len(uart.input), clint.mtimecmp, clint.msip
+            if csr_state(machine) != csrs:
+                kinds.append("csr")
+                csrs = csr_state(machine)
+            if hart.reservation != reservation:
+                kinds.append("reserva")
+                reservation = hart.reservation
+            if executed > spent:
+                kinds.append("wfi")
             if hart.block_instructions - blocks_before < executed:
                 kinds.append("lento")
             if kinds:
-                windows.append((before, hart.instret, "+".join(kinds)))
-        return {"instrucciones": hart.instret, "parada": stop.reason, "ventanas": windows,
+                windows.append((used_before, used, "+".join(kinds)))
+        return {"instrucciones": hart.instret, "gas": used, "parada": stop.reason, "ventanas": windows,
                 "bloques": hart.block_instructions / hart.instret if hart.instret else 0.0, "compilaciones": hart.compilations}
     finally:
         machine.close()
@@ -380,14 +407,15 @@ def verify_program(name: str, image: bytes, ram: int, gas: int, cuts: int, rng: 
     con bloques) y cadenas por modo. ``check_every`` por defecto: todos los cortes en programas de hasta
     ``LONG_PROGRAM`` instrucciones, ``CHECK_EVERY`` en los largos."""
     reference = run_uninterrupted(image, ram, gas, regs, feed, time_divisor)
-    total = reference["estado"][2]
+    total = reference["consumido"]       # los cortes son de gas (H3.4; hasta H3.3, instret: igual sin traps ni WFI)
     if step is None:
         step = 1 if total <= LONG_PROGRAM else 64
     if check_every is None:
         check_every = 1 if total <= LONG_PROGRAM else CHECK_EVERY
     profiled = profile(image, ram, gas, regs, step, feed, time_divisor)
     plans = {"uniformes": plan_cuts(total, cuts, rng), "sesgados": plan_cuts(total, cuts, rng, profiled["ventanas"])}
-    result: dict[str, object] = {"programa": name, "instrucciones": total, "parada": reference["parada"].reason,
+    result: dict[str, object] = {"programa": name, "instrucciones": reference["estado"][2], "gas": total,
+                                 "parada": reference["parada"].reason,
                                  "ventanas": len(profiled["ventanas"]),
                                  "clases_de_ventana": sorted({kind for _, _, kind in profiled["ventanas"]}),
                                  "segundos_interprete": reference["segundos"], "planes": {}}
@@ -452,13 +480,14 @@ FEED = b"abcdefgh"   # cola de entrada del UART de los programas ancla (el de MM
 
 
 def anchor_corpus() -> list[Program]:
-    """Catorce programas cortos: los de las revisiones ciegas de H2.0 (parches sobre el propio código, tope de
+    """Quince programas cortos: los de las revisiones ciegas de H2.0 (parches sobre el propio código, tope de
     recompilaciones, datos en la página del código), uno de MMIO (UART con cola de entrada, ``mtimecmp``), uno que lee
     los CSR de tiempo y, de la segunda ciega del arnés, ``mtimecmp`` de 64 bits con ``mtime`` por MMIO, una sola
     palabra en cada grupo de snapshot, salida larga del UART y los CSR ``time``/``timeh`` con divisores extremos
-    (2⁶⁴ − 1, 2³² + 5, 70 001). Divisores distintos en cada uno."""
+    (2⁶⁴ − 1, 2³² + 5, 70 001); de H3.0, el registro ``msip`` del CLINT con accesos de 4, 1 y 2 bytes (el último, para
+    no mover las posiciones que las pruebas citan). Divisores distintos en cada uno."""
     from cpu_digital.rv32_isa import CSR_CYCLE, CSR_TIME, CSR_TIMEH, Kind, encode
-    from cpu_digital.rv32_platform import CLINT_BASE, CLINT_MTIME, CLINT_MTIMECMP, UART_BASE
+    from cpu_digital.rv32_platform import CLINT_BASE, CLINT_MSIP, CLINT_MTIME, CLINT_MTIMECMP, UART_BASE
     from tests.test_rv32_blocks import SelfModifyingCode
     from tests.test_rv32_hart import CODE, DATA, assemble
     ebreak = encode(Kind.EBREAK)
@@ -501,6 +530,11 @@ def anchor_corpus() -> list[Program]:
     long_output = [encode(Kind.SB, 0, 10, 20, imm=0), encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-8), ebreak]
     time_reads = [encode(Kind.CSRRS, 1, 0, imm=CSR_TIME), encode(Kind.CSRRS, 2, 0, imm=CSR_TIMEH), encode(Kind.ADD, 3, 3, 1),
                   encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-16), ebreak]
+    # H3.0: el registro msip del CLINT con accesos de 4, 1 y 2 bytes (solo el bit 0 tiene estado); alterna 1 y 0.
+    msip_rw = [encode(Kind.ANDI, 7, 20, imm=1), encode(Kind.SW, 0, 10, 7, imm=0), encode(Kind.LW, 1, 10, imm=0),
+               encode(Kind.SB, 0, 10, 20, imm=1), encode(Kind.LHU, 2, 10, imm=0), encode(Kind.LBU, 3, 10, imm=1),
+               encode(Kind.ADD, 5, 5, 1), encode(Kind.ADD, 6, 6, 2), encode(Kind.ADD, 6, 6, 3),
+               encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-40), ebreak]
     extra = [
         ("mtimecmp de 64 bits y mtime por MMIO", mtime_mtimecmp,
          {10: CLINT_BASE + CLINT_MTIMECMP, 11: CLINT_BASE + CLINT_MTIME, 20: 5, 21: 0xA5A50000}, 7),
@@ -509,9 +543,121 @@ def anchor_corpus() -> list[Program]:
         ("CSR time y timeh con divisor 2⁶⁴ − 1", time_reads, {20: 9}, (1 << 64) - 1),
         ("CSR time y timeh con divisor 2³² + 5", time_reads, {20: 9}, (1 << 32) + 5),
         ("CSR time y timeh con divisor 70 001", time_reads, {20: 9}, 70_001),
+        ("msip del CLINT por MMIO de 4, 1 y 2 bytes", msip_rw, {10: CLINT_BASE + CLINT_MSIP, 20: 7}, 3),
     ]
-    return [(f"ancla-{index}: {name}", assemble(words), SMALL_RAM, 2000, regs, FEED, divisor)
-            for index, (name, words, regs, divisor) in enumerate(rotated + extra)]
+    programs_ = [(f"ancla-{index}: {name}", assemble(words), SMALL_RAM, 2000, regs, FEED, divisor)
+                 for index, (name, words, regs, divisor) in enumerate(rotated + extra)]
+    traps = trap_anchors(len(programs_))
+    return programs_ + traps + interrupt_anchors(len(programs_) + len(traps))
+
+
+def trap_anchors(first: int) -> list[Program]:
+    """H3.1: dos anclas con traps manejados (el manejador de las pruebas, en CODE + 0x800, salta la instrucción que
+    atrapó): un bucle caliente con cargas que se salen de la RAM y un ``ecall`` por vuelta, y una ida y vuelta a modo U
+    (``mret`` a U, ``ecall`` desde U, un CSR de M ilegal en U, ``cycle`` legible) que termina apagando por SYSCON desde U."""
+    from cpu_digital.rv32_isa import Kind, encode
+    from cpu_digital.rv32_platform import SYSCON_BASE
+    from tests.test_rv32_hart import CODE, HANDLER, assemble, load_immediate, with_handler
+    setup = load_immediate(30, HANDLER) + [encode(Kind.CSRRW, 0, 30, imm=0x305)]
+    poweroff = encode(Kind.SW, 0, 12, 13, imm=0)
+    loads = setup + load_immediate(5, BASE_RAM_END - 12) + [
+        encode(Kind.LW, 6, 5, imm=0), encode(Kind.ECALL), encode(Kind.ADDI, 5, 5, imm=4), encode(Kind.ADD, 7, 7, 6),
+        encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-20), poweroff]
+    head = setup + load_immediate(5, 0) + [encode(Kind.CSRRW, 0, 5, imm=0x341), encode(Kind.MRET)]
+    user = len(head)
+    head[len(setup):len(setup) + 2] = load_immediate(5, CODE + 4 * user)          # mepc ← la primera instrucción en U
+    roundtrip = head + [encode(Kind.ADDI, 7, 7, imm=1), encode(Kind.ECALL), encode(Kind.CSRRS, 8, 0, imm=0xC00),
+                        encode(Kind.CSRRS, 9, 0, imm=0x300), encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-20),
+                        poweroff]
+    regs = {12: SYSCON_BASE, 13: 0x5555, 20: 6}
+    # H3.3: LR/SC en bucle (un store sobre la palabra reservada en las vueltas impares hace fallar el SC) y un AMO.
+    atomics = [encode(Kind.LR_W, 6, 10), encode(Kind.ADDI, 6, 6, imm=3), encode(Kind.ANDI, 8, 20, imm=1),
+               encode(Kind.BEQ, 0, 8, 0, imm=8), encode(Kind.SW, 0, 10, 9, imm=0), encode(Kind.SC_W, 7, 10, 6),
+               encode(Kind.ADD, 11, 11, 7), encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-32),
+               encode(Kind.AMOADD_W, 16, 10, 17), poweroff]
+    from tests.test_rv32_hart import DATA
+    return [(f"ancla-{first}: bucle con cargas fuera de la RAM y ecall manejados", with_handler(loads), SMALL_RAM, 3000, regs,
+             FEED, 7),
+            (f"ancla-{first + 1}: ida y vuelta a modo U con traps", with_handler(roundtrip), SMALL_RAM, 3000, regs, FEED, 3),
+            (f"ancla-{first + 2}: LR/SC con reintentos, store que rompe la reserva y AMO", assemble(atomics), SMALL_RAM, 3000,
+             {10: DATA, 9: 0x1234, 17: 5, 20: 9, 12: SYSCON_BASE, 13: 0x5555}, FEED, 1)]
+
+
+def interrupt_anchors(first: int) -> list[Program]:
+    """H3.4: cinco anclas con interrupciones del CLINT (manejador de ``tests.test_rv32_hart.interrupt_handler_words`` en
+    CODE + 0x800; las excepciones saltan la instrucción, MSI borra ``msip``, MTI reprograma ``mtimecmp`` = ``mtime`` +
+    delta o, con delta 0, quita MTIE), todas de menos de 300 de gas y terminando apagando por SYSCON: un temporizador
+    periódico sobre un bucle caliente (bloques que el plazo corta), WFI que duerme hasta el temporizador en cada vuelta,
+    ``msip`` autoprovocada con MIE alternado (reevaluación tras el store y tras la escritura de ``mstatus``), el
+    temporizador interrumpiendo un bucle en modo U, y una WFI que lleva ``instret`` al borde de 2⁶⁴ seguida de lecturas
+    de ``mip``, ``time`` y ``timeh`` que lo cruzan (MTIP compara el contador envuelto)."""
+    from cpu_digital.rv32_isa import Kind, encode
+    from cpu_digital.rv32_platform import CLINT_BASE, SYSCON_BASE
+    from tests.test_rv32_hart import CODE, HANDLER, MTIME_PAGE, MTIMECMP_PAGE, load_immediate, with_interrupt_handler
+    setup = load_immediate(30, HANDLER) + [encode(Kind.CSRRW, 0, 30, imm=0x305)]
+    poweroff = encode(Kind.SW, 0, 12, 13, imm=0)
+    regs = {12: SYSCON_BASE, 13: 0x5555}
+
+    def arm(value: int, high: int = 0) -> list[int]:   # mtimecmp = (high << 32) | value (con signo), con x26–x28
+        return [encode(Kind.LUI, 28, imm=MTIMECMP_PAGE << 12), encode(Kind.ADDI, 27, 0, imm=value),
+                encode(Kind.SW, 0, 28, 27, imm=0), encode(Kind.ADDI, 26, 0, imm=high), encode(Kind.SW, 0, 28, 26, imm=4)]
+
+    mtie = [encode(Kind.ADDI, 28, 0, imm=0x80), encode(Kind.CSRRS, 0, 28, imm=0x304)]
+    periodic = setup + arm(12) + mtie + [encode(Kind.CSRRSI, 0, 8, imm=0x300)] + [
+        encode(Kind.ADDI, 5, 5, imm=1), encode(Kind.XOR, 6, 6, 5), encode(Kind.ADDI, 20, 20, imm=-1),
+        encode(Kind.BNE, 0, 20, 0, imm=-12), poweroff]
+    sleeper = setup + [encode(Kind.CSRRSI, 0, 8, imm=0x300),
+                       encode(Kind.LUI, 28, imm=MTIME_PAGE << 12), encode(Kind.LW, 27, 28, imm=-8), encode(Kind.ADDI, 27, 27, imm=5),
+                       encode(Kind.LUI, 28, imm=MTIMECMP_PAGE << 12), encode(Kind.SW, 0, 28, 27, imm=0), encode(Kind.SW, 0, 28, 0, imm=4),
+                       *mtie, encode(Kind.WFI), encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-40), poweroff]
+    software = setup + [encode(Kind.ADDI, 28, 0, imm=0x8), encode(Kind.CSRRS, 0, 28, imm=0x304),
+                        encode(Kind.LUI, 26, imm=CLINT_BASE), encode(Kind.ADDI, 25, 0, imm=1),
+                        encode(Kind.ANDI, 7, 20, imm=1), encode(Kind.BEQ, 0, 7, 0, imm=8), encode(Kind.CSRRSI, 0, 8, imm=0x300),
+                        encode(Kind.SW, 0, 26, 25, imm=0), encode(Kind.CSRRCI, 0, 8, imm=0x300), encode(Kind.LW, 8, 26, imm=0),
+                        encode(Kind.ADD, 9, 9, 8), encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-32), poweroff]
+    head = setup + arm(20) + mtie + load_immediate(5, 0) + [encode(Kind.CSRRW, 0, 5, imm=0x341), encode(Kind.MRET)]
+    user = len(head)
+    head[len(setup) + 7:len(setup) + 9] = load_immediate(5, CODE + 4 * user)        # mepc ← la primera instrucción en U
+    in_user = head + [encode(Kind.ADDI, 6, 6, imm=1), encode(Kind.XOR, 7, 7, 6), encode(Kind.ADDI, 20, 20, imm=-1),
+                      encode(Kind.BNE, 0, 20, 0, imm=-12), poweroff]
+    edge = setup + arm(-20, -1) + mtie + [encode(Kind.WFI)] + [                      # mtimecmp = 2⁶⁴ − 20 con divisor 1
+        encode(Kind.CSRRS, 1, 0, imm=0x344), encode(Kind.ADD, 2, 2, 1), encode(Kind.CSRRS, 3, 0, imm=0xC01),
+        encode(Kind.XOR, 4, 4, 3), encode(Kind.CSRRS, 6, 0, imm=0xC81), encode(Kind.ADD, 7, 7, 6),
+        encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-28), poweroff]
+    return [(f"ancla-{first}: temporizador periódico sobre un bucle caliente", with_interrupt_handler(periodic, 9), SMALL_RAM,
+             2000, {**regs, 20: 40}, FEED, 3),
+            (f"ancla-{first + 1}: WFI que duerme hasta el temporizador en cada vuelta", with_interrupt_handler(sleeper, 0),
+             SMALL_RAM, 2000, {**regs, 20: 8}, FEED, 7),
+            (f"ancla-{first + 2}: msip autoprovocada con MIE alternado", with_interrupt_handler(software, 25), SMALL_RAM, 2000,
+             {**regs, 20: 10}, FEED, 1),
+            (f"ancla-{first + 3}: el temporizador interrumpe un bucle en modo U", with_interrupt_handler(in_user, 30), SMALL_RAM,
+             2000, {**regs, 20: 20}, FEED, 1),
+            (f"ancla-{first + 4}: WFI hasta el borde de 2⁶⁴ y mip/time al cruzarlo", with_interrupt_handler(edge, 0), SMALL_RAM,
+             2000, {**regs, 20: 12}, FEED, 1)]
+
+
+def interrupt_corpus(count: int, rng: random.Random) -> list[Program]:
+    """H3.4: programas aleatorios con temporizador, ``msip``, ``mie``, ``mstatus.MIE``/``TW``, WFI y modo U
+    (``tests.test_rv32_hart.random_interrupt_program``), con divisores 1, 3 y 7."""
+    from tests.test_rv32_hart import random_interrupt_program, with_interrupt_handler
+    corpus: list[Program] = []
+    for index in range(count):
+        vectored = rng.random() < 0.4
+        delta = rng.choice((0, 7, 25, 60))
+        words = random_interrupt_program(rng, rng.randrange(20, 150), vectored)
+        corpus.append((f"interrupciones-{index}", with_interrupt_handler(words, delta), SMALL_RAM, 1500, None, b"",
+                       (1, 3, 7)[index % 3]))
+    return corpus
+
+
+BASE_RAM_END = 0x80000000 + SMALL_RAM
+
+
+def trap_corpus(count: int, rng: random.Random) -> list[Program]:
+    """H3.1: programas aleatorios con CSR, traps manejados, ``MRET`` y modo U (``tests.test_rv32_hart.random_trap_program``)."""
+    from tests.test_rv32_hart import random_trap_program, with_handler
+    return [(f"traps-{index}", with_handler(random_trap_program(rng, rng.randrange(20, 160))), SMALL_RAM, 2000, None, b"",
+             DIVISORS[index % len(DIVISORS)]) for index in range(count)]
 
 
 def random_corpus(count: int, rng: random.Random) -> list[Program]:
@@ -549,8 +695,12 @@ def main() -> int:
             pass
     parser = argparse.ArgumentParser(description="E4 de RFC-EXP-00018: invariante S bajo cortes")
     parser.add_argument("--cortes", type=int, default=1000)
-    parser.add_argument("--conjunto", choices=("todos", "coremark", "embench", "aleatorios", "anclas"), default="todos")
+    parser.add_argument("--conjunto", choices=("todos", "coremark", "embench", "aleatorios", "anclas", "interrupciones"),
+                        default="todos")
     parser.add_argument("--aleatorios", type=int, default=200)
+    parser.add_argument("--traps", type=int, default=50, help="programas aleatorios con traps, CSR y modo U (H3.1)")
+    parser.add_argument("--interrupciones", type=int, default=50,
+                        help="programas aleatorios con temporizador, msip, WFI y modo U (H3.4)")
     parser.add_argument("--semilla", type=int, default=20261019)
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args()
@@ -566,6 +716,11 @@ def main() -> int:
         corpus.extend(anchor_corpus())
     if args.conjunto in ("todos", "aleatorios"):
         corpus.extend(random_corpus(args.aleatorios, rng))
+        corpus.extend(trap_corpus(args.traps, rng))
+    if args.conjunto == "interrupciones":                       # el detector de E5 para los mutantes de H3.4
+        corpus.extend(interrupt_anchors(0))
+    if args.conjunto in ("todos", "aleatorios", "interrupciones"):
+        corpus.extend(interrupt_corpus(args.interrupciones, rng))
     print(f"Python {platform.python_version()} ({platform.system()} {platform.machine()}); cortes por plan: {args.cortes}; "
           f"programas: {len(corpus)}; semilla {args.semilla}")
     report: dict[str, object] = {"python": platform.python_version(), "cortes": args.cortes, "semilla": args.semilla, "programas": []}
@@ -578,7 +733,7 @@ def main() -> int:
         divergences += int(result["divergencias"])
         if not result["planes"]["uniformes"]["cortes"]:
             without_cuts.append(name)
-        if name.startswith(("aleatorio", "hostil", "ancla")) and not result["divergencias"]:
+        if name.startswith(("aleatorio", "hostil", "ancla", "traps", "interrupciones")) and not result["divergencias"]:
             continue
         uniform, biased = result["planes"]["uniformes"], result["planes"]["sesgados"]
         line = (f"{name:16s} {result['instrucciones']:>11,} instr  ventanas {result['ventanas']:>6}  "
@@ -592,7 +747,7 @@ def main() -> int:
             if detail:
                 line += f"troceado {plan_name} DIVERGE (corte {detail['corte']}, w{detail['calentamiento']}: {detail['motivo']})  "
         print(line + ("DIVERGE" if result["divergencias"] else "ok"))
-    small = [r for r in report["programas"] if str(r["programa"]).startswith(("aleatorio", "hostil", "ancla"))]
+    small = [r for r in report["programas"] if str(r["programa"]).startswith(("aleatorio", "hostil", "ancla", "traps", "interrupciones"))]
     if small:
         cuts_in_windows = sum(int(r["planes"]["sesgados"]["cortes_en_ventana"]) for r in small)
         cuts_total = sum(int(r["planes"]["sesgados"]["cortes"]) for r in small)

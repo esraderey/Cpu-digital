@@ -1,4 +1,9 @@
-"""E5 (primera parte) de RFC-EXP-00018: riscv-tests rv32ui sobre el hart, enteros y fragmentados (H2.3).
+"""E5 (primera parte) de RFC-EXP-00018: riscv-tests rv32ui (H2.3) y rv32mi (H3.1) sobre el hart, enteros y fragmentados.
+
+Suite ``rv32mi`` (H3.1): los 13 tests de ``isa/rv32mi`` que caben en el perfil de la plataforma (``TESTS_MI``; fuera,
+con su motivo, ``EXCLUDED_MI``), con el entorno ``benchmarks/rv32_arranque/riscv_tests_mi/`` (``trap_vector`` que
+despacha a ``mtvec_handler``, el test corre en modo M, paso y fallo como en rv32ui) y binarios
+``riscv_mi_<nombre>_rv32i_zicsr.bin``. Sin ``--suite``, el CLI ejecuta todas las suites versionadas.
 
 Compila ``isa/rv32ui/*.S`` de riscv-software-src/riscv-tests (commit ``RISCV_TESTS_COMMIT``, zip con sha256
 ``RISCV_TESTS_ZIP_SHA256``; los ``rv32ui/*.S`` son envoltorios de los cuerpos de ``isa/rv64ui``, con los que forman
@@ -54,26 +59,48 @@ TESTS = ("add", "addi", "and", "andi", "auipc", "beq", "bge", "bgeu", "blt", "bl
          "sltiu", "sltu", "sra", "srai", "srl", "srli", "st_ld", "sub", "sw", "xor", "xori")
 RAM = 1 << 16
 GAS = 200_000
+# H3.1: isa/rv32mi (los envoltorios rv32mi incluyen ../rv64mi y ../rv64si). Prefijo propio que no contiene el de rv32ui
+# (los filtros de SHA256SUMS buscan el prefijo como subcadena).
+PORT_DIR_MI = ROOT / "benchmarks" / "rv32_arranque" / "riscv_tests_mi"
+PREFIX_MI = "riscv_mi_"
+TESTS_MI = ("csr", "illegal", "lh-misaligned", "lw-misaligned", "ma_addr", "ma_fetch", "mcsr", "sbreak", "scall",
+            "sh-misaligned", "shamt", "sw-misaligned", "zicntr")
+EXCLUDED_MI = {"breakpoint": "exige el módulo de triggers de depuración (Sdtrig: tselect/tdata1), fuera del perfil",
+               "pmpaddr": "exige PMP, que la plataforma no implementa",
+               "instret_overflow": "exige minstret escribible; aquí instret es el reloj del invitado (H4 separa mcycle)"}
+# H3.2: isa/rv32um (los ocho de M; tests de modo U de env/p que el entorno de rv32ui corre en M, como rv32ui).
+PREFIX_UM = "riscv_um_"
+TESTS_UM = ("div", "divu", "mul", "mulh", "mulhsu", "mulhu", "rem", "remu")
+ARCH_UM = "rv32im_zicsr"
+# suite → (entorno, prefijo de los binarios, tests, -march)
+SUITES: dict[str, tuple[Path, str, tuple[str, ...], str]] = {
+    "rv32ui": (PORT_DIR, PREFIX, TESTS, ARCH), "rv32mi": (PORT_DIR_MI, PREFIX_MI, TESTS_MI, ARCH),
+    "rv32um": (PORT_DIR, PREFIX_UM, TESTS_UM, ARCH_UM),
+    "rv32ua": (PORT_DIR, "riscv_ua_", ("amoadd_w", "amoand_w", "amomax_w", "amomaxu_w", "amomin_w", "amominu_w", "amoor_w",
+                                       "amoswap_w", "amoxor_w", "lrsc"), "rv32ima_zicsr"),   # H3.3: los diez de A
+}
+PREFIX_UA, TESTS_UA = SUITES["rv32ua"][1], SUITES["rv32ua"][2]
 
 
 def run(command: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=True, text=True, capture_output=True, **kwargs)
 
 
-def build(clang: str, repo: Path, build_dir: Path) -> dict[str, Path | str]:
-    """Ensambla cada test; devuelve la ruta del .bin o el primer error literal de clang."""
+def build(clang: str, repo: Path, build_dir: Path, suite: str = "rv32ui") -> dict[str, Path | str]:
+    """Ensambla cada test de la suite; devuelve la ruta del .bin o el primer error literal de clang."""
+    port_dir, prefix, tests, arch = SUITES[suite]
     build_dir.mkdir(parents=True, exist_ok=True)
     results: dict[str, Path | str] = {}
-    for name in TESTS:
-        source = repo / "isa" / "rv32ui" / f"{name}.S"
+    for name in tests:
+        source = repo / "isa" / suite / f"{name}.S"
         if not source.is_file():
             results[name] = f"no existe {source}"
             continue
-        elf = build_dir / f"{PREFIX}{name}_{ARCH}.elf"
-        binary = build_dir / f"{PREFIX}{name}_{ARCH}.bin"
-        command = [clang, "--target=riscv32-unknown-elf", f"-march={ARCH}", "-mabi=ilp32", "-nostdlib", "-ffreestanding",
-                   "-static", f"-I{PORT_DIR}", f"-I{repo / 'isa' / 'macros' / 'scalar'}", f"-I{repo / 'env'}",
-                   "-fuse-ld=lld", "-T", str(PORT_DIR / "link.ld"), "-o", str(elf), str(source)]
+        elf = build_dir / f"{prefix}{name}_{arch}.elf"
+        binary = build_dir / f"{prefix}{name}_{arch}.bin"
+        command = [clang, "--target=riscv32-unknown-elf", f"-march={arch}", "-mabi=ilp32", "-nostdlib", "-ffreestanding",
+                   "-static", f"-I{port_dir}", f"-I{repo / 'isa' / 'macros' / 'scalar'}", f"-I{repo / 'env'}",
+                   "-fuse-ld=lld", "-T", str(port_dir / "link.ld"), "-o", str(elf), str(source)]
         try:
             run(command)
             run(["llvm-objcopy", "-O", "binary", str(elf), str(binary)])
@@ -84,9 +111,10 @@ def build(clang: str, repo: Path, build_dir: Path) -> dict[str, Path | str]:
     return results
 
 
-def install(results: dict[str, Path | str]) -> list[str]:
+def install(results: dict[str, Path | str], suite: str = "rv32ui") -> list[str]:
+    prefix = SUITES[suite][1]
     installed = []
-    lines = [line for line in SUMS.read_text(encoding="utf-8").splitlines() if line and PREFIX not in line] if SUMS.exists() else []
+    lines = [line for line in SUMS.read_text(encoding="utf-8").splitlines() if line and prefix not in line] if SUMS.exists() else []
     for name, result in results.items():
         if isinstance(result, Path):
             target = BIN_DIR / result.name
@@ -97,12 +125,13 @@ def install(results: dict[str, Path | str]) -> list[str]:
     return installed
 
 
-def versioned() -> dict[str, Path]:
-    """Binarios de riscv-tests versionados cuyo sha256 coincide con SHA256SUMS."""
+def versioned(suite: str = "rv32ui") -> dict[str, Path]:
+    """Binarios de la suite versionados cuyo sha256 coincide con SHA256SUMS."""
+    prefix, arch = SUITES[suite][1], SUITES[suite][3]
     expected = {}
     for line in SUMS.read_text(encoding="utf-8").splitlines():
-        if PREFIX in line:
-            digest, _, filename = line.partition(" *")
+        digest, _, filename = line.partition(" *")
+        if filename.startswith(prefix):
             expected[filename] = digest
     binaries = {}
     for filename, digest in expected.items():
@@ -111,7 +140,7 @@ def versioned() -> dict[str, Path]:
             raise SystemExit(f"falta {path}")
         if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise SystemExit(f"sha256 distinto en {path}")
-        binaries[re.sub(rf"^{PREFIX}(.*)_{ARCH}\.bin$", r"\1", filename)] = path
+        binaries[re.sub(rf"^{prefix}(.*)_{arch}\.bin$", r"\1", filename)] = path
     return binaries
 
 
@@ -156,8 +185,9 @@ def main() -> int:
             sys.stdout.reconfigure(encoding="utf-8")
         except (AttributeError, OSError):
             pass
-    parser = argparse.ArgumentParser(description="riscv-tests rv32ui sobre el hart RV32, enteros y fragmentados (E5)")
+    parser = argparse.ArgumentParser(description="riscv-tests rv32ui y rv32mi sobre el hart RV32, enteros y fragmentados (E5)")
     parser.add_argument("--construir", type=Path, default=None, help="raíz de riscv-tests ya extraída")
+    parser.add_argument("--suite", choices=(*SUITES, "todas"), default="todas")
     parser.add_argument("--clang", default="clang")
     parser.add_argument("--sin-instalar", action="store_true", help="ejecuta lo recién ensamblado sin tocar bin/")
     parser.add_argument("--cortes", type=int, default=64)
@@ -166,29 +196,36 @@ def main() -> int:
     args = parser.parse_args()
     if args.cortes < 1:
         parser.error("cortes debe ser positivo")
-    print(f"Python {platform.python_version()} ({platform.system()} {platform.machine()}); riscv-tests rv32ui; {ARCH}; "
-          f"cortes por plan: {args.cortes}")
-    report: dict[str, object] = {"python": platform.python_version(), "arch": ARCH, "cortes": args.cortes, "semilla": args.semilla}
+    suites = list(SUITES) if args.suite == "todas" else [args.suite]
+    print(f"Python {platform.python_version()} ({platform.system()} {platform.machine()}); riscv-tests "
+          f"{', '.join(f'{suite} ({SUITES[suite][3]})' for suite in suites)}; cortes por plan: {args.cortes}")
+    report: dict[str, object] = {"python": platform.python_version(), "arch": {suite: SUITES[suite][3] for suite in suites},
+                                 "cortes": args.cortes, "semilla": args.semilla, "suites": suites}
     binaries: dict[str, Path] | None = None
     if args.construir is not None:
         clang = shutil.which(args.clang)
         if clang is None:
             print(f"No se encuentra {args.clang}", file=sys.stderr)
             return 2
-        build_dir = Path(tempfile.gettempdir()) / "rv32_riscv_tests_build"
-        results = build(clang, args.construir, build_dir)
-        excluded = {name: reason for name, reason in results.items() if not isinstance(reason, Path)}
+        built: dict[str, Path] = {}
+        excluded: dict[str, str] = {}
+        for suite in suites:
+            build_dir = Path(tempfile.gettempdir()) / f"rv32_riscv_tests_build_{suite}"
+            results = build(clang, args.construir, build_dir, suite)
+            excluded.update({f"{suite}/{name}": reason for name, reason in results.items() if not isinstance(reason, Path)})
+            built.update({f"{suite}/{name}": path for name, path in results.items() if isinstance(path, Path)})
+            if not args.sin_instalar:
+                print(f"{suite}: ensamblados e instalados en bin/: {len(install(results, suite))}")
         if args.sin_instalar:
-            binaries = {name: path for name, path in results.items() if isinstance(path, Path)}
+            binaries = built
             print(f"ensamblados (sin instalar): {len(binaries)}")
-        else:
-            installed = install(results)
-            print(f"ensamblados e instalados en bin/: {len(installed)}")
         for name, reason in excluded.items():
             print(f"  fuera: {name}: {reason}")
         report["excluidos"] = excluded
+    if "rv32mi" in suites:
+        report["fuera_del_perfil"] = {f"rv32mi/{name}": reason for name, reason in EXCLUDED_MI.items()}
     if binaries is None:
-        binaries = versioned()
+        binaries = {f"{suite}/{name}": path for suite in suites for name, path in versioned(suite).items()}
     rng = random.Random(args.semilla)
     rows: dict[str, dict[str, object]] = {}
     passes = fails = others = divergences = 0
@@ -202,7 +239,7 @@ def main() -> int:
         others += whole["veredicto"] not in ("pass", "fail")
         divergences += int(fragmented["divergencias"])
         biased = fragmented["planes"]["sesgados"]
-        print(f"{name:10s} {whole['veredicto']:18s} {whole['instrucciones']:>7} instr  ventanas {fragmented['ventanas']:>4}  "
+        print(f"{name:20s} {whole['veredicto']:18s} {whole['instrucciones']:>7} instr  ventanas {fragmented['ventanas']:>4}  "
               f"cortes {fragmented['planes']['uniformes']['cortes']}/{biased['cortes']} (sesgados en ventana {biased['cortes_en_ventana']})  "
               f"divergencias {fragmented['divergencias']}")
     report["tests"] = rows

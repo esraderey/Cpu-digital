@@ -6,6 +6,49 @@ primer commit, así que los cambios se agrupan por fecha.
 
 ## [Sin publicar]
 
+### 2026-10-21
+
+- **RFC-EXP-00019** (núcleo nativo en Rust): revisado tras H3 en un Anexo C. No hay código Rust; los cambios son
+  enmiendas PROPUESTAS al RFC:
+  - la `struct` del ABI es el inventario v2;
+  - una ventana nativa cuenta como escritura del host (`written`, `generations`, línea de la reserva);
+  - las ventanas se miden en gas;
+  - V1 compara un resumen por instrucción sin el hash incremental de P2.3, que sigue sin implementar;
+  - las capas del núcleo van en orden hasta EN6;
+  - se propone un modo interactivo diferido, pendiente de decisión del usuario.
+
+  Se corrige §2.5: el nightly con Miri sí estaba instalado. RFC-EXP-00018 enlaza el nuevo RFC desde P5, la fila H6 y la
+  hoja de ruta.
+
+### 2026-10-20
+
+- **Hito H3 del RFC-EXP-00018** (hart RV32IMA_Zicsr con modos M y U, interrupciones del CLINT, DTB; FreeRTOS y Linux nommu
+  arrancan en el hart; E1 medido en el hart, E4 y E5 de cierre):
+  - Esquema v2 del snapshot del hart y de `Machine` (H3.0): `csrs` (los siete CSR de modo M con estado), `privilege`,
+    `reservation` restaurada y `clint.msip`; legalización WARL fija (`legalize_csr`); los snapshots v1 se siguen leyendo y
+    ponen el estado nuevo a su reinicio. Puerta de inventario con los slots nuevos y el módulo `rv32_dtb`.
+  - Zicsr con el mapa de CSR de la plataforma, modos M y U, traps síncronos con la entrada en trap de escritura múltiple y modo
+    compatible (destino fuera de la RAM: parada como en H2, sin escribir ni cobrar), `MRET` (H3.1); extensión M (H3.2) en el
+    intérprete y en los bloques; extensión A con política de reserva fija R-9 (H3.3); interrupciones de software y de
+    temporizador del CLINT con reevaluación en el bucle externo de `run`, plazo del temporizador con gas apartado y horizonte
+    impuesto, `WFI` que adelanta el reloj o para con `Stop("wfi")`, `Stop("interrupcion")` en modo compatible (H3.4). Sin
+    cambios en VM32 ni en la política de gas del TNU; `accelerate` sigue en `False`.
+  - `cpu_digital/rv32_dtb.py` (H3.5): DTB FDT v17 de la plataforma (topología de mini-rv32ima) y `boot()` con la convención de
+    arranque (`a0` = 0, `a1` = DTB). `benchmarks/benchmark_rv32_linux.py`: la imagen `linux-6.1.14-rv32nommu-cnl-1` de E1
+    (externa, por argumento, sha256 comprobado) llega a `~ #` con 64 991 743 de gas (E1 en mini-rv32ima: 64 929 979) y 41,7 s
+    de intérprete; E4 sobre el arranque sin divergencias. `benchmarks/benchmark_rv32_freertos.py` y
+    `benchmarks/rv32_arranque/freertos/`: puerto propio de FreeRTOS V11.1.0 (fuentes externas no versionadas) compilado con
+    clang, binario reproducible `freertos_demo_rv32ima_zicsr.bin` en `rv32_arranque/bin` con su sha256. Zephyr no se
+    construye (exigiría instalar `west` y su SDK).
+  - Conformidad: riscv-tests rv32mi 13/13, rv32um 8/8 y rv32ua 10/10 (binarios versionados con sha256), enteros y
+    fragmentados, además de los 42 rv32ui de H2.
+  - Arnés de E4/E5: ventanas y cortes en coordenadas de gas (antes `instret`), ventana `wfi`, anclas y corpus de
+    interrupciones, detector de E5 `interrupciones`, mutantes de corte de H3.4 y sonda que compara también el gas. E4 oficial: 0 divergencias en 338 programas × 2 000 cortes × 3 modos. E5 oficial con riscv-tests: 11 vivos en la batería, detectados los 11 (100 %), 11 = 11 uniformes y sesgados.
+    La cláusula del sesgo de E5 vuelve a empatar en las dos baterías (11 = 11 con riscv-tests, 18 = 18 con interrupciones): decisión del usuario.
+  - Pruebas: referencia con CSR, traps, M, A, CLINT y `WFI` en `tests/test_rv32_hart.py` (diferenciales en seis modos),
+    anclas dirigidas de interrupciones y `WFI`, invariante S con interrupciones, `tests/test_rv32_dtb.py` (lector de FDT
+    propio), `tests/test_benchmark_rv32_linux.py` (núcleo sintético) y `tests/test_benchmark_rv32_freertos.py`.
+
 ### 2026-10-19
 
 - **Hitos H2.1–H2.4 del RFC-EXP-00018** (snapshot del hart, invariante S bajo cortes, riscv-tests y ACT enteros y

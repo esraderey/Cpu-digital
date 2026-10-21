@@ -234,6 +234,10 @@ CSR_MVENDORID = 0xF11
 CSR_MARCHID = 0xF12
 CSR_MIMPID = 0xF13
 CSR_MHARTID = 0xF14
+# H3.1: CSR del mapa de la plataforma que no tienen nombre en el desensamblado (CSR_NAMES no cambia).
+CSR_MCOUNTEREN = 0x306
+CSR_MSTATUSH = 0x310
+CSR_MCONFIGPTR = 0xF15
 CSR_NAMES: dict[int, str] = {
     CSR_CYCLE: "cycle", CSR_TIME: "time", CSR_INSTRET: "instret",
     CSR_CYCLEH: "cycleh", CSR_TIMEH: "timeh", CSR_INSTRETH: "instreth",
@@ -258,6 +262,24 @@ INTERRUPT_BIT = 1 << 31
 INTERRUPT_MACHINE_SOFTWARE = 3
 INTERRUPT_MACHINE_TIMER = 7
 INTERRUPT_MACHINE_EXTERNAL = 11
+
+# Modos de privilegio (privilegiado, «Privilege Levels»): la plataforma implementa M y U.
+PRIV_U = 0
+PRIV_M = 3
+
+# Campos de mstatus y de mie/mip (privilegiado §3.1.6 y §3.1.9) que la plataforma implementa (H3). En RV32 sin modo S ni
+# F/V, los demás campos de mstatus son de solo lectura a cero; MPRV y TW existen porque hay modo U.
+MSTATUS_MIE = 1 << 3
+MSTATUS_MPIE = 1 << 7
+MSTATUS_MPP = 3 << 11
+MSTATUS_MPRV = 1 << 17
+MSTATUS_TW = 1 << 21
+MIE_MSIE = 1 << INTERRUPT_MACHINE_SOFTWARE
+MIE_MTIE = 1 << INTERRUPT_MACHINE_TIMER
+MIE_MEIE = 1 << INTERRUPT_MACHINE_EXTERNAL
+MIP_MSIP = MIE_MSIE   # mip tiene los mismos bits que mie
+MIP_MTIP = MIE_MTIE
+MIP_MEIP = MIE_MEIE
 
 
 def sign_extend(value: int, bits: int) -> int:
@@ -342,4 +364,5 @@ def encode(kind: Kind, rd: int = 0, rs1: int = 0, rs2: int = 0, imm: int = 0) ->
 __all__ = [
     "ABI_NAMES", "BY_KIND", "BY_MNEMONIC", "CSR_NAMES", "Format", "Kind", "MASK32", "SPECS", "Spec", "XLEN",
     "encode", "sign_extend",
-] + [name for name in dir() if name.startswith(("OP_", "CSR_", "CAUSE_", "INTERRUPT_")) and name != "CSR_NAMES"]
+] + [name for name in dir() if name.startswith(("OP_", "CSR_", "CAUSE_", "INTERRUPT_", "PRIV_", "MSTATUS_", "MIE_", "MIP_"))
+       and name != "CSR_NAMES"]

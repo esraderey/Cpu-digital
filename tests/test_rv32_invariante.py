@@ -74,16 +74,21 @@ class RandomProgramsUnderCuts(unittest.TestCase):
 class AnchorProgramsUnderEveryCut(unittest.TestCase):
     def test_every_cut_of_the_anchor_programs(self) -> None:
         rng = random.Random(3)
-        for name, image, _, _, regs, _, divisor in anchor_corpus():
+        corpus = anchor_corpus()
+        traps, interrupts = len(B.trap_anchors(0)), len(B.interrupt_anchors(0))   # las de H3.1, H3.3 y H3.4 apagan por SYSCON
+        first = len(corpus) - traps - interrupts
+        syscon = {program[0] for program in B.trap_anchors(first) + B.interrupt_anchors(first + traps)}
+        self.assertEqual(syscon, {program[0] for program in corpus[first:]})
+        for name, image, _, _, regs, _, divisor in corpus:
             machine = new_machine(image, SMALL_RAM, False, 2, regs, FEED, divisor)
             try:
                 stop = machine.run(2000)
-                total = machine.hart.instret
+                total = 2000 - machine.hart.gas                       # gas consumido: los cortes son de gas (H3.4)
             finally:
                 machine.close()
-            self.assertEqual(stop.reason, "ebreak", name)
+            self.assertEqual(stop.reason, "apagado" if name in syscon else "ebreak", name)
             self.assertLess(total, 300, name)
-            with self.subTest(program=name, instrucciones=total):
+            with self.subTest(program=name, gas=total):
                 # Todos los cortes posibles (plan_cuts con count = total − 1 los devuelve todos) en los tres modos.
                 result = verify_program(name, image, SMALL_RAM, 2000, total - 1, rng, regs, step=1, bytes_every=2,
                                         check_every=1, feed=FEED, time_divisor=divisor)
@@ -546,6 +551,173 @@ class SecondHarnessReview(unittest.TestCase):
         for plan in result["planes"].values():
             for mode in plan["modos"].values():
                 self.assertIsNone(mode["ms_snapshot_restore"])
+
+
+class SchemaV2Harness(unittest.TestCase):
+    """H3.0: el arnés compara y sesga también el estado del esquema v2 (CSR de modo M, privilegio, reserva, ``msip``)."""
+
+    def test_the_msip_anchor_has_mmio_windows_and_survives_every_cut(self) -> None:
+        name, image, ram, gas, regs, feed, divisor = next(program for program in anchor_corpus() if "msip" in program[0])
+        profiled = profile(image, ram, gas, regs, 1, feed, divisor)
+        self.assertIn("mmio", {kind for _, _, window_kind in profiled["ventanas"] for kind in window_kind.split("+")})
+        result = verify_program(name, image, ram, gas, 2000, random.Random(3), regs, step=1, bytes_every=3, check_every=1,
+                                feed=feed, time_divisor=divisor)
+        self.assertEqual(result["divergencias"], 0, result)
+        self.assertGreater(result["planes"]["uniformes"]["cortes"], 50)
+
+    def test_an_msip_that_is_not_restored_is_seen(self) -> None:
+        original = Machine.restore
+
+        def forgetful(self, state):
+            original(self, state)
+            self.clint.msip = 0
+
+        name, image, ram, gas, regs, feed, divisor = next(program for program in anchor_corpus() if "msip" in program[0])
+        with mock.patch.object(Machine, "restore", forgetful):
+            result = verify_program(name, image, ram, gas, 24, random.Random(9), regs, step=1, feed=feed, time_divisor=divisor)
+        self.assertGreater(result["divergencias"], 0)
+
+    def test_observable_carries_every_new_field(self) -> None:
+        machine = new_machine(assemble([EBREAK]), SMALL_RAM, False, 2, None)
+        self.addCleanup(machine.close)
+        reference = B.observable(machine)
+        seen = {repr(reference)}
+        for target, name, value in ((machine.hart, "mstatus", 8), (machine.hart, "mie", 0x80), (machine.hart, "mtvec", 4),
+                                    (machine.hart, "mscratch", 1), (machine.hart, "mepc", 4), (machine.hart, "mcause", 2),
+                                    (machine.hart, "mtval", 3), (machine.hart, "privilege", 0), (machine.hart, "reservation", CODE),
+                                    (machine.clint, "msip", 1)):
+            with self.subTest(field=name):
+                old = getattr(target, name)
+                setattr(target, name, value)
+                current = repr(B.observable(machine))
+                self.assertNotIn(current, seen)
+                seen.add(current)
+                setattr(target, name, old)
+        self.assertEqual(B.observable(machine), reference)
+        self.assertEqual(B.observable(machine)[:8][2], machine.hart.instret)     # los índices de H2 no se mueven
+
+    def test_the_profile_sees_csr_privilege_and_reservation_changes(self) -> None:
+        # En H3.0 ninguna instrucción toca ese estado: un FENCE trucado lo cambia para comprobar la vigilancia del perfil.
+        from cpu_digital import rv32_hart
+        slot = int(Kind.FENCE)
+        original = rv32_hart.HANDLERS[slot]
+
+        def touching(hart, regs, rd, rs1, rs2, imm, raw, pc):
+            if regs[20] == 3:
+                hart.mscratch += 1
+            elif regs[20] == 2:
+                hart.reservation = None if hart.reservation else hart.base
+            return None
+
+        words = [encode(Kind.FENCE, 0, 0, imm=0x0FF), encode(Kind.ADDI, 20, 20, imm=-1), encode(Kind.BNE, 0, 20, 0, imm=-8), EBREAK]
+        rv32_hart.HANDLERS[slot] = touching
+        try:
+            profiled = profile(assemble(words), SMALL_RAM, 200, {20: 5}, 1)
+        finally:
+            rv32_hart.HANDLERS[slot] = original
+        kinds = {kind for _, _, window_kind in profiled["ventanas"] for kind in window_kind.split("+")}
+        self.assertTrue({"csr", "reserva"} <= kinds, profiled["ventanas"])
+
+
+class TrapsHarness(unittest.TestCase):
+    """H3.1: las anclas con traps y el corpus aleatorio con CSR, traps y modo U bajo cortes uniformes y sesgados; el perfil
+    reconoce la entrada en trap como evento (cambian mcause, mepc, mstatus o el privilegio: ventana ``csr``)."""
+
+    def test_the_trap_anchors_end_as_designed_and_have_csr_windows(self) -> None:
+        corpus = anchor_corpus()
+        count = len(B.trap_anchors(0))
+        first = len(corpus) - count - len(B.interrupt_anchors(0))       # tras ellas, las de H3.4
+        traps = corpus[first:first + count]
+        self.assertEqual([program[0] for program in traps], [program[0] for program in B.trap_anchors(first)])
+        for name, image, ram, gas, regs, feed, divisor in traps:
+            with self.subTest(program=name):
+                machine = new_machine(image, ram, False, 2, regs, feed, divisor)
+                self.addCleanup(machine.close)
+                self.assertEqual(machine.run(gas).reason, "apagado")
+                kinds = {kind for _, _, window_kind in profile(image, ram, gas, regs, 1, feed, divisor)["ventanas"]
+                         for kind in window_kind.split("+")}
+                if "LR/SC" in name:                                  # H3.3: ventanas de reserva y SC que fallan
+                    self.assertIn("reserva", kinds)
+                    self.assertGreater(machine.hart.regs[11], 0)
+                else:
+                    self.assertGreater(machine.hart.mcause, 0)
+                    self.assertIn("csr", kinds)
+
+    def test_random_trap_programs_under_uniform_and_biased_cuts(self) -> None:
+        rng = random.Random(31)
+        windows = in_window = 0
+        for name, image, ram, gas, regs, feed, divisor in B.trap_corpus(10, rng):
+            result = verify_program(name, image, ram, gas, 16, rng, regs, step=1, bytes_every=3, check_every=1, feed=feed,
+                                    time_divisor=divisor)
+            with self.subTest(program=name):
+                self.assertEqual(result["divergencias"], 0, result)
+            windows += "csr" in result["clases_de_ventana"]
+            in_window += int(result["planes"]["sesgados"]["cortes_en_ventana"])
+        self.assertGreater(windows, 7)
+        self.assertGreater(in_window, 100)
+
+
+class InterruptsHarness(unittest.TestCase):
+    """H3.4: las anclas de interrupciones hacen lo que dicen (y el perfil ve sus ventanas ``csr`` y ``wfi``), los cortes
+    del arnés se miden en gas y el corpus aleatorio de interrupciones pasa cortes uniformes y sesgados."""
+
+    def test_the_interrupt_anchors_do_what_they_say(self) -> None:
+        corpus = anchor_corpus()
+        count = len(B.interrupt_anchors(0))
+        anchors = corpus[-count:]
+        self.assertEqual([program[0] for program in anchors], [program[0] for program in B.interrupt_anchors(len(corpus) - count)])
+        for index, (name, image, ram, gas, regs, feed, divisor) in enumerate(anchors):
+            with self.subTest(program=name):
+                machine = new_machine(image, ram, True, 1, regs, feed, divisor)   # con bloques
+                self.addCleanup(machine.close)
+                self.assertEqual(machine.run(gas).reason, "apagado")
+                hart = machine.hart
+                spent = gas - hart.gas
+                kinds = {kind for _, _, window_kind in profile(image, ram, gas, regs, 1, feed, divisor)["ventanas"]
+                         for kind in window_kind.split("+")}
+                self.assertIn("csr", kinds)                                    # entradas en interrupción
+                if index == 0:                                                 # temporizador periódico
+                    self.assertEqual(hart.mcause, 0x80000007)
+                    self.assertGreater(hart.block_instructions, 0)
+                elif index == 1:                                               # WFI que duerme
+                    self.assertEqual(hart.mcause, 0x80000007)
+                    self.assertIn("wfi", kinds)
+                    self.assertGreater(hart.instret, spent)                     # durmió: más instret que gas
+                elif index == 2:                                               # msip autoprovocada
+                    self.assertEqual(hart.mcause, 0x80000003)
+                    self.assertGreater(hart.regs[9], 0)                        # msip leído a 1 con MIE = 0
+                elif index == 3:                                               # desde modo U
+                    self.assertEqual((hart.mcause, hart.mstatus >> 11 & 3, hart.privilege), (0x80000007, 0, 0))
+                else:                                                          # borde de 2⁶⁴
+                    self.assertIn("wfi", kinds)
+                    self.assertLess(hart.instret, spent)                       # envolvió: el contador vuelve a empezar
+                    self.assertGreater(hart.regs[2], 0)                        # MTIP leído antes de cruzar
+                    self.assertGreater(hart.regs[7], 0)                        # timeh = 2³² − 1 antes de cruzar
+
+    def test_cuts_are_planned_in_gas(self) -> None:
+        # Una WFI que duerme 10 000 instrucciones con 1 de gas: el total de cortes es el gas consumido, no instret.
+        name, image, ram, gas, regs, feed, divisor = B.interrupt_anchors(0)[1]
+        result = verify_program(name, image, ram, gas, 10_000, random.Random(4), regs, step=1, modes=MODES[:1],
+                                feed=feed, time_divisor=divisor)
+        self.assertGreater(result["instrucciones"], result["gas"])
+        self.assertEqual(result["planes"]["uniformes"]["cortes"], result["gas"] - 1)
+        self.assertEqual(result["planes"]["uniformes"]["modos"][MODES[0][0]]["cortes_alcanzados"], result["gas"] - 1)
+        self.assertEqual(result["divergencias"], 0, result)
+
+    def test_random_interrupt_programs_under_uniform_and_biased_cuts(self) -> None:
+        rng = random.Random(34)
+        wfi = csr = in_window = 0
+        for name, image, ram, gas, regs, feed, divisor in B.interrupt_corpus(10, rng):
+            result = verify_program(name, image, ram, gas, 16, rng, regs, step=1, bytes_every=3, check_every=1, feed=feed,
+                                    time_divisor=divisor)
+            with self.subTest(program=name):
+                self.assertEqual(result["divergencias"], 0, result)
+            wfi += "wfi" in "+".join(result["clases_de_ventana"])
+            csr += "csr" in "+".join(result["clases_de_ventana"])
+            in_window += int(result["planes"]["sesgados"]["cortes_en_ventana"])
+        self.assertGreater(csr, 7)
+        self.assertGreater(wfi, 1)
+        self.assertGreater(in_window, 100)
 
 
 class EmbenchUnderCuts(unittest.TestCase):

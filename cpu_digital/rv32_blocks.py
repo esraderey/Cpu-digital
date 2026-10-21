@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 from typing import Callable
 
-from .rv32_alu import BRANCH_TEMPLATES, TEMPLATES
+from .rv32_alu import BRANCH_TEMPLATES, TEMPLATES, div, divu, rem, remu
 from .rv32_decode import decode
 from .rv32_isa import Kind
 from .rv32_mem import LINE_MASK, LINE_SHIFT
@@ -44,17 +44,22 @@ MASK32 = 0xFFFFFFFF
 PAGE_SHIFT = 12
 
 _BRANCHES = frozenset({Kind.BEQ, Kind.BNE, Kind.BLT, Kind.BGE, Kind.BLTU, Kind.BGEU})
-_ALU_REG = frozenset({Kind.ADD, Kind.SUB, Kind.SLL, Kind.SLT, Kind.SLTU, Kind.XOR, Kind.SRL, Kind.SRA, Kind.OR, Kind.AND})
+# Extensión M (H3.2): los productos con plantilla en línea; división y resto llaman a la función de rv32_alu, ligada como
+# argumento por defecto del bloque (sin búsqueda global).
+_ALU_REG = frozenset({Kind.ADD, Kind.SUB, Kind.SLL, Kind.SLT, Kind.SLTU, Kind.XOR, Kind.SRL, Kind.SRA, Kind.OR, Kind.AND,
+                      Kind.MUL, Kind.MULH, Kind.MULHSU, Kind.MULHU})
+_DIVISION = {Kind.DIV: "div", Kind.DIVU: "divu", Kind.REM: "rem", Kind.REMU: "remu"}
 _ALU_IMM = frozenset({Kind.ADDI, Kind.SLTI, Kind.SLTIU, Kind.XORI, Kind.ORI, Kind.ANDI})
 _SHIFT_IMM = frozenset({Kind.SLLI, Kind.SRLI, Kind.SRAI})
 _LOADS = {Kind.LB: 1, Kind.LBU: 1, Kind.LH: 2, Kind.LHU: 2, Kind.LW: 4}
 _STORES = {Kind.SB: 1, Kind.SH: 2, Kind.SW: 4}
-_STRAIGHT = _ALU_REG | _ALU_IMM | _SHIFT_IMM | frozenset(_LOADS) | frozenset(_STORES) | {Kind.LUI, Kind.AUIPC}
+_REG_REG = _ALU_REG | frozenset(_DIVISION)
+_STRAIGHT = _REG_REG | _ALU_IMM | _SHIFT_IMM | frozenset(_LOADS) | frozenset(_STORES) | {Kind.LUI, Kind.AUIPC}
 _INCLUDED_CONTROL = _BRANCHES | {Kind.JAL, Kind.JALR}
-_READS_RS1 = _ALU_REG | _ALU_IMM | _SHIFT_IMM | frozenset(_LOADS) | frozenset(_STORES) | _BRANCHES | {Kind.JALR}
-_READS_RS2 = _ALU_REG | frozenset(_STORES) | _BRANCHES
-_PURE = _ALU_REG | _ALU_IMM | _SHIFT_IMM | {Kind.LUI, Kind.AUIPC}   # con rd = x0 no emiten nada ni leen
-_WRITES_RD = _ALU_REG | _ALU_IMM | _SHIFT_IMM | frozenset(_LOADS) | {Kind.LUI, Kind.AUIPC, Kind.JAL, Kind.JALR}
+_READS_RS1 = _REG_REG | _ALU_IMM | _SHIFT_IMM | frozenset(_LOADS) | frozenset(_STORES) | _BRANCHES | {Kind.JALR}
+_READS_RS2 = _REG_REG | frozenset(_STORES) | _BRANCHES
+_PURE = _REG_REG | _ALU_IMM | _SHIFT_IMM | {Kind.LUI, Kind.AUIPC}   # con rd = x0 no emiten nada ni leen
+_WRITES_RD = _REG_REG | _ALU_IMM | _SHIFT_IMM | frozenset(_LOADS) | {Kind.LUI, Kind.AUIPC, Kind.JAL, Kind.JALR}
 _CONSTANTS = re.compile(r"\b[MS]\b")
 
 Runner = Callable[[list[int]], tuple[int, int, int]]
@@ -157,6 +162,7 @@ def compile_block(hart, pc: int, gas_per_instruction: int = 1, keep_source: bool
     lines: list[str] = []
     emit = lines.append
     written: list[int] = []
+    divisions: set[str] = set()
 
     def flush(registers: list[int]) -> str:
         return "; ".join(f"regs[{r}] = r{r}" for r in registers) if registers else "pass"
@@ -182,6 +188,10 @@ def compile_block(hart, pc: int, gas_per_instruction: int = 1, keep_source: bool
         elif kind in _ALU_REG:
             if rd:
                 emit(f"    r{rd} = {_literal(TEMPLATES[kind].format(a=ra, b=rb))}")
+        elif kind in _DIVISION:
+            if rd:
+                emit(f"    r{rd} = {_DIVISION[kind]}({ra}, {rb})")
+                divisions.add(_DIVISION[kind])
         elif kind in _ALU_IMM:
             if rd:
                 if kind == Kind.ADDI and rs1 == 0:
@@ -269,10 +279,13 @@ def compile_block(hart, pc: int, gas_per_instruction: int = 1, keep_source: bool
         emit(f"    {flush(written)}")
         emit(f"    return ({(instructions[-1][0] + 4) & MASK32}, {count}, 0)")
 
-    header = "def run(regs, written=written, code=code, words=words, lanes=lanes):"
+    # Las funciones de división de M solo se ligan en los bloques que las usan (la cabecera de los demás no cambia).
+    header = ("def run(regs, written=written, code=code, words=words, lanes=lanes"
+              + "".join(f", {name}={name}" for name in sorted(divisions)) + "):")
     loads = "    " + "; ".join(f"r{r} = regs[{r}]" for r in needs_load) if needs_load else "    pass"
     source = "\n".join([header, loads, *lines, ""])
-    namespace = {"written": hart.written, "code": hart.code, "words": hart.words_u, "lanes": hart.lanes}
+    namespace = {"written": hart.written, "code": hart.code, "words": hart.words_u, "lanes": hart.lanes,
+                 "div": div, "divu": divu, "rem": rem, "remu": remu}
     # El código generado sale de la memoria del invitado ya decodificada, nunca de texto externo.
     exec(compile(source, f"<bloque {pc:#x}>", "exec"), namespace)
     run = namespace.pop("run")   # sin ciclo función ↔ globales: el bloque se libera por recuento

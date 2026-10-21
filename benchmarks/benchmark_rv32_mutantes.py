@@ -5,8 +5,14 @@ Cada mutante es una o varias sustituciones textuales sobre una copia del árbol 
 ``pc``, ``instret``, ``time_divisor``, RAM, salida y cola del UART, ``mtimecmp``), cachés no vaciadas (decodificación,
 bloques, mapa de código), generaciones que no suben al restaurar (``reset``, escritura del host y ``clear_code``), y
 sus combinaciones (un bloque compilado solo sobrevive a una restauración si no se vacía **y** las generaciones no
-suben), ``written`` no recalculado, generaciones que bajan y un snapshot que omite el último grupo de páginas. Dos
-pasos por mutante, cada uno en un subproceso con el árbol mutado en ``PYTHONPATH``:
+suben), ``written`` no recalculado, generaciones que bajan y un snapshot que omite el último grupo de páginas; desde
+H3.0, el estado del esquema v2 mal restaurado (reserva de LR/SC, privilegio, CSR de modo M, ``mepc``, ``msip`` y un
+snapshot v1 que conserva el estado nuevo del destino); desde H3.4, los fallos de corte de la entrega de interrupciones
+(un store a un dispositivo, una escritura de ``mstatus``/``mie`` o un ``MRET`` que no reevalúan y MTIP comparando el
+contador sin envolver a 64 bits): la ejecución entera los arrastra hasta el siguiente punto de reevaluación y la troceada se
+cura en cada corte, así que solo un fragmentador los ve; y el gas apartado por el plazo que se pierde al salir de ``run``,
+que la sonda da por equivalente con razón (se pierde lo mismo entero que troceado: lo mata un ancla dirigida). La sonda
+compara también el gas consumido. Dos pasos por mutante, cada uno en un subproceso con el árbol mutado en ``PYTHONPATH``:
 
 1. **Vivacidad** (``--sonda``): ¿cambia el mutante algo observable? Se mide de dos formas. *General*: una batería
    dirigida (programas ancla con parches sobre el propio código, tope de recompilaciones y MMIO con cola de entrada,
@@ -17,14 +23,15 @@ pasos por mutante, cada uno en un subproceso con el árbol mutado en ``PYTHONPAT
    de esa batería: queda fuera del denominador de E5, y se informa aparte si está vivo en general (es un límite de
    cobertura de los programas, no del fragmentador).
 2. **Detección** por el fragmentador con K cortes uniformes y K sesgados: ``benchmark_rv32_riscv_tests`` o, con
-   ``--detector aleatorios``, ``benchmark_rv32_invariante`` sobre programas aleatorios. Se anota por separado qué plan
-   detectó.
+   ``--detector aleatorios``, ``benchmark_rv32_invariante`` sobre programas aleatorios, o, con ``--detector
+   interrupciones`` (H3.4), sobre las anclas y los programas aleatorios con temporizador, ``msip`` y WFI. Se anota por
+   separado qué plan detectó.
 
 Criterio del RFC (§5, E5): mata P2 si el fragmentador detecta menos del 90 % de los mutantes vivos (en la batería) o
 si los cortes sesgados no superan a los uniformes.
 
 Uso (desde la raíz del repositorio):
-    python -m benchmarks.benchmark_rv32_mutantes [--detector riscv|aleatorios] [--cortes 64] [--json informe.json]
+    python -m benchmarks.benchmark_rv32_mutantes [--detector riscv|aleatorios|interrupciones] [--cortes 64] [--json informe.json]
     python -m benchmarks.benchmark_rv32_mutantes --sonda --detector riscv --json sonda.json   (uso interno)
 """
 
@@ -51,6 +58,7 @@ MEM = "cpu_digital/rv32_mem.py"
 PLATFORM = "cpu_digital/rv32_platform.py"
 CLEARS = ("        self.decode_cache = {}\n        self.blocks = {}\n        self.block_hits = {}\n        self.recompilations = {}\n"
           "        self.memory.clear_code()\n")
+CSR_RESTORE = "        self.mstatus, self.mie, self.mtvec, self.mscratch, self.mepc, self.mcause, self.mtval = csrs\n"
 NO_BUMPS: list[Edit] = [
     (MEM, "            generations[page] += 1\n            written[page] = 1\n", "            written[page] = 1   # MUTANTE: el host no sube\n"),
     (MEM, "                generations[page] += 1\n                written[page] = 0\n", "                written[page] = 0   # MUTANTE: reset no sube\n"),
@@ -82,7 +90,36 @@ MUTANTS: dict[str, list[Edit]] = {
                                 "            generations[page] = 0   # MUTANTE: la generación baja\n            written[page] = 1\n")],
     "snapshot_omite_ultimo_grupo": [(MEM, "        for first in range(0, total, pages_per_snapshot_page):\n",
                                      "        for first in range(0, total - pages_per_snapshot_page, pages_per_snapshot_page):   # MUTANTE\n")],
+    # H3.0 (esquema v2): el estado nuevo presente en el snapshot pero mal restaurado (vivos desde que H3.1 y H3.3 leen los
+    # CSR de modo M, el privilegio y la reserva; msip y mtimecmp, desde que H3.4 entrega interrupciones).
+    "reserva_no_restaurada": [(HART, "        self.reservation = reservation\n", "        self.reservation = None   # MUTANTE: reserva no restaurada\n")],
+    "privilegio_no_restaurado": [(HART, "        self.privilege = privilege\n", "        pass   # MUTANTE: privilegio no restaurado\n")],
+    "csrs_sin_restaurar": [(HART, CSR_RESTORE, "        pass   # MUTANTE: CSR de modo M sin restaurar\n")],
+    "mepc_sin_restaurar": [(HART, CSR_RESTORE, CSR_RESTORE.replace("self.mepc,", "_,").replace("= csrs\n", "= csrs   # MUTANTE: mepc\n"))],
+    "msip_no_restaurado": [(PLATFORM, "        self.clint.msip = msip\n", "        pass   # MUTANTE: msip sin restaurar (interrupción pendiente perdida)\n")],
+    # H3.3: la reserva que sobrevive a una restauración que trae null (el destino conserva la suya) y la marca de la línea
+    # de la reserva que no se repone al restaurar (los store de los bloques ya no la perderían).
+    "reserva_sobrevive_a_la_restauracion": [(HART, "        self.reservation = reservation\n",
+                                             "        self.reservation = self.reservation if reservation is None else reservation   # MUTANTE\n")],
+    "marca_de_reserva_no_repuesta": [(HART, "            self.memory.mark_code(reservation - self.base, 4)\n",
+                                      "            pass   # MUTANTE: la línea de la reserva no se vuelve a marcar\n")],
+    "v1_sin_reiniciar_lo_nuevo": [
+        (HART, "            csrs: tuple[int, ...] = (0,) * len(CSR_SLOTS)\n",
+         "            csrs = tuple(getattr(self, slot) for _, slot in CSR_SLOTS)   # MUTANTE: v1 conserva los CSR del destino\n"),
+        (HART, "            privilege = PRIV_M\n", "            privilege = self.privilege   # MUTANTE: v1 conserva el privilegio\n")],
 }
+# H3.4: fallos de corte de la entrega de interrupciones (la ejecución entera los arrastra; la troceada se cura en cada corte).
+MUTANTS.update({
+    "mmio_sin_reevaluar": [(HART, "        raise _Recheck()   # un dispositivo puede haber cambiado msip o mtimecmp (H3.4): el store ya se confirmó\n",
+                            "        return   # MUTANTE: un store a un dispositivo no reevalúa las interrupciones\n")],
+    "csr_sin_reevaluar": [(HART, "                recheck = imm == CSR_MSTATUS or imm == CSR_MIE\n",
+                           "                recheck = False   # MUTANTE: escribir mstatus o mie no reevalúa\n")],
+    "mret_sin_reevaluar": [(HART, "    raise _Recheck(hart.mepc)   # cambian MIE y el privilegio: el bucle reevalúa las interrupciones (H3.4)\n",
+                            "    return hart.mepc   # MUTANTE: MRET no reevalúa\n")],
+    "gas_apartado_perdido": [(HART, "            self.gas = gas + reserve\n", "            self.gas = gas   # MUTANTE: el gas apartado por el plazo se pierde\n")],
+    "mtip_sin_envolver": [(PLATFORM, "        return (self.hart.instret & MASK64) // self.hart.time_divisor   # el mismo reloj que rdtime, envuelto a 64 bits\n",
+                           "        return self.hart.instret // self.hart.time_divisor   # MUTANTE: mtime sin envolver a 64 bits\n")],
+})
 MUTANTS["bloques_vivos+generaciones_quietas"] = MUTANTS["bloques_vivos"] + NO_BUMPS
 MUTANTS["decodificacion_viva+generaciones_quietas"] = MUTANTS["decodificacion_viva"] + NO_BUMPS
 MUTANTS["mapa_sin_vaciar+generaciones_quietas"] = MUTANTS["mapa_de_codigo_sin_vaciar"] + NO_BUMPS
@@ -119,7 +156,8 @@ def subprocess_json(tree: Path, module: str, arguments: list[str], output: Path,
 def probe(programs: list[tuple[str, bytes, int, int, dict[int, int] | None, bytes, int]], rng: random.Random,
           dense: int = 200, limit: int = 5) -> dict[str, object]:
     """Todos los cortes (o ``dense`` al azar si el programa es largo), restauración en máquina nueva y usada con
-    aceleración distinta en origen y destino; vivo si algo observable cambia frente a la ejecución entera."""
+    aceleración distinta en origen y destino; vivo si algo observable cambia frente a la ejecución entera: el estado, la
+    parada, el hash o el gas consumido (desde H3.4: un mutante que solo pierde gas también rompe la invariante S)."""
     from benchmarks.benchmark_rv32_invariante import new_machine, observable
     from cpu_digital.rv32_hart import Stop
     from cpu_digital.rv32_platform import Machine
@@ -130,8 +168,8 @@ def probe(programs: list[tuple[str, bytes, int, int, dict[int, int] | None, byte
         whole = new_machine(image, ram, False, 2, regs, feed, divisor)
         try:
             stop = whole.run(gas)
-            total = whole.hart.instret
-            expected = (observable(whole), stop, whole.state_hash())
+            total = gas - whole.hart.gas          # los cortes son de gas (H3.4: WFI avanza instret sin gas)
+            expected = (observable(whole), stop, whole.state_hash(), total)
         finally:
             whole.close()
         cuts = range(1, total) if total <= dense else sorted({rng.randrange(1, total) for _ in range(dense)})
@@ -154,7 +192,7 @@ def probe(programs: list[tuple[str, bytes, int, int, dict[int, int] | None, byte
                             continue
                         target.hart.accelerate, target.hart.warmup = accelerate_target, warmup
                         stop = target.run(gas - cut)
-                        if (observable(target), stop, target.state_hash()) != expected:
+                        if (observable(target), stop, target.state_hash(), gas - target.hart.gas) != expected:
                             alive.append(f"{name} corte {cut} destino {label} ({accelerate_source}->{accelerate_target}, w{warmup}): estado final distinto")
                 finally:
                     source.close()
@@ -166,13 +204,16 @@ def probe(programs: list[tuple[str, bytes, int, int, dict[int, int] | None, byte
 
 
 def probe_both(detector: str, random_programs: int, seed: int) -> dict[str, object]:
-    from benchmarks.benchmark_rv32_invariante import anchor_corpus, random_corpus
+    from benchmarks.benchmark_rv32_invariante import anchor_corpus, interrupt_anchors, interrupt_corpus, random_corpus
 
     rng = random.Random(seed)
     general = anchor_corpus() + random_corpus(12, rng)
     if detector == "riscv":
-        from benchmarks.benchmark_rv32_riscv_tests import GAS, RAM, versioned
-        battery = [(name, path.read_bytes(), RAM, GAS, None, b"", 1) for name, path in sorted(versioned().items())]
+        from benchmarks.benchmark_rv32_riscv_tests import GAS, RAM, SUITES, versioned
+        battery = [(f"{suite}/{name}", path.read_bytes(), RAM, GAS, None, b"", 1)       # rv32ui y, desde H3.1, rv32mi
+                   for suite in SUITES for name, path in sorted(versioned(suite).items())]
+    elif detector == "interrupciones":
+        battery = interrupt_anchors(0) + interrupt_corpus(random_programs, rng)
     else:
         battery = random_corpus(random_programs, rng)
     return {"general": probe(general, rng), "bateria": probe(battery, rng, dense=120)}
@@ -204,7 +245,7 @@ def main() -> int:
             pass
     parser = argparse.ArgumentParser(description="E5: mutantes de restauración errónea frente al fragmentador")
     parser.add_argument("--sonda", action="store_true", help="uso interno: sonda de vivacidad en el árbol actual")
-    parser.add_argument("--detector", choices=("riscv", "aleatorios"), default="riscv")
+    parser.add_argument("--detector", choices=("riscv", "aleatorios", "interrupciones"), default="riscv")
     parser.add_argument("--cortes", type=int, default=64)
     parser.add_argument("--aleatorios", type=int, default=30, help="programas del detector aleatorio")
     parser.add_argument("--semilla", type=int, default=5)
@@ -225,6 +266,8 @@ def main() -> int:
           f"mutantes {len(names)}")
     probe_arguments = ["--sonda", "--detector", args.detector, "--aleatorios", str(args.aleatorios), "--semilla", str(args.semilla)]
     detector_arguments = (["--cortes", str(args.cortes), "--semilla", str(args.semilla)] if args.detector == "riscv"
+                          else ["--conjunto", "interrupciones", "--interrupciones", str(args.aleatorios), "--cortes", str(args.cortes),
+                                "--semilla", str(args.semilla)] if args.detector == "interrupciones"
                           else ["--conjunto", "aleatorios", "--aleatorios", str(args.aleatorios), "--cortes", str(args.cortes),
                                 "--semilla", str(args.semilla)])
     detector_module = "benchmarks.benchmark_rv32_riscv_tests" if args.detector == "riscv" else "benchmarks.benchmark_rv32_invariante"
